@@ -11,6 +11,7 @@ import { homedir } from 'node:os';
 import { IpynbError, createWarning, type Warning } from './core/errors.ts';
 import { mapRawOutputs, type OutputItem } from './core/outputs.ts';
 import { cellSource, type Hasher } from './core/parse.ts';
+import { analyzeStale, downgradeConfidence, regexDefs, regexUses, type StaleCell } from './core/stale.ts';
 import type { IpynbConfig } from './config.ts';
 import { applyImagePolicy, shouldReturnImages, type ImagesPolicy } from './fs/artifact.ts';
 import { readNotebookFile, writeNotebookFile } from './fs/notebook-file.ts';
@@ -403,7 +404,7 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
     ));
   }
 
-  // ---- stale analysis slot (filled in step 8) --------------------------------
+  // ---- stale analysis (SPEC §5.6) --------------------------------------------
   let staleCells: RunOutcome['stale_cells'] = [];
   let staleAnalysis: RunOutcome['stale_analysis'] = null;
   if (resolution.language !== 'python') {
@@ -413,7 +414,63 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
       'stale analysis is only available for Python kernels',
     ));
   } else {
-    staleAnalysis = null; // step 8 wires the symtable analysis here
+    const codeSources = codeCellIndexes.map((index) => cellSource(notebook.cells[index]!));
+    let defsByCodeIndex: string[][] = [];
+    let usesByCodeIndex: string[][] = [];
+    let method: 'python-symtable' | 'regex' = 'python-symtable';
+    let degraded = false;
+    try {
+      const analysis = await deps.registry.analyze(req.path, codeSources);
+      if (analysis.ok) {
+        defsByCodeIndex = analysis.defs;
+        usesByCodeIndex = analysis.uses;
+      } else {
+        degraded = true;
+      }
+    } catch {
+      // Kernel unavailable (e.g. it just timed out): degrade to regex too.
+      degraded = true;
+    }
+    if (degraded) {
+      method = 'regex';
+      warnings.push(createWarning(
+        'stale_analysis_degraded',
+        'at least one cell failed AST parsing; stale analysis degraded to regex (all confidences are low)',
+      ));
+      defsByCodeIndex = codeSources.map((source) => regexDefs(source));
+      usesByCodeIndex = codeSources.map((source) => regexUses(source));
+    }
+    // Map code-index-aligned arrays onto full cell-index space.
+    const defs: string[][] = [];
+    const uses: string[][] = [];
+    for (let i = 0; i < notebook.cells.length; i += 1) {
+      const codePosition = codeCellIndexes.indexOf(i);
+      if (codePosition >= 0) {
+        defs[i] = defsByCodeIndex[codePosition] ?? [];
+        uses[i] = usesByCodeIndex[codePosition] ?? [];
+      } else {
+        defs[i] = [];
+        uses[i] = [];
+      }
+    }
+    const staleMeta = notebook.cells.map((cell, index) => ({
+      cell_index: index,
+      cell_id: cell.id ?? null,
+      is_code: cell.cell_type === 'code',
+      has_nonempty_outputs: Array.isArray(cell.outputs) && cell.outputs.length > 0,
+    }));
+    let computed: StaleCell[] = analyzeStale({
+      defs,
+      uses,
+      targetIndexes: executedCellsSet,
+      replayIndexes: new Set(replayPrefix),
+      cells: staleMeta,
+    });
+    if (method === 'regex') {
+      computed = downgradeConfidence(computed);
+    }
+    staleCells = computed;
+    staleAnalysis = { approximate: true, analysis_version: 1, method };
   }
 
   // ---- write-back -------------------------------------------------------------

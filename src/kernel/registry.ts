@@ -9,7 +9,7 @@ import { IpynbError } from '../core/errors.ts';
 import { normalizeForCompare } from '../config.ts';
 import type { Logger } from '../log.ts';
 import { SidecarTransport, type SidecarTransportOptions } from './sidecar-transport.ts';
-import type { ExecCellParams, ExecCellResult, KernelTransport } from './transport.ts';
+import type { AnalyzeResult, ExecCellParams, ExecCellResult, KernelTransport } from './transport.ts';
 
 export interface KernelSessionInfo {
   readonly kernelId: string;
@@ -228,6 +228,12 @@ export class KernelRegistry {
     } finally {
       session.busy = false;
     }
+  }
+
+  /** Run the sidecar's symtable analysis (SPEC §5.8 analyze op). */
+  async analyze(notebookPath: string, sources: readonly string[]): Promise<AnalyzeResult> {
+    const session = this.#requireSession(notebookPath, 'kernel_not_available');
+    return session.transport.analyze(sources);
   }
 
   async interrupt(notebookPath: string): Promise<void> {

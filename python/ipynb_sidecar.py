@@ -294,6 +294,55 @@ def op_shutdown_all(_params: dict) -> dict:
     return {"ok": True}
 
 
+def op_analyze(params: dict) -> dict:
+    """Per-cell module-level definitions and uses via symtable (SPEC §5.6)."""
+    import symtable
+
+    sources = params["sources"]
+    defs: list[list[str]] = []
+    uses: list[list[str]] = []
+    failed: list[int] = []
+    for index, source in enumerate(sources):
+        try:
+            table = symtable.symtable(source, "<cell>", "exec")
+        except SyntaxError:
+            failed.append(index)
+            defs.append([])
+            uses.append([])
+            continue
+        cell_defs, cell_uses = _extract_symbols(table)
+        defs.append(cell_defs)
+        uses.append(cell_uses)
+    return {"ok": len(failed) == 0, "failed_cell_indexes": failed, "defs": defs, "uses": uses}
+
+
+def _extract_symbols(table) -> tuple[list[str], list[str]]:
+    defined = set()
+    for symbol in table.get_symbols():
+        if symbol.is_parameter():
+            continue
+        if symbol.is_assigned() or symbol.is_imported() or symbol.is_namespace():
+            defined.add(symbol.get_name())
+
+    used = set()
+    for symbol in table.get_symbols():
+        if symbol.is_referenced() and symbol.get_name() not in defined:
+            used.add(symbol.get_name())
+    # Names referenced from nested scopes that resolve to module globals.
+    for child in _iter_descendants(table):
+        for symbol in child.get_symbols():
+            if symbol.is_global() and symbol.is_referenced():
+                used.add(symbol.get_name())
+
+    return sorted(defined), sorted(used - defined)
+
+
+def _iter_descendants(table):
+    for child in table.get_children():
+        yield child
+        yield from _iter_descendants(child)
+
+
 OPS = {
     "ping": op_ping,
     "start_kernel": op_start_kernel,
@@ -301,6 +350,7 @@ OPS = {
     "interrupt": op_interrupt,
     "shutdown_kernel": op_shutdown_kernel,
     "kernel_status": op_kernel_status,
+    "analyze": op_analyze,
     "shutdown_all": op_shutdown_all,
 }
 
