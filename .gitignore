@@ -1,0 +1,24 @@
+# 依赖与构建产物（安装/构建生成，不入库）
+node_modules/
+lib/
+coverage/
+*.tsbuildinfo
+
+# 环境与编辑器
+.env
+.env.*
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 测试专用虚拟环境（本地生成，禁止改动用户解释器环境；见 AGENTS.md §3）
+.venv-test/
+tests/.venv*/
+
+# 日志与临时文件
+*.log
+*.tmp-*
+*.bak
+
+# 注：本仓库无大体积原始数据目录；若未来引入只读数据集，须在此登记排除理由。
