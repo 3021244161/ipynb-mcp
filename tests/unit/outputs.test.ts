@@ -39,7 +39,7 @@ function makePng(width: number, height: number, pad = 0): Uint8Array {
 }
 
 function makeJpeg(width: number, height: number): Uint8Array {
-  const bytes = new Uint8Array(16);
+  const bytes = new Uint8Array(17);
   bytes.set([0xff, 0xd8, 0xff, 0xc0, 0x00, 0x0b, 0x08], 0);
   bytes[7] = (height >>> 8) & 0xff;
   bytes[8] = height & 0xff;
