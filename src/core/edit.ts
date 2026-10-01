@@ -8,6 +8,7 @@ import {
   type JsonValue,
   type Warning,
 } from './errors.ts';
+import type { MarkdownIssue } from './markdown.ts';
 import {
   cellSource,
   cellSourceHash,
@@ -20,12 +21,7 @@ import {
 /** Raw op as it arrives from JSON — fields are narrowed defensively inside. */
 export type EditOpInput = Readonly<Record<string, unknown>>;
 
-export interface MarkdownIssue {
-  readonly severity: 'error' | 'warning';
-  readonly rule: string;
-  readonly line: number;
-  readonly message: string;
-}
+export type { MarkdownIssue } from './markdown.ts';
 
 export interface ChangedCell {
   readonly cell_index: number;
