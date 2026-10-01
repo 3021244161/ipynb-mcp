@@ -6,8 +6,8 @@
 import { realpathSync } from 'node:fs';
 import path from 'node:path';
 
-import { normalizeForCompare } from '../config.ts';
-import { IpynbError } from '../core/errors.ts';
+import { normalizeForCompare } from '../config.js';
+import { IpynbError } from '../core/errors.js';
 
 export interface FenceDeps {
   /** Realpath of an existing path; implementations should throw when it does not exist. */

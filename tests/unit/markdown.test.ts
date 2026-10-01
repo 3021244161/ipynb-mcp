@@ -5,10 +5,10 @@ import path from 'node:path';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { checkMarkdown } from '../../src/core/markdown.ts';
-import { applyEditOps } from '../../src/core/edit.ts';
-import { parseNotebook } from '../../src/core/parse.ts';
-import { hasher } from '../../src/hash.ts';
+import { checkMarkdown } from '../../src/core/markdown.js';
+import { applyEditOps } from '../../src/core/edit.js';
+import { parseNotebook } from '../../src/core/parse.js';
+import { hasher } from '../../src/hash.js';
 
 let dir: string;
 

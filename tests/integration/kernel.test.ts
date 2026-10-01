@@ -12,9 +12,9 @@ import { fileURLToPath } from 'node:url';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { createLogger } from '../../src/log.ts';
-import { KernelRegistry } from '../../src/kernel/registry.ts';
-import { SidecarTransport } from '../../src/kernel/sidecar-transport.ts';
+import { createLogger } from '../../src/log.js';
+import { KernelRegistry } from '../../src/kernel/registry.js';
+import { SidecarTransport } from '../../src/kernel/sidecar-transport.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const VENV_DIR = path.join(REPO_ROOT, 'tests', '.venv-test');

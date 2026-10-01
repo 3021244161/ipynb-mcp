@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { open, rename, unlink } from 'node:fs/promises';
 import path from 'node:path';
 
-import { IpynbError } from '../core/errors.ts';
+import { IpynbError } from '../core/errors.js';
 
 export interface AtomicWriteDeps {
   open(target: string, flags: string, mode: number): Promise<FileHandleLike>;

@@ -3,7 +3,7 @@
 // untouched cells keep their original `source` shape (string stays string,
 // array stays array) byte-for-byte after a round trip.
 
-import { IpynbError } from './errors.ts';
+import { IpynbError } from './errors.js';
 
 export interface Hasher {
   sha256Hex(input: string | Uint8Array): string;

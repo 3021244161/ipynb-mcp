@@ -1,0 +1,340 @@
+// Integration tests (step 9): server-level behaviors — stdout purity (I12),
+// client abort of runs and edits (I13/I14), background run vs kernel
+// restart (I16).
+
+import { spawn } from 'node:child_process';
+import { existsSync, readdirSync, realpathSync } from 'node:fs';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+
+import type { IpynbConfig } from '../../src/config.js';
+import { hasher } from '../../src/hash.js';
+import { KernelRegistry } from '../../src/kernel/registry.js';
+import { pythonPrefix } from '../../src/kernel/interpreter.js';
+import { RunStore } from '../../src/mcp/run-store.js';
+import { PathFence } from '../../src/fs/fence.js';
+import { createLogger } from '../../src/log.js';
+import { createServer } from '../../src/server.js';
+
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const VENV_DIR = path.join(REPO_ROOT, 'tests', '.venv-test');
+const WINDOWS = process.platform === 'win32';
+const VENV_PY = WINDOWS ? path.join(VENV_DIR, 'Scripts', 'python.exe') : path.join(VENV_DIR, 'bin', 'python');
+const BASE_PYTHON = process.env['IPYNB_TEST_PYTHON'] ?? (WINDOWS ? 'python' : 'python3');
+
+let workspace: string;
+let client: Client;
+let registry: KernelRegistry;
+let runStore: RunStore;
+
+beforeAll(async () => {
+  if (!existsSync(VENV_PY)) {
+    const { execFileSync } = await import('node:child_process');
+    execFileSync(BASE_PYTHON, ['-m', 'venv', '--system-site-packages', VENV_DIR], { stdio: 'inherit', timeout: 120_000 });
+  }
+  workspace = await mkdtemp(path.join(tmpdir(), 'ipynb-mcp-server-'));
+  const basePython = BASE_PYTHON === 'python' || BASE_PYTHON === 'python3' ? null : BASE_PYTHON;
+  const jupyterRoot = basePython !== null ? path.join(pythonPrefix(basePython), 'share', 'jupyter') : null;
+  if (jupyterRoot !== null && existsSync(path.join(jupyterRoot, 'kernels'))) {
+    process.env['JUPYTER_PATH'] = jupyterRoot;
+  }
+  registry = new KernelRegistry({ idleSeconds: 3600, logger: createLogger('error') });
+  registry.start();
+  runStore = new RunStore();
+  const config: IpynbConfig = {
+    root: workspace,
+    allowOutsideRoot: false,
+    readOnly: false,
+    images: 'auto',
+    python: null,
+    kernelIdleSeconds: 3600,
+    execTimeoutSeconds: 300,
+    backgroundThresholdSeconds: 30,
+    backupKeep: 10,
+    artifactDir: path.join(workspace, 'artifacts'),
+    inlineTextChars: 20000,
+    previewLines: 12,
+    maxImagesPerCall: 20,
+    maxImageBytes: 20971520,
+    logLevel: 'error',
+  };
+  const server = createServer({
+    config,
+    fence: new PathFence(workspace, false, process.platform),
+    registry,
+    runStore,
+    hasher,
+    logger: createLogger('error'),
+    realpath: (target) => realpathSync(target),
+    platform: process.platform,
+  });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  client = new Client({ name: 'server-test', version: '0.0.0' });
+  await client.connect(clientTransport);
+}, 180_000);
+
+afterAll(async () => {
+  await registry.shutdownAll();
+  await rm(workspace, { recursive: true, force: true });
+}, 120_000);
+
+async function writeNb(name: string, cells: Array<Record<string, unknown>>): Promise<string> {
+  const target = path.join(workspace, name);
+  await writeFile(target, JSON.stringify({
+    nbformat: 4,
+    nbformat_minor: 5,
+    metadata: { kernelspec: { name: 'python3' }, language_info: { name: 'python' } },
+    cells,
+  }));
+  return target;
+}
+
+function codeCell(id: string, source: string): Record<string, unknown> {
+  return { cell_type: 'code', id, metadata: {}, source, outputs: [], execution_count: null };
+}
+
+async function callTool(name: string, args: Record<string, unknown>): Promise<{
+  isError?: boolean;
+  content: Array<{ type: string; text?: string }>;
+}> {
+  return (await client.callTool({ name, arguments: args })) as unknown as {
+    isError?: boolean;
+    content: Array<{ type: string; text?: string }>;
+  };
+}
+
+describe('[I13] client abort of an in-flight synchronous run', () => {
+  it('returns cancelled, interrupts the kernel and writes nothing new', async () => {
+    const nb = await writeNb('i13.ipynb', [
+      codeCell('c0', 'import time\ntime.sleep(30)'),
+    ]);
+    const before = await readFile(nb);
+
+    const controller = new AbortController();
+    const request = client.callTool(
+      {
+        name: 'notebook_run',
+        arguments: { path: nb, cell_selector: 'all', timeout_seconds: 25 },
+      },
+      undefined,
+      { signal: controller.signal },
+    );
+    // Let the run start, then cancel mid-cell.
+    await new Promise((resolve) => setTimeout(resolve, 3_000));
+    controller.abort();
+
+    let result: { content: Array<{ type: string; text?: string }> } | null = null;
+    let failure: unknown = null;
+    try {
+      result = (await request) as unknown as { content: Array<{ type: string; text?: string }> };
+    } catch (cause) {
+      failure = cause;
+    }
+    // Either the client surfaces the cancellation, or the server answers with
+    // a cancelled tool error — both satisfy I13. What must NOT happen: the
+    // cell runs to completion.
+    if (result !== null) {
+      const body = JSON.parse(String(result.content[0]?.text ?? '{}')) as Record<string, unknown>;
+      expect(body['code']).toBe('cancelled');
+    } else {
+      expect(String(failure)).toBeTruthy();
+    }
+
+    // The kernel got interrupted well before the 30s sleep finished: the
+    // file stays byte-identical (nothing executed to completion).
+    expect(await readFile(nb)).toEqual(before);
+  }, 120_000);
+});
+
+describe('[I14] client abort of an in-flight edit', () => {
+  it('a pre-aborted edit leaves the file untouched with no tmp leftovers', async () => {
+    const nb = await writeNb('i14.ipynb', [codeCell('c0', 'x = 1')]);
+    const before = await readFile(nb);
+
+    // Cancel BEFORE the request reaches the writer: the abort signal is
+    // already set, so the atomic write bails before creating a temp file.
+    const controller = new AbortController();
+    controller.abort();
+    const outcome = await handleEditThroughAbort(nb, controller.signal);
+    expect(outcome).toMatchObject({ isError: true });
+    const firstBlock = (outcome?.content ?? [])[0];
+    expect(firstBlock && 'text' in firstBlock ? firstBlock.text : '{}').toBeTruthy();
+    expect(JSON.parse(firstBlock && 'text' in firstBlock ? firstBlock.text : '{}')['code']).toBe('cancelled');
+
+    expect(await readFile(nb)).toEqual(before);
+    const leftovers = readdirSync(workspace).filter((name) => name.includes('.tmp-'));
+    expect(leftovers).toEqual([]);
+  }, 60_000);
+});
+
+async function handleEditThroughAbort(nb: string, signal: AbortSignal) {
+  // Direct handler invocation with an already-aborted signal (the in-memory
+  // client cannot inject a pre-cancelled request cleanly).
+  const { handleNotebookEdit } = await import('../../src/mcp/tools/edit.js');
+  const { toCallToolResult } = await import('../../src/mcp/tools/result.js');
+  const { readNotebookFile } = await import('../../src/fs/notebook-file.js');
+  const notebook = await readNotebookFile(nb, hasher);
+  const sourceHash = `sha256:${hasher.sha256Hex('x = 1')}`;
+  void notebook;
+  const outcome = await handleNotebookEdit(
+    {
+      config: {
+        root: workspace, allowOutsideRoot: false, readOnly: false, images: 'auto', python: null,
+        kernelIdleSeconds: 3600, execTimeoutSeconds: 300, backgroundThresholdSeconds: 30,
+        backupKeep: 10, artifactDir: path.join(workspace, 'artifacts'), inlineTextChars: 20000,
+        previewLines: 12, maxImagesPerCall: 20, maxImageBytes: 20971520, logLevel: 'error',
+      },
+      fence: new PathFence(workspace, false, process.platform),
+      registry,
+      runStore,
+      hasher,
+      logger: createLogger('error'),
+      realpath: (target) => realpathSync(target),
+      platform: process.platform,
+    },
+    {
+      path: nb,
+      ops: [{ op: 'replace_source', cell_index: 0, expected_source_hash: sourceHash, new_text: 'x = 2' }],
+    },
+    { signal },
+  );
+  return toCallToolResult(outcome);
+}
+
+describe('[I16] background run vs kernel restart', () => {
+  it('fails the run immediately, writes completed cells, keeps status queryable', async () => {
+    const nb = await writeNb('i16.ipynb', [
+      codeCell('c0', 'a = 1'),
+      codeCell('c1', 'b = 2'),
+      codeCell('c2', 'import time\ntime.sleep(1)\nc = 3'),
+      codeCell('c3', 'import time\ntime.sleep(1)\nd = 4'),
+      codeCell('c4', 'e = 5'),
+    ]);
+    // 30s timeout x 5 cells = 150s > 30s threshold -> background.
+    const start = await callTool('notebook_run', {
+      path: nb, cell_selector: 'all', timeout_seconds: 30,
+    });
+    const startBody = JSON.parse(String(start.content[0]?.text ?? '{}')) as Record<string, unknown>;
+    expect(startBody['kind']).toBe('background');
+    const runId = String(startBody['run_id']);
+
+    // Wait until at least one cell completed (kernel startup can be slow
+    // when files run serially); poll the run status instead of a fixed sleep.
+    const deadline = Date.now() + 30_000;
+    for (;;) {
+      const poll = await callTool('notebook_run_status', { run_id: runId });
+      const pollBody = JSON.parse(String(poll.content[0]?.text ?? '{}')) as Record<string, unknown>;
+      const progress = pollBody['progress'] as Record<string, unknown>;
+      if (Number(progress?.['completed'] ?? 0) >= 2 || Date.now() > deadline) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+
+    const restart = await callTool('notebook_kernel', { action: 'restart', path: nb });
+    const restartBody = JSON.parse(String(restart.content[0]?.text ?? '{}')) as Record<string, unknown>;
+    expect(restartBody['action']).toBe('restart');
+    const newKernelId = String((restartBody['kernels'] as Array<Record<string, unknown>>)[0]?.['kernel_id'] ?? '');
+
+    // The run must be queryable at every moment after the restart (no dangling
+    // window) and immediately terminal.
+    const statusAfterRestart = await callTool('notebook_run_status', { run_id: runId });
+    const statusBody = JSON.parse(String(statusAfterRestart.content[0]?.text ?? '{}')) as Record<string, unknown>;
+    expect(['failed', 'completed', 'cancelled']).toContain(statusBody['state']);
+
+    // Give the background task time to observe the abort and write back.
+    await new Promise((resolve) => setTimeout(resolve, 6_000));
+
+    const finalStatus = await callTool('notebook_run_status', { run_id: runId });
+    const finalBody = JSON.parse(String(finalStatus.content[0]?.text ?? '{}')) as Record<string, unknown>;
+    expect(finalBody['state']).toBe('failed');
+    expect((finalBody['error'] as Record<string, unknown>)['code']).toBe('kernel_died');
+    const writeBack = finalBody['write_back'] as Record<string, unknown>;
+    expect(writeBack['performed']).toBe(true);
+
+    // The file contains the completed cells; cells that were in flight or
+    // never started are untouched (null execution_count, empty outputs).
+    const written = JSON.parse(await readFile(nb, 'utf8')) as { cells: Array<Record<string, unknown>> };
+    const completed = written.cells.filter((cell) => cell['execution_count'] !== null);
+    expect(completed.length).toBeGreaterThanOrEqual(1);
+    expect(completed.length).toBeLessThan(5);
+    // Restart did not auto-run anything on the fresh kernel.
+    expect(newKernelId).not.toBe('');
+    const kernelStatus = await callTool('notebook_kernel', { action: 'status' });
+    const kernels = JSON.parse(String(kernelStatus.content[0]?.text ?? '{}')) as { kernels: Array<Record<string, unknown>> };
+    const fresh = kernels.kernels.find((k) => k['kernel_id'] === newKernelId);
+    expect(fresh?.['execution_count']).toBeNull();
+  }, 180_000);
+});
+
+describe('[I12] stdout purity of the real stdio server', () => {
+  it('every stdout line from the spawned server is valid JSON-RPC', async () => {
+    // Build first (lib/bin.js must exist); pnpm is a .cmd on Windows -> shell.
+    const { execFileSync } = await import('node:child_process');
+    if (!existsSync(path.join(REPO_ROOT, 'lib', 'bin.js'))) {
+      execFileSync('pnpm build', { cwd: REPO_ROOT, stdio: 'ignore', timeout: 120_000, shell: true });
+    }
+
+    const serverWorkspace = await mkdtemp(path.join(tmpdir(), 'ipynb-mcp-stdio-'));
+    const nbPath = path.join(serverWorkspace, 'nb.ipynb');
+    await writeFile(nbPath, JSON.stringify({
+      nbformat: 4, nbformat_minor: 5, metadata: {},
+      cells: [{ cell_type: 'code', id: 'c0', metadata: {}, source: 'x = 1', outputs: [], execution_count: null }],
+    }));
+
+    const child = spawn(process.execPath, [path.join(REPO_ROOT, 'lib', 'bin.js'), '--root', serverWorkspace], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const stdoutLines: string[] = [];
+    child.stdout.on('data', (chunk: Buffer) => {
+      for (const line of chunk.toString('utf8').split('\n')) {
+        if (line.trim() !== '') {
+          stdoutLines.push(line);
+        }
+      }
+    });
+    let stderrText = '';
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderrText += chunk.toString('utf8');
+    });
+
+    const send = (message: Record<string, unknown>): void => {
+      child.stdin.write(`${JSON.stringify(message)}\n`);
+    };
+    const waitFor = async (predicate: () => boolean, timeoutMs: number): Promise<void> => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline && !predicate()) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      if (!predicate()) {
+        throw new Error('timed out waiting for server responses');
+      }
+    };
+
+    send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '0' } } });
+    send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+    send({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
+    send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'notebook_read', arguments: { path: nbPath } } });
+    await waitFor(() => stdoutLines.filter((line) => line.includes('"id":3')).length >= 1, 30_000);
+
+    child.stdin.end();
+    await new Promise<void>((resolve) => {
+      child.on('close', () => resolve());
+      setTimeout(resolve, 10_000).unref?.();
+    });
+
+    // R14/I12: every stdout line parses as JSON; diagnostics only on stderr.
+    expect(stdoutLines.length).toBeGreaterThanOrEqual(3);
+    for (const line of stdoutLines) {
+      expect(() => JSON.parse(line)).not.toThrow();
+    }
+    await rm(serverWorkspace, { recursive: true, force: true });
+  }, 180_000);
+});

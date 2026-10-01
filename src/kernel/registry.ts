@@ -5,11 +5,11 @@
 
 import { createHash } from 'node:crypto';
 
-import { IpynbError } from '../core/errors.ts';
-import { normalizeForCompare } from '../config.ts';
-import type { Logger } from '../log.ts';
-import { SidecarTransport, type SidecarTransportOptions } from './sidecar-transport.ts';
-import type { AnalyzeResult, ExecCellParams, ExecCellResult, KernelTransport } from './transport.ts';
+import { IpynbError } from '../core/errors.js';
+import { normalizeForCompare } from '../config.js';
+import type { Logger } from '../log.js';
+import { SidecarTransport, type SidecarTransportOptions } from './sidecar-transport.js';
+import type { AnalyzeResult, ExecCellParams, ExecCellResult, KernelTransport } from './transport.js';
 
 export interface KernelSessionInfo {
   readonly kernelId: string;

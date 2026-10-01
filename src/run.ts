@@ -8,16 +8,16 @@ import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 
-import { IpynbError, createWarning, type Warning } from './core/errors.ts';
-import { mapRawOutputs, type OutputItem } from './core/outputs.ts';
-import { cellSource, type Hasher } from './core/parse.ts';
-import { analyzeStale, downgradeConfidence, regexDefs, regexUses, type StaleCell } from './core/stale.ts';
-import type { IpynbConfig } from './config.ts';
-import { applyImagePolicy, shouldReturnImages, type ImagesPolicy } from './fs/artifact.ts';
-import { readNotebookFile, writeNotebookFile } from './fs/notebook-file.ts';
-import type { KernelRegistry } from './kernel/registry.ts';
-import { resolveInterpreter } from './kernel/interpreter.ts';
-import type { Logger } from './log.ts';
+import { IpynbError, createWarning, type Warning } from './core/errors.js';
+import { mapRawOutputs, type OutputItem } from './core/outputs.js';
+import { cellSource, type Hasher, type NotebookFile } from './core/parse.js';
+import { analyzeStale, downgradeConfidence, regexDefs, regexUses, type StaleCell } from './core/stale.js';
+import type { IpynbConfig } from './config.js';
+import { applyImagePolicy, shouldReturnImages, type ImagesPolicy } from './fs/artifact.js';
+import { readNotebookFile, writeNotebookFile } from './fs/notebook-file.js';
+import type { KernelRegistry } from './kernel/registry.js';
+import { resolveInterpreter } from './kernel/interpreter.js';
+import type { Logger } from './log.js';
 
 export type RunMode = 'auto' | 'resume' | 'replay' | 'full';
 export type ModeUsed = 'resume' | 'replay' | 'full';
@@ -31,6 +31,11 @@ export interface RunRequest {
   readonly clearOutputsBefore: boolean;
   readonly expectedContentHash?: string;
   readonly createBackup: boolean;
+  /** Cooperative cancellation: checked between cells; completed cells are still written back. */
+  readonly abort?: {
+    readonly signal: AbortSignal;
+    readonly reason: 'cancelled' | 'kernel_died';
+  };
 }
 
 export interface ExecutedCell {
@@ -71,6 +76,11 @@ export interface RunOutcome {
   readonly content_hash_after: string | null;
 }
 
+export type RunProgressEvent =
+  | { readonly phase: 'start'; readonly total: number }
+  | { readonly phase: 'cell'; readonly completed: number; readonly total: number; readonly current_cell_index: number }
+  | { readonly phase: 'write_back'; readonly completed: number; readonly total: number };
+
 export interface RunDeps {
   readonly registry: KernelRegistry;
   readonly hasher: Hasher;
@@ -79,6 +89,7 @@ export interface RunDeps {
   readonly logger?: Logger;
   readonly realpath: (target: string) => string;
   readonly platform?: NodeJS.Platform;
+  readonly onProgress?: (event: RunProgressEvent) => void;
 }
 
 /** Parse a cell_selector into ascending deduped code-cell indexes (SPEC §4.7). */
@@ -273,8 +284,13 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
     language: resolution.language,
   });
 
+  deps.onProgress?.({ phase: 'start', total: targets.length });
+
   // ---- replay prefix: silent, no outputs, no counters, nothing written ------
   for (const index of replayPrefix) {
+    if (isAborted(req.abort)) {
+      break; // outer abort branch performs the (empty) write-back and raises
+    }
     const cell = notebook.cells[index]!;
     await deps.registry.execCell(req.path, {
       code: cellSource(cell),
@@ -300,7 +316,11 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
   let sawTimeout = false;
 
   for (const index of targets) {
+    if (isAborted(req.abort)) {
+      break; // fall through to the outer abort branch: write back completed cells
+    }
     const cell = notebook.cells[index]!;
+    deps.onProgress?.({ phase: 'cell', completed: executed.length, total: targets.length, current_cell_index: index });
     let result;
     try {
       result = await deps.registry.execCell(req.path, {
@@ -310,8 +330,11 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
         timeoutMs: req.timeoutSeconds * 1000,
       });
     } catch (cause) {
-      if (cause instanceof IpynbError && cause.code === 'kernel_busy') {
-        throw cause;
+      if (isAborted(req.abort)) {
+        // The kernel was killed while this cell was in flight (restart/
+        // shutdown raced the execution): fall through to the abort branch so
+        // completed cells still get written back (SPEC §4.8 rule 3).
+        break;
       }
       throw cause;
     }
@@ -369,31 +392,40 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
       break;
     }
 
-    // Update the in-memory model for the write-back (completed cells only).
-    cell.outputs = [...result.result.rawOutputs];
-    cell.execution_count = result.result.executionCount;
-    executedCellsSet.add(index);
+    // A cell interrupted by the abort (status error) is NOT a completed cell:
+    // its partial output never lands (SPEC §4.8 rule 2). Cells that finished
+    // cleanly (ok) still count, even if the abort raced in afterwards.
+    const abortedNow = isAborted(req.abort);
+    const interruptedByAbort = abortedNow && result.result.status === 'error';
+    if (!interruptedByAbort) {
+      cell.outputs = [...result.result.rawOutputs];
+      cell.execution_count = result.result.executionCount;
+      executedCellsSet.add(index);
+    }
+    if (abortedNow) {
+      break;
+    }
   }
 
   if (sawTimeout) {
     // Write back the cells that DID complete (SPEC §4.7 rule 5), then raise
     // exec_timeout with the partial state in detail.
-    let timeoutWriteBack: RunOutcome['write_back'] = { performed: false, backup_path: null };
-    if (req.writeOutputs && executedCellsSet.size > 0) {
-      const partialWrite = await writeNotebookFile(notebook, req.path, {
-        hasher: deps.hasher,
-        backupKeep: deps.config.backupKeep,
-        createBackup: req.createBackup,
-        expectedContentHash: notebook.contentHash,
-        platform,
-      });
-      timeoutWriteBack = { performed: true, backup_path: partialWrite.backupPath };
-    }
+    const timeoutWriteBack = await writeBackCompleted(notebook, req, deps, platform, executedCellsSet);
     const timeoutCell = executed[executed.length - 1];
     throw new IpynbError('exec_timeout', `cell execution timed out after ${req.timeoutSeconds}s (interrupt did not land)`, {
       cell_index: timeoutCell?.cell_index ?? null,
       completed_cells: executed.length - 1,
       write_back: timeoutWriteBack,
+    });
+  }
+
+  if (isAborted(req.abort)) {
+    // Completed cells stay written; the interrupted cell never lands (SPEC §4.8).
+    const abortWriteBack = await writeBackCompleted(notebook, req, deps, platform, executedCellsSet);
+    const code = req.abort!.reason === 'kernel_died' ? 'kernel_died' : 'cancelled';
+    throw new IpynbError(code, `run aborted (${code})`, {
+      executed_cells: executed.length,
+      write_back: abortWriteBack,
     });
   }
 
@@ -474,6 +506,7 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
   }
 
   // ---- write-back -------------------------------------------------------------
+  deps.onProgress?.({ phase: 'write_back', completed: executed.length, total: targets.length });
   let writeBack: RunOutcome['write_back'] = { performed: false, backup_path: null };
   let contentHashAfter: string | null = null;
   if (req.writeOutputs && executedCellsSet.size > 0) {
@@ -512,6 +545,30 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
 }
 
 // ---------------------------------------------------------------------------
+
+function isAborted(abort: RunRequest['abort']): boolean {
+  return abort?.signal.aborted === true;
+}
+
+async function writeBackCompleted(
+  notebook: NotebookFile,
+  req: RunRequest,
+  deps: RunDeps,
+  platform: NodeJS.Platform,
+  executedCellsSet: ReadonlySet<number>,
+): Promise<RunOutcome['write_back']> {
+  if (!req.writeOutputs || executedCellsSet.size === 0) {
+    return { performed: false, backup_path: null };
+  }
+  const partialWrite = await writeNotebookFile(notebook, req.path, {
+    hasher: deps.hasher,
+    backupKeep: deps.config.backupKeep,
+    createBackup: req.createBackup,
+    expectedContentHash: notebook.contentHash,
+    platform,
+  });
+  return { performed: true, backup_path: partialWrite.backupPath };
+}
 
 function mappedTruncated(executed: readonly ExecutedCell[]): boolean {
   return executed.some((entry) =>

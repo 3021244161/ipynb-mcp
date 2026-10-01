@@ -5,7 +5,7 @@ import {
   NdjsonFramer,
   ProtocolFramingError,
   parseSidecarMessage,
-} from '../../src/kernel/protocol.ts';
+} from '../../src/kernel/protocol.js';
 
 describe('[step7][U22] NDJSON framing', () => {
   it('reassembles a response split across multiple chunks', () => {

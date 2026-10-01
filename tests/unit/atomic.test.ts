@@ -5,8 +5,8 @@ import path from 'node:path';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { IpynbError } from '../../src/core/errors.ts';
-import { atomicWriteFile, type AtomicWriteDeps, type FileHandleLike } from '../../src/fs/atomic.ts';
+import { IpynbError } from '../../src/core/errors.js';
+import { atomicWriteFile, type AtomicWriteDeps, type FileHandleLike } from '../../src/fs/atomic.js';
 
 let dir: string;
 

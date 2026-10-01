@@ -4,7 +4,7 @@ import path from 'node:path';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { IpynbError } from '../../src/core/errors.ts';
+import { IpynbError } from '../../src/core/errors.js';
 import {
   cellSource,
   cellSourceHash,
@@ -13,9 +13,9 @@ import {
   serializeNotebook,
   setCellSource,
   sourceToArray,
-} from '../../src/core/parse.ts';
-import { hasher } from '../../src/hash.ts';
-import { readNotebookFile, writeNotebookFile } from '../../src/fs/notebook-file.ts';
+} from '../../src/core/parse.js';
+import { hasher } from '../../src/hash.js';
+import { readNotebookFile, writeNotebookFile } from '../../src/fs/notebook-file.js';
 
 let dir: string;
 

@@ -7,8 +7,8 @@ import {
   createWarning,
   type JsonValue,
   type Warning,
-} from './errors.ts';
-import type { MarkdownIssue } from './markdown.ts';
+} from './errors.js';
+import type { MarkdownIssue } from './markdown.js';
 import {
   cellSource,
   cellSourceHash,
@@ -16,12 +16,12 @@ import {
   type Hasher,
   type NotebookCell,
   type NotebookFile,
-} from './parse.ts';
+} from './parse.js';
 
 /** Raw op as it arrives from JSON — fields are narrowed defensively inside. */
 export type EditOpInput = Readonly<Record<string, unknown>>;
 
-export type { MarkdownIssue } from './markdown.ts';
+export type { MarkdownIssue } from './markdown.js';
 
 export interface ChangedCell {
   readonly cell_index: number;

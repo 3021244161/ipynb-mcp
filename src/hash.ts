@@ -3,7 +3,7 @@
 
 import { createHash } from 'node:crypto';
 
-import type { Hasher } from './core/parse.ts';
+import type { Hasher } from './core/parse.js';
 
 export function sha256Hex(input: string | Uint8Array): string {
   return createHash('sha256').update(input).digest('hex');

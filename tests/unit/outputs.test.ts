@@ -4,9 +4,9 @@ import path from 'node:path';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { mapRawOutputs, type RawOutput } from '../../src/core/outputs.ts';
-import { applyImagePolicy, shouldReturnImages } from '../../src/fs/artifact.ts';
-import { hasher } from '../../src/hash.ts';
+import { mapRawOutputs, type RawOutput } from '../../src/core/outputs.js';
+import { applyImagePolicy, shouldReturnImages } from '../../src/fs/artifact.js';
+import { hasher } from '../../src/hash.js';
 
 let artifactRoot: string;
 let notebookPath: string;

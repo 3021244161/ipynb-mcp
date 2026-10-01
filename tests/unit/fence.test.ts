@@ -5,8 +5,8 @@ import path from 'node:path';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { IpynbError } from '../../src/core/errors.ts';
-import { PathFence } from '../../src/fs/fence.ts';
+import { IpynbError } from '../../src/core/errors.js';
+import { PathFence } from '../../src/fs/fence.js';
 
 let workspace: string;
 let root: string;

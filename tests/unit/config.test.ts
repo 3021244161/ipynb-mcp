@@ -7,7 +7,7 @@ import {
   validateStartupFiles,
   type EnvLike,
   type StartupFsDeps,
-} from '../../src/config.ts';
+} from '../../src/config.js';
 
 const BASE_ENV: EnvLike = {
   LOCALAPPDATA: 'C:/Users/test/AppData/Local',

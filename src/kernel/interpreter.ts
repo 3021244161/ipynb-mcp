@@ -8,7 +8,7 @@
 
 import path from 'node:path';
 
-import { IpynbError, createWarning, type JsonValue, type Warning } from '../core/errors.ts';
+import { IpynbError, createWarning, type JsonValue, type Warning } from '../core/errors.js';
 
 export interface InterpreterCandidate {
   readonly path: string;

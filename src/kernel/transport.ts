@@ -1,7 +1,7 @@
 // KernelTransport interface (D3): isolates the sidecar implementation so a
 // pure-Node ZMQ transport can replace it later without touching callers.
 
-import type { RawOutput } from '../core/outputs.ts';
+import type { RawOutput } from '../core/outputs.js';
 
 export interface PingResult {
   readonly pythonVersion: string;

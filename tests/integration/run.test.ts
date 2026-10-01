@@ -11,15 +11,15 @@ import { fileURLToPath } from 'node:url';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import type { IpynbConfig } from '../../src/config.ts';
-import { IpynbError } from '../../src/core/errors.ts';
-import { parseNotebook } from '../../src/core/parse.ts';
-import { hasher } from '../../src/hash.ts';
-import { KernelRegistry } from '../../src/kernel/registry.ts';
-import { pythonPrefix, resolveInterpreter } from '../../src/kernel/interpreter.ts';
-import { SidecarTransport } from '../../src/kernel/sidecar-transport.ts';
-import { runNotebook, type RunDeps, type RunRequest } from '../../src/run.ts';
-import { createLogger } from '../../src/log.ts';
+import type { IpynbConfig } from '../../src/config.js';
+import { IpynbError } from '../../src/core/errors.js';
+import { parseNotebook } from '../../src/core/parse.js';
+import { hasher } from '../../src/hash.js';
+import { KernelRegistry } from '../../src/kernel/registry.js';
+import { pythonPrefix, resolveInterpreter } from '../../src/kernel/interpreter.js';
+import { SidecarTransport } from '../../src/kernel/sidecar-transport.js';
+import { runNotebook, type RunDeps, type RunRequest } from '../../src/run.js';
+import { createLogger } from '../../src/log.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const VENV_DIR = path.join(REPO_ROOT, 'tests', '.venv-test');

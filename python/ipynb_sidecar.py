@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import time
 from queue import Empty
 
@@ -57,11 +58,18 @@ class KernelEntry:
 
 
 KERNELS: dict[str, KernelEntry] = {}
+KERNELS_LOCK = threading.Lock()
+STDOUT_LOCK = threading.Lock()
+
+
+class KernelDiedError(RuntimeError):
+    """Raised when a kernel process dies during an operation."""
 
 
 def send(obj: dict) -> None:
-    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
+    with STDOUT_LOCK:
+        sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
 
 
 def send_log(level: str, message: str) -> None:
@@ -136,13 +144,15 @@ def op_start_kernel(params: dict) -> dict:
     except Exception as exc:
         entry.shutdown()
         raise RuntimeError(f"kernel did not become ready: {exc}") from exc
-    KERNELS[kernel_id] = entry
+    with KERNELS_LOCK:
+        KERNELS[kernel_id] = entry
     return {"pid": entry.pid(), "kernelSpecName": kernel_spec_name, "language": language}
 
 
 def op_exec_cell(params: dict) -> dict:
     kernel_id = params["kernelId"]
-    entry = KERNELS.get(kernel_id)
+    with KERNELS_LOCK:
+        entry = KERNELS.get(kernel_id)
     if entry is None:
         raise RuntimeError(f"unknown kernel: {kernel_id}")
     kc = entry.client
@@ -179,19 +189,19 @@ def op_exec_cell(params: dict) -> dict:
             if interrupt_deadline is None and now >= deadline:
                 if not entry.km.is_alive():
                     send_kernel_died(kernel_id)
-                    raise RuntimeError("kernel died during execution")
+                    raise KernelDiedError("kernel died during execution")
                 try:
                     entry.km.interrupt_kernel()
                 except Exception as exc:  # interrupt failed on a dead kernel
                     if not entry.km.is_alive():
                         send_kernel_died(kernel_id)
-                        raise RuntimeError(f"kernel died during execution: {exc}") from exc
+                        raise KernelDiedError(f"kernel died during execution: {exc}") from exc
                 interrupt_deadline = now + 5.0
                 continue
             if interrupt_deadline is not None and now >= interrupt_deadline:
                 if not entry.km.is_alive():
                     send_kernel_died(kernel_id)
-                    raise RuntimeError("kernel died during execution")
+                    raise KernelDiedError("kernel died during execution")
                 status = "timeout"
                 break
             continue
@@ -257,7 +267,8 @@ def op_exec_cell(params: dict) -> dict:
 
 
 def op_interrupt(params: dict) -> dict:
-    entry = KERNELS.get(params["kernelId"])
+    with KERNELS_LOCK:
+        entry = KERNELS.get(params["kernelId"])
     if entry is None:
         raise RuntimeError(f"unknown kernel: {params['kernelId']}")
     entry.km.interrupt_kernel()
@@ -266,7 +277,8 @@ def op_interrupt(params: dict) -> dict:
 
 def op_shutdown_kernel(params: dict) -> dict:
     kernel_id = params["kernelId"]
-    entry = KERNELS.pop(kernel_id, None)
+    with KERNELS_LOCK:
+        entry = KERNELS.pop(kernel_id, None)
     if entry is None:
         return {"ok": True}
     entry.shutdown()
@@ -274,7 +286,8 @@ def op_shutdown_kernel(params: dict) -> dict:
 
 
 def op_kernel_status(params: dict) -> dict:
-    entry = KERNELS.get(params["kernelId"])
+    with KERNELS_LOCK:
+        entry = KERNELS.get(params["kernelId"])
     if entry is None:
         return {"alive": False, "executionCount": None, "pid": None}
     return {
@@ -285,8 +298,10 @@ def op_kernel_status(params: dict) -> dict:
 
 
 def op_shutdown_all(_params: dict) -> dict:
-    for kernel_id in list(KERNELS.keys()):
-        entry = KERNELS.pop(kernel_id)
+    with KERNELS_LOCK:
+        pending = list(KERNELS.items())
+        KERNELS.clear()
+    for kernel_id, entry in pending:
         try:
             entry.shutdown()
         except Exception as exc:
@@ -387,15 +402,17 @@ def handle_request(request: dict) -> None:
         result = handler(params)
         send({"id": request_id, "ok": True, "result": result})
     except Exception as exc:
+        code = "kernel_died" if isinstance(exc, KernelDiedError) else "internal"
         send({
             "id": request_id,
             "ok": False,
-            "error": {"code": "internal", "message": f"{type(exc).__name__}: {exc}"},
+            "error": {"code": code, "message": f"{type(exc).__name__}: {exc}"},
         })
 
 
 def main() -> int:
     send_log("info", "sidecar ready")
+    workers: list[threading.Thread] = []
     for line in sys.stdin:
         stripped = line.strip()
         if not stripped:
@@ -408,8 +425,15 @@ def main() -> int:
         if not isinstance(request, dict):
             send_log("warn", "request is not an object")
             continue
-        handle_request(request)
+        # Each request runs on its own worker thread: an in-flight exec_cell
+        # (which blocks for its whole timeout window) must not delay interrupt
+        # or shutdown ops (SPEC §4.6.2 / §4.8 — "interrupt immediately").
+        worker = threading.Thread(target=handle_request, args=(request,), daemon=True)
+        worker.start()
+        workers.append(worker)
     # stdin closed: clean shutdown path (Node normally calls shutdown_all first).
+    for worker in workers:
+        worker.join(timeout=5)
     op_shutdown_all({})
     return 0
 

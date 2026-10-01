@@ -4,7 +4,7 @@
 
 import path from 'node:path';
 
-import type { JsonValue } from '../core/errors.ts';
+import type { JsonValue } from '../core/errors.js';
 
 export interface BackupDeps {
   copyFile(src: string, dest: string): Promise<void>;

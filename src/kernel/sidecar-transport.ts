@@ -7,13 +7,13 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-import { IpynbError } from '../core/errors.ts';
+import { IpynbError } from '../core/errors.js';
 import {
   NdjsonFramer,
   ProtocolFramingError,
   parseSidecarMessage,
   type SidecarRequest,
-} from './protocol.ts';
+} from './protocol.js';
 import type {
   AnalyzeResult,
   ExecCellParams,
@@ -23,7 +23,7 @@ import type {
   PingResult,
   StartKernelParams,
   StartKernelResult,
-} from './transport.ts';
+} from './transport.js';
 
 export type SpawnFn = typeof spawn;
 

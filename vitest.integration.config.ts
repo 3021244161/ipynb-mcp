@@ -5,6 +5,7 @@ export default defineConfig({
     include: ['tests/integration/**/*.test.ts'],
     environment: 'node',
     testTimeout: 180_000,
+    fileParallelism: false, // real kernels are timing-sensitive; run files serially
     hookTimeout: 180_000,
   },
 });

@@ -6,7 +6,7 @@ import {
   regexDefs,
   regexUses,
   type StaleCellMeta,
-} from '../../src/core/stale.ts';
+} from '../../src/core/stale.js';
 
 interface CellSpec {
   defs: string[];

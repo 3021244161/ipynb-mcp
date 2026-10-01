@@ -4,7 +4,7 @@ import path from 'node:path';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { createBackup, type BackupDeps } from '../../src/fs/backup.ts';
+import { createBackup, type BackupDeps } from '../../src/fs/backup.js';
 
 let dir: string;
 

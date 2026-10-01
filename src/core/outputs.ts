@@ -3,8 +3,8 @@
 // exactly 0 or 1 items. Pure logic — base64 decoding uses the global atob,
 // image headers are parsed by hand (no image libraries, SPEC §4.4).
 
-import type { JsonValue } from './errors.ts';
-import type { Hasher } from './parse.ts';
+import type { JsonValue } from './errors.js';
+import type { Hasher } from './parse.js';
 
 /** Raw output as delivered by the sidecar protocol (SPEC §5.8, + metadata for §4.4). */
 export interface RawOutput {

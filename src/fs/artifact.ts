@@ -10,9 +10,9 @@ import { createHash } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
-import { createWarning, type Warning } from '../core/errors.ts';
-import type { ExtractedImage, OutputItem } from '../core/outputs.ts';
-import { normalizeForCompare } from '../config.ts';
+import { createWarning, type Warning } from '../core/errors.js';
+import type { ExtractedImage, OutputItem } from '../core/outputs.js';
+import { normalizeForCompare } from '../config.js';
 
 export type ImagesPolicy = 'auto' | 'never' | 'always';
 

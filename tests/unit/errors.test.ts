@@ -4,7 +4,7 @@ import {
   IpynbError,
   WARNING_CODES,
   createWarning,
-} from '../../src/core/errors.ts';
+} from '../../src/core/errors.js';
 
 describe('[step1] error codes (SPEC §7 closed set)', () => {
   it('defines exactly 24 error-class and 11 warning-class codes (35 total)', () => {

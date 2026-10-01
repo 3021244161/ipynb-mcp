@@ -10,12 +10,12 @@ import { fileURLToPath } from 'node:url';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import type { IpynbConfig } from '../../src/config.ts';
-import { hasher } from '../../src/hash.ts';
-import { KernelRegistry } from '../../src/kernel/registry.ts';
-import { pythonPrefix } from '../../src/kernel/interpreter.ts';
-import { runNotebook, type RunDeps } from '../../src/run.ts';
-import { createLogger } from '../../src/log.ts';
+import type { IpynbConfig } from '../../src/config.js';
+import { hasher } from '../../src/hash.js';
+import { KernelRegistry } from '../../src/kernel/registry.js';
+import { pythonPrefix } from '../../src/kernel/interpreter.js';
+import { runNotebook, type RunDeps } from '../../src/run.js';
+import { createLogger } from '../../src/log.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const VENV_DIR = path.join(REPO_ROOT, 'tests', '.venv-test');

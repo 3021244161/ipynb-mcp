@@ -4,16 +4,16 @@
 
 import { copyFile, readFile, readdir, unlink } from 'node:fs/promises';
 
-import { IpynbError } from '../core/errors.ts';
+import { IpynbError } from '../core/errors.js';
 import {
   parseNotebook,
   selfCheckNotebook,
   serializeNotebook,
   type Hasher,
   type NotebookFile,
-} from '../core/parse.ts';
-import { atomicWriteFile } from './atomic.ts';
-import { createBackup } from './backup.ts';
+} from '../core/parse.js';
+import { atomicWriteFile } from './atomic.js';
+import { createBackup } from './backup.js';
 
 export async function readNotebookFile(absolutePath: string, hasher: Hasher): Promise<NotebookFile> {
   let bytes: Uint8Array;

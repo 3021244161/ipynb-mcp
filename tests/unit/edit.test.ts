@@ -4,10 +4,10 @@ import path from 'node:path';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { applyEditOps, type EditOpInput } from '../../src/core/edit.ts';
-import { IpynbError } from '../../src/core/errors.ts';
-import { cellSource, cellSourceHash, parseNotebook, serializeNotebook } from '../../src/core/parse.ts';
-import { hasher } from '../../src/hash.ts';
+import { applyEditOps, type EditOpInput } from '../../src/core/edit.js';
+import { IpynbError } from '../../src/core/errors.js';
+import { cellSource, cellSourceHash, parseNotebook, serializeNotebook } from '../../src/core/parse.js';
+import { hasher } from '../../src/hash.js';
 
 let dir: string;
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createLogger } from '../../src/log.ts';
+import { createLogger } from '../../src/log.js';
 
 function capture(): { lines: string[]; sink: (line: string) => void } {
   const lines: string[] = [];

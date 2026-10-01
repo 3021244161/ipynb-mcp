@@ -2,7 +2,7 @@
 // Precedence: CLI args > environment variables > defaults.
 // Startup-time failures exit with code 2 (never 1 or 0) — see bin.ts.
 
-import type { LogLevel } from './log.ts';
+import type { LogLevel } from './log.js';
 
 export type ImagesPolicy = 'auto' | 'never' | 'always';
 
