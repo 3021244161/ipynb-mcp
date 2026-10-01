@@ -1,0 +1,4 @@
+{
+  "meta.title": "Jupyter Notebooks (ipynb-mcp)",
+  "meta.description": "Read, edit and run local Jupyter notebooks through a zero-config stdio MCP server. Edits are CAS-protected and long-running cells are never re-executed."
+}

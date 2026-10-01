@@ -104,7 +104,7 @@ async function cleanupTempFile(
   }
 }
 
-function isLockError(cause: unknown): boolean {
+export function isLockError(cause: unknown): boolean {
   return (
     cause instanceof Error &&
     ('code' in cause &&

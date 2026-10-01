@@ -12,7 +12,7 @@ import {
   type Hasher,
   type NotebookFile,
 } from '../core/parse.js';
-import { atomicWriteFile } from './atomic.js';
+import { atomicWriteFile, isLockError } from './atomic.js';
 import { createBackup } from './backup.js';
 
 export async function readNotebookFile(absolutePath: string, hasher: Hasher): Promise<NotebookFile> {
@@ -85,13 +85,26 @@ export async function writeNotebookFile(
 
   let backupPath: string | null = null;
   if (options.createBackup) {
-    const result = await createBackup(absolutePath, options.backupKeep, {
-      copyFile: (src, dest) => copyFile(src, dest),
-      readdir: (dir) => readdir(dir),
-      unlink: (target) => unlink(target),
-      now: options.now ?? (() => new Date()),
-    });
-    backupPath = result.backupPath;
+    try {
+      const result = await createBackup(absolutePath, options.backupKeep, {
+        copyFile: (src, dest) => copyFile(src, dest),
+        readdir: (dir) => readdir(dir),
+        unlink: (target) => unlink(target),
+        now: options.now ?? (() => new Date()),
+      });
+      backupPath = result.backupPath;
+    } catch (cause) {
+      // A held-open notebook blocks the backup copy too (Windows EBUSY etc.):
+      // same lock semantics as the rename path (D12).
+      if (isLockError(cause)) {
+        throw new IpynbError(
+          'notebook_locked',
+          `notebook file is locked by another process: ${absolutePath}`,
+          { path: absolutePath },
+        );
+      }
+      throw cause;
+    }
   }
 
   await atomicWriteFile(absolutePath, serialized, {

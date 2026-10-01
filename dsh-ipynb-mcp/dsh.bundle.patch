@@ -1,0 +1,17 @@
+# dsh bundle patch for ipynb-mcp
+#
+# Inserts an MCP client entry into dsh's configuration: the ipynb-mcp stdio
+# server is launched via npx on demand (zero service, zero tokens).
+# Paths are relative to the dsh config root where the patch applies.
+
+--- a/config.yaml
++++ b/config.yaml
+@@
++mcp:
++  servers:
++    ipynb:
++      transport: stdio
++      command: npx
++      args:
++        - "-y"
++        - "ipynb-mcp"

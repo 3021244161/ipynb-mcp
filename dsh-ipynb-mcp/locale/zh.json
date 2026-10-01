@@ -1,0 +1,4 @@
+{
+  "meta.title": "Jupyter 笔记本 (ipynb-mcp)",
+  "meta.description": "通过零配置的 stdio MCP 服务器读取、编辑并运行本地 Jupyter 笔记本。编辑带 CAS 保护，长时间运行的 cell 不会被重复执行。"
+}
