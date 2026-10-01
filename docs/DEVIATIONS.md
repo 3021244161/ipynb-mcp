@@ -6,5 +6,7 @@
 |---|---|---|---|---|---|---|
 | D-001 | 2026-10-02 | §5.1 `--backup-keep` / §5.9 | SPEC 未定义 `backup_keep=0` 的语义（"超过 backup_keep 时删除最旧的"在 0 时与"生成备份"自相矛盾）。实现取：`keep=0` 时**不创建备份**，返回 `backup_path: null`。 | 创建后立即删除是无意义的额外 I/O；"保留 0 份"的直译结果等价于"不备份"。 | 仅影响 `--backup-keep 0` 配置；默认 10 不受影响。 | 已实现（src/fs/backup.ts） |
 | D-002 | 2026-10-02 | §5.7 `unclosed-fence` | SPEC 判定为"去掉行内代码后，\`\`\` 与 ~~~ 围栏计数为奇数"。实现取：**行首（trim 后）以 \`\`\` / ~~~ 开头才计入围栏**，不做行内代码剥离。 | CommonMark 行内代码可跨行，完整剥离需跨行状态机；而"行内 \`\`\`"出现在句子中间时不在行首、天然不影响行首判定。两种实现仅在"一行以 \`\`\` 开头但属于跨行行内代码的后半段"这一歧义场景下分歧，该场景本身对 CommonMark 也是 fence（歧义）。 | 极罕见歧义场景下 fence 计数与严格 CommonMark 不同；常规 notebook 内容无差异。 | 已实现（src/core/markdown.ts） |
+| D-003 | 2026-10-02 | §5.8 `RawOutput` 类型 | §5.8 的 RawOutput 定义未含 `metadata` 字段，而 §4.4 要求图片宽高优先取 "output metadata 的 width/height"。实现为 RawOutput 增加 `metadata?: Record<string, unknown>`（sidecar 协议透传 jupyter output 的 metadata）。 | §4.4 的宽高优先级是明确的行为要求，无 metadata 字段则无法实现；jupyter 的 display_data/execute_result 天然携带 metadata。 | 仅增加可选字段，协议向后兼容；不影响既有判定顺序。 | 已实现（src/core/outputs.ts） |
+
 
 
