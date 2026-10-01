@@ -37,6 +37,7 @@ interface Session {
   pid: number | null;
   generation: number;
   busy: boolean;
+  lastSeenContentHash: string | null;
   readonly transport: KernelTransport;
 }
 
@@ -157,6 +158,7 @@ export class KernelRegistry {
       pid: result.pid,
       generation: 0,
       busy: false,
+      lastSeenContentHash: null,
       transport,
     };
     this.#sessions.set(key, session);
@@ -255,6 +257,20 @@ export class KernelRegistry {
     const { interpreterPath, kernelSpecName, language } = session;
     await this.shutdown(notebookPath);
     return this.getOrCreate({ notebookPath, interpreterPath, kernelSpecName, language });
+  }
+
+  /** Last content hash observed for this notebook's kernel session, if any. */
+  lastSeenContentHash(notebookPath: string): string | null {
+    const session = this.#findSessionByNotebook(notebookPath);
+    return session === null ? null : session.lastSeenContentHash;
+  }
+
+  /** Record the content hash the kernel's state currently reflects. */
+  setLastSeenContentHash(notebookPath: string, contentHash: string | null): void {
+    const session = this.#findSessionByNotebook(notebookPath);
+    if (session !== null) {
+      session.lastSeenContentHash = contentHash;
+    }
   }
 
   /** Notify that the notebook was edited (bumps generation for stale analysis). */
