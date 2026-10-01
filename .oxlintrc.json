@@ -1,0 +1,9 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "rules": {
+    "no-console": "error",
+    "no-empty": "error",
+    "no-throw-literal": "error",
+    "typescript/no-non-null-assertion": "off"
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "name": "ipynb-mcp",
+  "version": "0.1.0",
+  "description": "MCP server (stdio) for AI agents to safely read, edit and run local Jupyter notebooks — zero service, CAS-guarded edits, resumable execution.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "ipynb-mcp": "./lib/bin.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "lib",
+    "python",
+    "README.md",
+    "LICENSE"
+  ],
+  "packageManager": "pnpm@11.7.0",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "lint": "oxlint src tests",
+    "test": "vitest run",
+    "test:integration": "vitest run --config vitest.integration.config.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "~1.31.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "oxlint": "^1.0.0",
+    "typescript": "^5.8.0",
+    "vitest": "^3.0.0"
+  }
+}

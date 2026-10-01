@@ -1,0 +1,3 @@
+singlePackage: true
+allowBuilds:
+  esbuild: true
