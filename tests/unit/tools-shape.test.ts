@@ -169,6 +169,27 @@ describe('[step9][U24] response shape across all six tools', () => {
   });
 });
 
+describe('[D-015] a default single-cell run stays SYNCHRONOUS (E1 regression)', () => {
+  it('omitting timeout_seconds does not return a background handle', async () => {
+    // SPEC D14's literal formula (300 x 1 > 30) sent EVERY default run to
+    // background, contradicting §0. DEVIATIONS D-015 applies a conservative
+    // factor; this guards the default-path behaviour.
+    const nb = path.join(workspace, 'd15-default.ipynb');
+    await writeFile(nb, JSON.stringify({
+      nbformat: 4,
+      nbformat_minor: 5,
+      metadata: {},
+      cells: [{ cell_type: 'code', id: 'c0', metadata: {}, source: 'x = 1', outputs: [], execution_count: null }],
+    }));
+    const result = await callTool('notebook_run', { path: nb });
+    const body = JSON.parse(assertSingleTextBlock(result)) as Record<string, unknown>;
+    // Synchronous: the call resolves to an outcome/error, never a run handle.
+    expect(body['kind']).not.toBe('background');
+    expect(body['run_id']).toBeUndefined();
+    expect(body['code']).toBe('interpreter_not_found');
+  }, 60_000);
+});
+
 describe('[D7] timeout_seconds boundary values are accepted (SPEC §4.5 range 1..86400)', () => {
   it('accepts 1 (synchronous) and 86400 (background), rejecting neither as invalid', async () => {
     const nb = path.join(workspace, 'd7-timeout.ipynb');

@@ -14,11 +14,13 @@
 | 3 | A8–A14, A16（校验与边界） | `893aa2e` | ✅ 完成 |
 | 4 | A15, A17–A31（健壮性） | `f00d765` | ✅ 完成 |
 | 5 | B1/B4（模块边界与去重） | `e884891` | ✅ 完成 |
-| 5b | B2/B3/B5/B6（偏离登记） | — | ⬜ 待办 |
+| 5b | B2/B3/B5/B6（偏离登记） | 见下 | ✅ 完成（D-007~D-011） |
 | 6 | C1–C6（发布链与 CLI） | `abaa0c7` | ✅ 完成 |
-| 7 | D1–D3, D5(2/5), D7(1/4) | `867a19b` | 🟡 部分完成 |
-| 7b | D4, D5 余项, D6, D7 余项 | — | ⬜ 待办 |
-| 8 | E1–E3（SPEC 缺陷）+ 文档收尾 | — | ⬜ 待办 |
+| 7 | D1–D3 | `867a19b` | ✅ 完成 |
+| 7b | D4 | `b4f3457` | ✅ 完成 |
+| 7c | D6 | `020dd55` | ✅ 完成 |
+| 7d | D5 余项 + D7 余项 | `2e3d4bc` | ✅ 完成 |
+| 8 | E1–E3（SPEC 缺陷）+ 文档收尾 | 见下 | ✅ 完成（D-015~D-017 + README） |
 
 **门禁（提交 `867a19b` 时）**：`typecheck` 0 错 / `lint` 0 警 / 单测 **179/179** / 集成 **34/34**。
 
@@ -89,10 +91,10 @@
 | D1 | ✅ | 夹具支持预置输出；I5 断言超时/未执行 cell 的既有输出保留；新增 I18 / I18b / I-env |
 | D2 | ✅ | 新增 `tests/unit/analyze-op.test.ts` 驱动**真实 sidecar** analyze op（无 Python 时 skip）；**顺带捕获真实协议 bug**：sidecar 返回 `failed_cell_indexes` 而类型声明 `failedCellIndexes`，降级分析一直丢失失败索引 —— 已改名并覆盖 |
 | D3 | ✅ | 新增 `tests/unit/edit-tool.test.ts` 走真实工具层（U2/U8/U9/U12）；CAS 失败文件与备份均不变、一次重试契约、`dry_run` 三断言、`file_changed` 带 expected/actual |
-| D4 | ⬜ | 8 处用例缺失/失真待修：U13 ✅（本轮补）、U20 ✅（本轮补）已解决；**余** U12 工具层 ✅、I3（去掉 `void before`）、I7（补下一次 replay）、I9（restart 无 cell 执行）、I12（stderr 断言）、I13/I14（真在途）、I16（终态集合断言）、I17（不 mock 探针） |
-| D5 | 🟡 | 已修 2/5：protocol 胶囊常量 → 独立字面量 ✅；log stdout 定向断言 ✅。**余** `atomic.test.ts` 用例名（wx flag）与实际不符、`outputs.test.ts` base64 前缀断言（应解码判魔数）、`tools-shape.test.ts` 恒真式 |
-| D6 | ⬜ | 状态污染：两个集成文件改 `JUPYTER_PATH` 不恢复；`kernel.test.ts` 的 I11 PID 采集依赖同文件前序用例 |
-| D7 | 🟡 | 已修 1/4：NDJSON 恰好 64 MiB ✅。**余** `ops` 恰好 32、`timeout_seconds` = 1/86400、`max_images_per_call` 恰好 20 |
+| D4 | ✅ | I3 去掉 `void before` 并改为文档级「仅 cell 5 变化」断言；I9 不再执行 cell 来「证明可用」；I12 补 stderr 断言；I14 改为真在途（多 MB notebook + 下一 tick abort）；I16 改精确集合断言；I17 用真实 venv 取代被 mock 的探针。**顺带查出两个真实缺陷**：`kernelspec_mismatch` 在 `.venv` 回退路径从不发出（SPEC §5.2 触发条件 3 不依赖 kernelspec 可用）；失败 run 的 `executed` 从未进入 error detail（此前的补丁因缩进变化静默未生效），导致 `notebook_run_status` 对 timeout/abort run 返回空 `executed` |
+| D5 | ✅ | protocol 常量 → 独立字面量；log stdout 定向断言；`tools-shape` 恒真式 → 确定性断言；`atomic.test.ts` 用例改名并补真正的 wx flag 断言（注入 EEXIST）；`outputs.test.ts` 改为「解码 + PNG/JPEG 魔数」判定，不再 grep 两个字面前缀 |
+| D6 | ✅ | `run.test.ts`/`server.test.ts` 保存并恢复 `JUPYTER_PATH`；`kernel.test.ts` 的 I11 改为自包含（自行 spawn 待检查的 sidecar 与 kernel，并断言被检查集合非空以堵住「空循环假绿」），已验证可单独 `-t '[I11]'` 运行 |
+| D7 | ✅ | NDJSON 恰好 64 MiB 接受 / 64 MiB+1 拒绝；`ops` 恰好 32 端到端通过；`timeout_seconds` 1 走同步、86400 走后台（两者均证明通过校验）；恰好 20 张图全部物化且索引 0..19 无 `image_limit` |
 | D8 | ⬜ | E1–E9 手工验收未执行（DoD 未达成，清单已交付 `docs/E2E-CHECKLIST.md`，由 boss 执行留档） |
 | D9 | ✅ | 评审确认为正面实践，无需整改 |
 
@@ -100,19 +102,25 @@
 
 | # | 结论 | 处理 |
 |---|---|---|
-| E1 | ⬜ | D14 后台判定式使同步路径在默认配置下不可达（`300 × 1 = 300 > 30` → **每次 run 都进后台**），与 §0「≤60s 跑通第一个 cell / 不烧 token」冲突。属 SPEC 自相矛盾 → 记 DEVIATIONS 后取**改动最小**解法（保守估计式，不加新参数） |
-| E2 | ⬜ | R6「禁止读写 root 之外」与 §5.2 解释器探测（读 `~/.local/share/jupyter/kernels`、执行 PATH 上 `python`）冲突。实现按 §5.2 → 记 DEVIATIONS 并注明豁免面 |
-| E3 | ⬜ | 单行 64 MiB 上限与 §4.4「20 × 20 MiB 图片」上限自相矛盾（合法内容可触发协议错误并杀 sidecar）。记 DEVIATIONS，建议动态上限 |
+| E1 | ✅ | 判为 SPEC 自相矛盾，登记 **D-015**；最小改动修正判定式为保守倍数比较（`× 10`），默认单 cell 走同步路径，11+ cell 仍转后台。新增回归用例 `[D-015]` 断言默认调用不返回后台句柄。未加新参数（`run_in_background` 属 AGENTS §11「必须先问人类」） |
+| E2 | ✅ | 登记 **D-016**：R6 的围栏适用于用户文件（notebook / artifact / 备份）；解释器与 kernelspec 的**只读**探测不受围栏约束且不写入那些路径，豁免面集中声明在 `src/kernel/interpreter.ts` |
+| E3 | ✅ | 登记 **D-017**：上限语义严格按 §5.8 的「单行」判定（多条小行不再误杀），冲突本身在 README「已知限制」向用户披露；根治方案（分帧 / 按需 `fetch_output`）需 SPEC 修订，未实施 |
 
 ---
 
-## 七、下一步（按优先级）
+## 七、剩余事项
 
-1. **D4 / D5 余项 / D7 余项**：补齐缺失与失真的验收用例（评审列为 P1）。
-2. **D6**：修测试状态污染，使用例可单独运行。
-3. **B2 / B3 / B5 / B6**：补 `DEVIATIONS.md` D-007 起各条（AGENTS §0 强制）。
-4. **E1–E3**：登记 SPEC 缺陷偏离；E1 附带最小实现修正（保证默认单 cell 走同步路径）；README 补「已知限制」（单次执行图片总体积受 64 MiB 限制）。
-5. **D8**：E1–E9 由 boss 手工执行留档。
+| # | 事项 | 归属 |
+|---|---|---|
+| 1 | **E1–E9 手工端到端**（DoD 最后一项）：清单已交付 `docs/E2E-CHECKLIST.md`，需真实 MCP 客户端（Claude Code / Cursor / dsh）执行并留档截图或日志 | **boss** |
+| 2 | npm 发布与 `dsh-ipynb-mcp` bundle 发布（OPEN_QUESTIONS Q5/Q6）：按默认先不发布，发布前需人类确认 | **boss** |
+| 3 | SPEC v3.1 建议修订三处（D14 判定式、R6 豁免措辞、§5.8 上限公式）与两处补强（`clear_outputs` 的 cell 类型约束、选择器两种错误码分界） | 人类 / 下一轮 |
 
-> **停点说明**：本轮（token 受限后）完成了「批次 7 的进度收口 + 本状态文档」这一最小可控单元，
-> 门禁全绿并已提交 `867a19b`。后续从上方第 1 项继续。
+**整改侧工作全部完成**：A/B/C/D 四类共 52 项已闭环（D8 属人工验收，非实现缺陷）。
+
+## 八、本轮（token 受限后）的收口记录
+
+- 起点：批次 7（测试补强）中途，`protocol.test.ts` 与 `log.test.ts` 各有一个失败用例。
+- 已完成：最小单元修复 → 批次 7 全部（D1–D7）→ 批次 5b（B2/B3/B5/B6 偏离登记）→ 批次 8（E1–E3 + README）。
+- 期间由测试补强**查出并修复 2 个真实缺陷**（`kernelspec_mismatch` 漏发、失败 run 的 `executed` 为空），并发现此前一次补丁因缩进变化**静默未生效**——已如实记录在提交信息与本表 D4 行。
+- 最终门禁：`typecheck` 0 错 / `lint` 0 警 / 单测 **185/185** / 集成 **35/35**。

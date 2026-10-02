@@ -256,9 +256,10 @@ describe('[I16] background run vs kernel restart', () => {
       codeCell('c3', 'import time\ntime.sleep(1)\nd = 4'),
       codeCell('c4', 'e = 5'),
     ]);
-    // 30s timeout x 5 cells = 150s > 30s threshold -> background.
+    // Background requires clearing the conservative estimate (D-015):
+    // 300s x 5 cells = 1500 > 30s threshold x 10 -> background.
     const start = await callTool('notebook_run', {
-      path: nb, cell_selector: 'all', timeout_seconds: 30,
+      path: nb, cell_selector: 'all', timeout_seconds: 300,
     });
     const startBody = JSON.parse(String(start.content[0]?.text ?? '{}')) as Record<string, unknown>;
     expect(startBody['kind']).toBe('background');

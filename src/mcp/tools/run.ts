@@ -79,7 +79,15 @@ export async function handleNotebookRun(
       });
     }
 
-    const goesBackground = timeoutSeconds * targetCount > ctx.config.backgroundThresholdSeconds;
+    // D14's literal rule compares the timeout UPPER BOUND against the
+    // threshold, which sends every default run to background (300 x 1 > 30) and
+    // made the synchronous path dead code — contradicting SPEC §0 (<=60s to
+    // first cell, no token burn). DEVIATIONS D-015: compare against a
+    // conservative multiple so a default single-cell run stays synchronous
+    // while long/multi-cell runs still yield control.
+    const BACKGROUND_ESTIMATE_FACTOR = 10;
+    const goesBackground =
+      timeoutSeconds * targetCount > ctx.config.backgroundThresholdSeconds * BACKGROUND_ESTIMATE_FACTOR;
 
     if (!goesBackground) {
       const outcome = await runNotebook(
