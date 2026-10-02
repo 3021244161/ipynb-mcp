@@ -73,6 +73,15 @@ export class KernelRegistry {
   readonly #runActive = new Set<string>(); // reuseKeys with a whole run in flight
   /** normalized notebook path -> run abort sinks (see onRunAbort). */
   readonly #runAborts = new Map<string, Set<() => void>>();
+  /**
+   * normalized path (for one known spelling) -> resolved reuse key. `#norm` runs
+   * `realpathSync`, a real filesystem call, and every session lookup used to make
+   * one call per session plus one for the query — so a run of N cells did N
+   * synchronous stat chains on the hot path (review v4 NEW-4). The paths a
+   * process works with are a small, stable set, so memoizing them is safe: the
+   * entry is dropped whenever the session it came from is removed.
+   */
+  readonly #normCache = new Map<string, string>();
   readonly #idleSeconds: number;
   readonly #logger?: Logger;
   readonly #platform: NodeJS.Platform;
@@ -125,13 +134,19 @@ export class KernelRegistry {
    * about to be created) falls back to its own spelling.
    */
   #norm(notebookPath: string): string {
+    const cached = this.#normCache.get(notebookPath);
+    if (cached !== undefined) {
+      return cached;
+    }
     let canonical = notebookPath;
     try {
       canonical = this.#canonicalPath(notebookPath);
     } catch {
       // Unresolvable (missing/racing path): the literal spelling is all we have.
     }
-    return normalizeForCompare(canonical, this.#platform);
+    const normalized = normalizeForCompare(canonical, this.#platform);
+    this.#normCache.set(notebookPath, normalized);
+    return normalized;
   }
 
   #reuseKey(notebookPath: string, interpreterPath: string, kernelSpecName: string): string {
@@ -688,6 +703,15 @@ export class KernelRegistry {
     }
     if (this.#kernels.get(session.kernelId) === session) {
       this.#kernels.delete(session.kernelId);
+    }
+    // Drop the memoized realpath for this notebook: the path may be recreated
+    // (or turned into a different file) between sessions, and holding a stale
+    // resolution would key the next session to the wrong identity.
+    this.#normCache.delete(session.notebookPath);
+    for (const [spelling, normalized] of this.#normCache) {
+      if (normalized === normalizeForCompare(session.notebookPath, this.#platform)) {
+        this.#normCache.delete(spelling);
+      }
     }
   }
 

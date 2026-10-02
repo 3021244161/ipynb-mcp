@@ -38,96 +38,126 @@ export class ProtocolFramingError extends Error {
   }
 }
 
+/** Initial capacity of the partial-line buffer (one typical kernel message). */
+const INITIAL_STAGING_BYTES = 64 * 1024;
+
 export class NdjsonFramer {
   /**
-   * Chunks of the UNTERMINATED remainder only, plus how many bytes they hold.
-   * Accumulating into one growing buffer re-copied the whole line on every
-   * chunk (`Buffer.concat`), so a single max-size line cost O(L^2/chunk) — a
-   * 64 MiB line took ~9.4 s of main-thread CPU, which blocks the whole stdio
-   * server (review v3 PERF-1). Chunks are only concatenated when a line is
-   * actually emitted.
+   * The UNTERMINATED remainder, in ONE buffer that grows by doubling.
+   *
+   * Two earlier designs were both O(L^2) for a max-size line arriving in small
+   * chunks, and the review measured both. v3 kept a list of chunks and only
+   * concatenated when a line was emitted: that fixed the copy but left the SCAN
+   * re-reading the whole newline-free prefix on every push. v4 added a cursor,
+   * which exposed the last two quadratic terms — the per-push walk over the
+   * chunk list (34 million chunk visits for 64 MiB in 16 KiB chunks) and the
+   * `Buffer.concat` of a growing prefix (8.6 GB copied for the same input).
+   * A doubling buffer makes both amortised O(L): each byte is copied at most
+   * twice over the line's whole life, and never scanned twice.
+   *
+   * The invariant that keeps this simple: `#staging` NEVER contains a newline,
+   * so every complete line either lies inside the incoming chunk or straddles
+   * the boundary between the two. Nothing is ever moved backwards.
    */
-  #chunks: Buffer[] = [];
-  #pending = 0;
+  #staging: Buffer = Buffer.alloc(0);
+  /**
+   * Valid bytes at the front of `#staging`. The buffer itself is reused (its
+   * capacity only ever grows), because allocating a fresh one per line cost more
+   * than the copies it was meant to avoid: a 64 MiB payload of small lines
+   * allocated 65 537 buffers and took 27 s, slower than the implementation this
+   * replaced.
+   */
+  #stagingLength = 0;
+
+  /** Current partial line length (diagnostics). */
+  get pendingBytes(): number {
+    return this.#stagingLength;
+  }
 
   /** Feed a chunk; returns all complete lines (without trailing newline). */
   push(chunk: Buffer): string[] {
     if (chunk.length === 0) {
       return [];
     }
-    this.#chunks.push(chunk);
-    this.#pending += chunk.length;
     const lines: string[] = [];
-    try {
-      for (;;) {
-        const newlineIndex = this.#indexOfNewline();
-        if (newlineIndex < 0) {
-          break;
-        }
-        // Checked BEFORE copying: an over-long complete line must be rejected
-        // without materialising it (SPEC §5.8).
-        if (newlineIndex > MAX_LINE_BYTES) {
-          throw new ProtocolFramingError(`sidecar line exceeds ${MAX_LINE_BYTES} bytes (protocol error)`);
-        }
-        const line = this.#take(newlineIndex);
-        // Tolerate \r\n: strip a trailing CR.
-        const text = line.toString('utf8');
-        lines.push(text.endsWith('\r') ? text.slice(0, -1) : text);
+    let consumed = 0;
+    /** Bytes of the CURRENT line held in \#staging\. */
+    let pending = this.#stagingLength;
+    let newlineIndex = chunk.indexOf(0x0a);
+    while (newlineIndex >= 0) {
+      // Checked BEFORE copying: an over-long complete line must be rejected
+      // without materialising it (SPEC 5.8).
+      if (pending + (newlineIndex - consumed) > MAX_LINE_BYTES) {
+        throw new ProtocolFramingError('sidecar line exceeds ' + MAX_LINE_BYTES + ' bytes (protocol error)');
       }
-    } finally {
-      if (this.#pending === 0) {
-        // Free an empty chunk list even when the loop threw.
-        this.#chunks = [];
-      }
+      lines.push(decodeLine(this.#lineWith(chunk.subarray(consumed, newlineIndex), pending)));
+      // That line is complete. The loop continues INSIDE the same chunk, where
+      // every following line starts at a chunk boundary, so nothing is pending
+      // for them. Leaving the first line's bytes counted charged them to every
+      // later line too and rejected a chunk of many small lines (review A21).
+      pending = 0;
+      consumed = newlineIndex + 1;
+      newlineIndex = chunk.indexOf(0x0a, consumed);
     }
+    const tail = chunk.subarray(consumed);
+    if (tail.length === 0) {
+      // The chunk ended exactly on a newline, or held no newline and no bytes.
+      if (pending === 0) {
+        this.#staging = Buffer.alloc(0);
+      }
+    } else if (pending === 0) {
+      // Nothing pending, so the tail IS the current line and there is nothing to
+      // copy: adopt the caller chunk. Nothing mutates it, and a tail longer than
+      // the cap is caught below rather than copied first.
+      this.#staging = tail;
+      pending = tail.length;
+    } else {
+      this.#appendToStaging(tail, pending);
+      pending += tail.length;
+    }
+    this.#stagingLength = pending;
     // Only the unterminated remainder counts toward the cap: it is the only
-    // thing that can still grow into an over-long single line.
-    if (this.#pending > MAX_LINE_BYTES) {
-      throw new ProtocolFramingError(`sidecar line exceeds ${MAX_LINE_BYTES} bytes (protocol error)`);
+    // thing that can still grow into an over-long single line (a chunk holding
+    // many complete small lines legitimately exceeds it, review A21).
+    if (pending > MAX_LINE_BYTES) {
+      throw new ProtocolFramingError('sidecar line exceeds ' + MAX_LINE_BYTES + ' bytes (protocol error)');
     }
     return lines;
   }
 
-  /** Offset of the first '\n' across the pending chunks, or -1. */
-  #indexOfNewline(): number {
-    if (this.#pending === 0) {
-      return -1;
+  /** \#staging's pending bytes + \segment\, without copying when one side is empty. */
+  #lineWith(segment: Buffer, pending: number): Buffer {
+    if (pending === 0) {
+      return segment;
     }
-    let offset = 0;
-    for (const chunk of this.#chunks) {
-      const found = chunk.indexOf(0x0a);
-      if (found >= 0) {
-        return offset + found;
+    const held = this.#staging.subarray(0, pending);
+    if (segment.length === 0) {
+      return held;
+    }
+    return Buffer.concat([held, segment]);
+  }
+
+  /** Grow by doubling so each byte is copied a bounded number of times. */
+  #appendToStaging(tail: Buffer, pending: number): void {
+    const needed = pending + tail.length;
+    if (needed > this.#staging.length) {
+      let capacity = Math.max(INITIAL_STAGING_BYTES, this.#staging.length);
+      const cap = MAX_LINE_BYTES + 1;
+      while (capacity < needed) {
+        capacity = Math.min(cap, capacity * 2);
       }
-      offset += chunk.length;
+      const next = Buffer.allocUnsafe(capacity);
+      this.#staging.subarray(0, pending).copy(next, 0);
+      this.#staging = next;
     }
-    return -1;
+    tail.copy(this.#staging, pending);
   }
+}
 
-  /** Copy `length` bytes off the front of the pending chunks (nearly always one). */
-  #take(length: number): Buffer {
-    if (this.#chunks.length === 1) {
-      const only = this.#chunks[0]!;
-      // subarray shares the chunk's memory, so a fast path that slices is
-      // enough; the chunk stays referenced only for as long as `line` is.
-      const line = only.subarray(0, length);
-      const rest = only.subarray(length + 1);
-      this.#chunks = rest.length === 0 ? [] : [rest];
-      this.#pending = rest.length;
-      return line;
-    }
-    const joined = Buffer.concat(this.#chunks, length + 1);
-    const line = joined.subarray(0, length);
-    const rest = joined.subarray(length + 1);
-    this.#pending = rest.length;
-    this.#chunks = rest.length === 0 ? [] : [rest];
-    return line;
-  }
-
-  /** Current partial line length (diagnostics). */
-  get pendingBytes(): number {
-    return this.#pending;
-  }
+/** Strip a trailing CR so CRLF framing is tolerated (SPEC §5.8). */
+function decodeLine(line: Buffer): string {
+  const text = line.toString('utf8');
+  return text.endsWith('\r') ? text.slice(0, -1) : text;
 }
 
 export function isSidecarResponse(message: SidecarMessage): message is SidecarResponse {
