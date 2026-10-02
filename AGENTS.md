@@ -203,6 +203,12 @@ tests/{unit,integration}
 - sidecar 的 `spawn` **必须可注入**（SPEC §5.8），否则 I7/I11 无法测。
 - 不许 mock 掉被测逻辑本身（例如为了通过 CAS 测试而 mock 掉 CAS 校验）。
 - 新增行为必须同时新增或扩展用例，并在提交信息里说明。
+- **断言不能只说产品自己的方言。** 这是本项目付出过代价的教训：四轮评审都没发现"执行后写出的 notebooks 根本不是合法 nbformat"，因为写入方与测试**用同一套私有字段名**（`outputType`），于是整套用例都在验证一个错误的世界观。凡是"产出的文件/协议/接口是否合规"这类问题，必须引入**外部权威**来判定：
+  - notebooks 的合规性用 Python 的 `nbformat.validate`（`tests/integration/nbformat-validator.ts`）；
+  - 端到端行为用**真客户端**驱动真 stdio server（`scripts/e2e-smoke.mjs`，`pnpm smoke`）；
+  - 自己写的检查器（如 `findStructuralProblem`）只能当**快速防线**，不能替代外部权威，且必须与外部权威对同一批 fixture 同时通过（`tests/integration/fixtures-valid.test.ts`）。
+- **测试 fixture 本身也要过外部权威。** 历史上多个 fixture（kernelspec 缺 `display_name`、`execute_result` 缺 `execution_count`）本身就是非法 nbformat，这让"文件没问题"类断言失去意义。
+- **格式类问题必须用解析器查，不能抽样。** 同一个"整块缩进错位"事故出现过三次；`git diff -w` 看不见它，`oxlint` 也不管。`pnpm lint` 现在会跑 `scripts/check-format.mjs`（tab/行尾空白）与 `scripts/check-indent.mjs`（用 TypeScript parser 校验块缩进与闭合括号列）。
 
 ---
 

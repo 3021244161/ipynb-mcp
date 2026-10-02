@@ -1,0 +1,39 @@
+test: judge the product with something that does not share its assumptions
+
+The v4 review found a 🔴 that four rounds of unit and integration review had
+missed, and the reason is structural rather than careless: the writer emitted
+`outputType` and the tests asserted `outputType`, so every assertion agreed with
+the bug. Two rules follow, and this commit makes both automatic.
+
+1. The RESULT is validated by an external authority. `nbformat-validator.ts`
+   runs Python's own `nbformat.validate` in a child process (skipping, with a
+   recorded reason, when nbformat is absent rather than pretending to pass).
+   `[FID-1]` uses it on a real run's output, `[FID-3]` on a converted cell, and
+   `fixtures-valid.test.ts` on every notebook literal the suite is built from.
+   Its first run rejected nine fixtures: `kernelspec` without `display_name`,
+   `execute_result` without `execution_count`. Those fixtures had made every
+   "the file is fine" assertion vacuous, so they are fixed here too, and a
+   dependency-free static check now refuses new ones.
+
+2. The product is exercised the way a client exercises it. `scripts/e2e-smoke.mjs`
+   (`pnpm smoke`) spawns `lib/bin.js` and drives it with the real SDK client over
+   stdio, asserting 11 things a unit test cannot see: the tool list, the absence
+   of `outputSchema`, that an unknown argument comes back as `invalid_arguments`
+   from the TOOL layer, that a run completes, that the file passes
+   `nbformat.validate`, that the stored outputs use nbformat keys, that
+   `notebook_read` can read back what was written, and that diagnostics went to
+   stderr. Mutation-checked: restoring FID-1 turns it red.
+
+QUAL-1 — the same "whole block one level too shallow" accident had shipped three
+times, and my previous round judged it fixed after sampling the old line numbers,
+which is a method error rather than a slip. `scripts/check-indent.mjs` now
+decides it with the TypeScript parser: direct statements of a block share a
+column, and a closing brace sits at the column of the line that opened the
+construct. `src/run.ts` was converged with the same AST walk (7 statements and 6
+braces), and the check runs as part of `pnpm lint`.
+
+Hygiene: the leftover `probe-framer.mjs` is gone, and the scratch commit-message
+files are ignored.
+
+Verified: 227 unit (1 skipped), 44 integration across 6 files, `pnpm smoke` 11/11,
+`pnpm lint` 0 warnings including both structural checks.

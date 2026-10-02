@@ -1,27 +1,74 @@
 # 代码审查整改状态（review fix status）
 
-> **来源**：`docs/review/ipynb-mcp-code-review.md`（第一轮）、`…-v2.md`（第二轮）、`…-v3.md`（第三轮）
+> **来源**：`docs/review/ipynb-mcp-code-review.md`（第一轮）、`…-v2.md`（第二轮）、`…-v3.md`（第三轮）、`…-v4.md`（第四轮 / 本轮）
 > **权威**：`SPEC.md` + `AGENTS.md`。整改只做「实现与被 SPEC 判定不符」的部分；
 > SPEC 自身的缺陷按 AGENTS §0 记入 `DEVIATIONS.md` 后按 SPEC 继续。
 >
 > 各轮的逐条闭环记录见本文件末尾的「第三轮」「第二轮」「第一轮」三节；**门禁数字以本节为准**。
 >
 > **本文档的 ✅ 只代表"代码里存在该实现 + 有对应的可复现验证"。**
-> 第一轮曾出现 3 处"标 ✅ 但代码里不存在"的虚报（第二轮 V1–V3），本表因此按此标准重写，
-> 并在每一行给出验证位置（用例名或文件）。
+> 第一轮曾出现 3 处"标 ✅ 但代码里不存在"的虚报（第二轮 V1–V3）；第四轮又暴露出两个同类问题：
+> ① 我上一轮把 QUAL-1 判成"已修"，实际只改了另一段（**抽样范围过窄导致的方法错误**）；
+> ② 个别条目标了 ✅ 但只有"改过"、没有"验证过"（`prepack` 从未在无 pnpm 的前提下跑过）。
+> **因此本轮起，未做或未验证的条目一律标 ⬜ / ⚠️ 并在正文写明原因，不再标 ✅。**
 >
-> **门禁实测（第三轮整改后）**：`pnpm typecheck` 0 错 / `pnpm lint` 0 警（57 文件 99 规则 + `scripts/check-format.mjs`）/
-> 单测 **223（222 passed + 1 skipped）** / 集成 **39/39**（5 文件全绿）/ `npm pack --dry-run` 133 文件 / 全树 LF。
+> **门禁实测（第四轮整改后）**：`pnpm typecheck` 0 错 / `pnpm lint` 0 警（59 文件 99 规则 + `check-format` + `check-indent`）/
+> 单测 **227（226 passed + 1 skipped）** / 集成 **44/44**（6 文件全绿）/ `pnpm smoke` **11/11** /
+> `npm pack --dry-run` 133 文件（`prepack` 在无 pnpm 前提下重建 `lib/` 验证）/ 全树 LF。
 > 唯一 skip 是 U20（本机无法起 kernel，已记录原因并区分"环境不足"与"start_kernel 回归"）。集成用到的解释器见 `COMPATIBILITY.md`。
 
 ---
 
-## 〇、第三轮（`ipynb-mcp-code-review-v3.md`，本轮）
+## 〇、第四轮（`ipynb-mcp-code-review-v4.md`，本轮）
+
+> 该报告的核查方式变了：主审起了**真 stdio server + 真 SDK 客户端 + 真实历史 notebook** 做 E2E，
+> 并用 **Python `nbformat.validate`** 当外部权威。结论是 v3 的整改**大部分真实有效**，但发现了一个
+> 四轮评审都没抓到的 🔴 —— 原因值得记住：**写入方与测试用同一套私有字段名**，于是整套用例都在
+> 验证一个错误的世界观。本轮的整改因此分成"修问题"和"修发现问题的能力"两部分。
+
+### 0.1 🔴 / 系统性
+
+| # | 结论 | 修复要点 | 验证 |
+|---|---|---|---|
+| **FID-1** | ✅ | `cell.outputs = [...result.result.rawOutputs]` 把 **sidecar 私有形状**（`outputType`）直接写进文件：**每个执行过的 cell 都让 notebook 变成非法 nbformat**，JupyterLab/nbconvert 会拒绝或丢输出，本工具也读不回自己刚写的内容，而终态仍报 `write_back.performed: true` 且无任何 warning。新增 `core/outputs.ts` 的 `nbformatOutputsOfRaw()`（写入方向的边界转换，含 nbformat 只在 `execute_result` 上要求的 `execution_count`），两条写回路径统一走它 | 集成 `[FID-1]`：真 notebook_run → **真 `nbformat.validate` 通过** + 读回 round-trip；`scripts/e2e-smoke.mjs` 11/11（**已做变异验证**：改回旧代码 → nbformat 校验、字段名、execution_count 三项同时变红） |
+| **FID-3** | ✅ | `set_cell_type` → markdown 时把 `execution_count` 置 `null` 而非**删除**。nbformat 禁止 markdown cell 出现该键（`Additional properties are not allowed`），而 `serializeNotebook` 只为 code cell 填它，于是这个 `null` **永久留在用户文件里** | 单测 `[U9]` ×2（断言 `'execution_count' in cell === false`）+ 集成 `[FID-3]` 走真工具路径后过校验器 |
+| **FID-4** | ✅ | **加一道结构自检**：`selfCheckNotebook` 除重新解析外，还检查 nbformat 结构规则（非 code cell 不得有 `outputs`/`execution_count`、`output_type` 必须存在、`stream`/`error`/`execute_result`/`data` 的必要字段）。违反 → `selfcheck_failed` 中止写入。这让"不会静默改坏"变成对**结果**的承诺，而不只是对解析器的承诺 | 单测 `[FID-4]`（协议形状与 markdown 残留各一例）；它当场抓出 3 个**本身就不合法**的测试 fixture（stale 两条 + `nbformat-validator` 报的 `display_name` 缺失） |
+| **QUAL-1** | ✅ | 同类事故第三次出现（整块缩进浅一级），我上一轮**方法错误地**判为已修。这次不再手改：新增 `scripts/check-indent.mjs`，用 TypeScript parser 校验"块内直接语句同列 + 闭合括号与开启行列相同"，接进 `pnpm lint`；并用同一个 AST 驱动把 `src/run.ts` 全部块收敛到一致（含 7 个语句 + 6 个闭合括号） | `pnpm lint` 现在会跑它，全仓 0 违规；该检查器正是发现并修正本轮这处缺陷的工具 |
+
+### 0.2 🟡
+
+| # | 结论 | 修复要点 |
+|---|---|---|
+| **FID-2** | ✅ | `rawOutputsOfCell` 对未知 `output_type` 曾**静默丢弃**，于是 read 会说"这个 cell 没有输出"——一个假陈述，也掩盖了 FID-1。现在映射为 `unsupported`（诚实报告"读不懂"而不是"没有"） |
+| **FID-5** | ✅ | `notebook_run_status` 把内部 camelCase 的 `writeBack` 原样透出，同一字段在 `notebook_run` 是 `backup_path`、在 status 里是 `backupPath`。统一为 `backup_path` |
+| **FID-6** | ✅ | sidecar 判定 `timeout` 后还去等一个**不可能到达**的 `execute_reply`（kernel 还在跑那个 cell），30 s 白等：实测 `timeoutMs=3s` 花掉 38 s。改为立即返回；传输层余量随之收缩（D-033）。**并如实披露**：Windows 上 `interrupt_kernel()` 需要控制台事件，stdio 服务没有控制台，`time.sleep` 类 cell 收不到中断——超时靠 §4.7 规则 6 的关闭 kernel 真正回收 CPU |
+| **ROB-10 补完** | ✅ | `#failureDetail()` 原来**二选一**返回 stderr 或 exit code，于是"pyzmq 崩溃"这类既有 stderr 又有退出码的场景把符号化结果丢掉了（主审实测"符号化 0% 有效"）。改为两半都给；sidecar 自报的错误在 child 已死时也带上退出事实 |
+| **NEW-1** | ✅ | v3 的 strict schema 让**工具层白名单变成不可达代码**（删掉它测试仍全绿）。改为 passthrough + 工具层拒绝，既满足"必须拒绝"又返回 SPEC 指定的 `invalid_arguments`；用例对六个工具全覆盖并断言 `detail.reason`（**已做变异验证**） |
+| **NEW-3** | ✅ | 分帧第三轮返工：v3 = 列表 + 延迟拼接（扫描仍 O(L²)）；v4 = 游标 + 逐块 skip（**skip 循环自身 O(chunks²)**）+ `Buffer.concat` 增长前缀（8.6 GB 拷贝）。最终改为**单个倍增缓冲**，并保持"永不回看已扫描字节"：每字节最多被拷两次、扫一次。期间我自己引入的两个回归（每行分配缓冲 → 27 s；`indexOf` 绝对偏移当相对用）都由用例抓出后修正 | 用例 `[NEW-3]` 以"扫描字节数 ≤ 1.1×数据量"断言算法而不是墙钟时间；`[A21]`/`[D7]`/byte-by-byte 等 10 例全绿 |
+| **NEW-4** | ✅ | `#norm` 每次调用都做 `realpathSync`，且**每个 session 一次 + 查询一次** → N cell 的 run 做 N 次同步 stat 链。加记忆化，并在 session 摘除时失效 |
+| **NEW-2** | ✅ 部分 | `timeout_seconds` 加 `.int()`。**广播类枚举没有改成 schema enum**：U27 要求枚举违规返回 `invalid_arguments`（工具错误），而 schema enum 会让 SDK 抢先返回协议错误——两者不可兼得，选了 SPEC §4.1.12 指定的形态（值仍由工具层校验并列出合法集合） |
+| **NEW-5** | ⬜ 未做 | 属 SPEC 缺口（终态可被二次翻转 / 与 §4.8 顺序语义冲突），本轮未改动终态语义：它是"建议补 SPEC"的条目而非已证实的缺陷，且改动它会触碰 §4.8 的对外契约。已列入下方剩余事项 |
+| **SEC-TOCTOU** | ✅ | connection file 改用 `tempfile.mkstemp()`（原子创建、0600、名不可预测），仍钉在 OS 临时目录并负责清理（D-034） |
+| **DEP-1 降级路径** | ✅ | 失败启动也清理（`wait_for_ready` 抛错时 `entry.shutdown()`；`BaseException` 路径单独 `remove_connection_file()`）。本仓测试此前已攒下 16 个残留，修复后实测不再新增 |
+| **DEP-2/DEP-3 文档不实** | ✅ | 首次把**规则落到 CI 能执行的地方**：`prepack` 从 `pnpm build` 改为 `tsc -p tsconfig.json` 并实测（删掉 `lib/` 后 `npm pack --dry-run` 重建成功）；`REVIEW-FIX-STATUS` 的门禁数字每条有出处，并在 §四 写明"未做项不标 ✅" |
+| **QUAL-6 残留** | ✅ | `backup.ts` 的 `onRetentionError` 仍带 `[ipynb-mcp] warn` 前缀 → 与兜底 sink 双前缀。已去掉 |
+| **H-2/H-3/H-6/H-7** | ✅ | `probe-framer.mjs` 等根目录残留清除；`.gitignore` 补 `ipynb-mcp-*.json`/`__pycache__`/`commit-msg.txt`；全树 LF（`git ls-files --eol` 0 CRLF / 0 mixed） |
+| **本轮零依赖** | ✅ | 新增的两个检查器（`check-indent.mjs`、`e2e-smoke.mjs`）与 `nbformat-validator.ts` 只用已有的 TypeScript 与 SDK —— 未新增任何依赖（AGENTS §11） |
+
+### 0.3 "发现问题的能力"（本轮真正的主要交付）
+
+四轮评审的教训不是"又漏了一个 bug"，而是**评审与测试共享了错误的前提**。因此本轮把三件事固化进 `pnpm lint` / `pnpm test*`：
+
+1. **外部权威判定合规**：`tests/integration/nbformat-validator.ts` 起子进程跑 Python `nbformat.validate`；`[FID-1]`、`[FID-3]`、`fixtures-valid.test.ts` 都用它，并跳过（带原因）而不是假装通过。
+2. **fixture 也要合规**：`fixtures-valid.test.ts` 对每个 notebook 字面量同时跑"自己的结构检查"与"真 nbformat"，另有零依赖静态检查禁止新增缺 `display_name` 的 kernelspec。
+3. **真客户端冒烟**：`scripts/e2e-smoke.mjs`（`pnpm smoke`）拉起 `lib/bin.js`，用 SDK Client 走完整 JSON-RPC，断言 11 项（含 nbformat 校验与 round-trip），**并已用变异验证**它能在 FID-1 复现时变红。
+
+## 〇-A、第三轮（`ipynb-mcp-code-review-v3.md`）
 
 > 该报告对 v2 的闭环核查结论是"四道门禁全部真实通过、逐字吻合"（本项目第一次），
 > 同时给出 5 条 🟠 与若干 🟡/🟢。逐条状态：
 
-### 0.1 🟠 项
+### 3.1 🟠 项
 
 | # | 结论 | 修复要点 | 验证 |
 |---|---|---|---|
@@ -32,7 +79,7 @@
 | **QUAL-8** | ✅ | `notebook_run_cancel` 立即置终态 + 不再 sleep；`interrupt` 失败只记 warn | `src/mcp/tools/run-status.ts`；终态语义与 §4.8 的响应枚举一致 |
 | **ARCH-1** | ✅ | nbformat 输出形状下沉到 `core/outputs.ts` 的 `rawOutputsOfCell`（`hasStableCellIds` 一并下沉）；顺带修掉**数组形式 `data` 值被静默丢弃** | `grep` 确认 `src/mcp/*` 不再解析输出形状；U15/U16/U17/U21/U21b 回归 |
 
-### 0.2 🟡 项
+### 3.2 🟡 项
 
 | # | 结论 | 修复要点 |
 |---|---|---|
@@ -64,7 +111,7 @@
 | **H-2/H-3/H-5/H-6/H-7** | ✅ | `.gitattributes` 生效（0 CRLF / 0 mixed）；`scripts/` 入库；`__pycache__`、`tmp*.json` 等已 ignore；`docs/review/` 三份报告入库 |
 | **DOC-1 ~ DOC-6** | ✅ | 新增 D-022~D-031（含 D-028 的"取消信号取舍"与 D-024 的"未知参数"取舍）；README 补四条已知限制；本文件重写门禁数字 |
 
-### 0.3 v3 报告对 v2 的核查异议
+### 3.3 v3 报告对 v2 的核查异议
 
 - **V3/A31 被标"修法有副作用"**：其副作用（写回窗口内取消丢失 detail）已按 ROB-8 修好，两条写回的信号取舍按 D-028 登记。
 - **V4/A23 被标"部分"**：按 D-031 如实登记为"不再按 pid 补刀"，理由与实测（无孤儿）写在条目里，不再声称字面实现。
@@ -144,9 +191,11 @@
 
 | # | 事项 | 归属 |
 |---|---|---|
-| 1 | **E1–E9 手工端到端**（DoD 最后一项）：清单见 `docs/E2E-CHECKLIST.md`，需真实 MCP 客户端 | **boss** |
-| 2 | **CI 首次真跑**：仓库无 `git remote`，`ci.yml` 的 12 个矩阵组合从未执行。本轮已修掉两处**必然失败**的配置（pnpm 版本双重声明；integration job 未跑单测），并加了 `IPYNB_TEST_REQUIRE_VENV=1` 防止解释器回退掩盖环境问题——但结论仍以真实 runner 为准 | **boss** |
+| 1 | **E1–E9 手工端到端**（DoD 最后一项）：清单见 `docs/E2E-CHECKLIST.md`，需真实第三方 MCP 客户端（Claude Code / Cursor）。**本轮已补上自动化的那一半**：`pnpm smoke` 用真 SDK 客户端驱动真 stdio server 并断言 11 项，但它不是第三方客户端，不能替代 E1–E9 | **boss** |
+| 2 | **CI 首次真跑**：仓库无 `git remote`，`ci.yml` 的 12 个矩阵组合从未执行。已修掉三处**必然失败**的配置（pnpm 版本双重声明；integration job 未跑单测；`IPYNB_TEST_REQUIRE_VENV=1` 缺失导致解释器回退掩盖环境问题），并新增 `pnpm smoke` 可在 CI 上跑（需 build + ipykernel）——但结论仍以真实 runner 为准 | **boss** |
 | 3 | **本机 venv 的 pyzmq 26.2.0 缺口**：该解释器起不了 kernel（详见 `COMPATIBILITY.md`）。集成文件已能自动探测并回退，**未修改任何解释器环境**（R5） | 环境 |
 | 4 | npm 发布与 `dsh-ipynb-mcp` bundle 发布（OPEN_QUESTIONS Q5/Q6）：按默认先不发布 | **boss** |
-| 5 | **结构重构类建议未做**（AGENTS §10 禁止"顺手重构"，且当前无行为风险点）：ARCH-4（`applyEditOps` 219 行）、ARCH-6 剩余部分（`executeCells`/`materializeRunImages`/`computeStaleReport` 抽取）、ARCH-7（`shouldReturnImages` 迁到 `core/outputs.ts`）。建议与下一次接口变更同批做 | 下一轮 |
-| 6 | SPEC v3.1 建议修订：D14 判定式量纲、R6 豁免措辞（含 artifact 默认根与 sidecar connection file）、§5.8 上限公式/分帧与 `failedCellIndexes` 字段名、§4.1.12 与 §4.6.3 的"未知参数"分工（D-024）、§5.2 的运行期降级语义（D-030） | 人类 / 下一轮 |
+| 5 | **NEW-5 未做**：终态可被二次翻转 / 与 §4.8 顺序语义的冲突是 **SPEC 缺口**（v4 报告自己也标"建议补 SPEC"）。改它会动 §4.8 的对外契约，故本轮只登记、不改行为；若要收紧，需要先由人类确认 §4.8 的预期顺序语义 | 人类 / 下一轮 |
+| 6 | **结构重构类建议未做**（AGENTS §10 禁止"顺手重构"，且当前无行为风险点）：ARCH-4（`applyEditOps` 219 行）、ARCH-6 剩余部分（`executeCells`/`materializeRunImages`/`computeStaleReport` 抽取）、ARCH-7（`shouldReturnImages` 迁到 `core/outputs.ts`）、NEW-2 的广播枚举（与 U27 的 `invalid_arguments` 要求冲突，需 SPEC 先裁决）。建议与下一次接口变更同批做 | 下一轮 |
+| 7 | **格式化器**：仍没有引入 prettier（新增依赖需先问人类，AGENTS §11）。替代方案是两个零依赖检查器（`check-format.mjs` + `check-indent.mjs`），后者用 TypeScript parser 覆盖了 QUAL-1 那一类事故。若人类同意引入格式化器，可删掉这两个脚本 | 人类 |
+| 8 | SPEC v3.1 建议修订：D14 判定式量纲、R6 豁免措辞（含 artifact 默认根与 sidecar connection file）、§5.8 上限公式/分帧与 `failedCellIndexes` 字段名、§4.1.12 与 §4.6.3 的"未知参数"分工（D-024）、§5.2 的运行期降级语义（D-030）、**§4.1.1 的写入方向边界（D-032，本轮最贵的一课）**、Windows 中断不可用对 §4.7 规则 5-6 的影响（D-033）、§4.8 的终态顺序语义（NEW-5） | 人类 / 下一轮 |
