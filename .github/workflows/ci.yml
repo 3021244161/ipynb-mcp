@@ -26,6 +26,9 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm lint
+      # No ipykernel here on purpose: this job proves the unit suite passes on a
+      # machine WITHOUT Python (AGENTS §3). The cases that need a real kernel
+      # probe for one and skip with a recorded reason (review T5).
       - run: pnpm test
       # R15/SPEC §8 rule 1: every green run must also prove the packable
       # artifact builds (review C1 — a publishable-empty-package gap).
@@ -56,6 +59,13 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm build
+      # Review T5/D2: the unit suite is the only place the symtable analyzer's
+      # discriminating power is asserted (analyze-op drives the REAL sidecar),
+      # so it must run in a job that has ipykernel. Without this line the D2
+      # guardrail held in no job at all.
+      - run: pnpm test
+        env:
+          IPYNB_TEST_PYTHON: python
       # setup-python's interpreter becomes the venv base for the test env.
       - run: pnpm test:integration
         env:
