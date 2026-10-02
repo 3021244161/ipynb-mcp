@@ -169,6 +169,32 @@ describe('[step9][U24] response shape across all six tools', () => {
   });
 });
 
+describe('[D7] timeout_seconds boundary values are accepted (SPEC §4.5 range 1..86400)', () => {
+  it('accepts 1 (synchronous) and 86400 (background), rejecting neither as invalid', async () => {
+    const nb = path.join(workspace, 'd7-timeout.ipynb');
+    await writeFile(nb, JSON.stringify({
+      nbformat: 4,
+      nbformat_minor: 5,
+      metadata: {},
+      cells: [{ cell_type: 'code', id: 'c0', metadata: {}, source: 'x = 1', outputs: [], execution_count: null }],
+    }));
+
+    // Lower bound 1: 1 x 1 cell stays under the background threshold, so the
+    // run reaches interpreter resolution and fails there (the configured
+    // interpreter does not exist) — proving 1 passed validation.
+    const low = await callTool('notebook_run', { path: nb, timeout_seconds: 1 });
+    const lowBody = JSON.parse(assertSingleTextBlock(low)) as Record<string, unknown>;
+    expect(lowBody['code']).toBe('interpreter_not_found');
+
+    // Upper bound 86400: far above the background threshold, so it must be
+    // accepted AND take the background path — proving 86400 passed validation.
+    const high = await callTool('notebook_run', { path: nb, timeout_seconds: 86400 });
+    const highBody = JSON.parse(assertSingleTextBlock(high)) as Record<string, unknown>;
+    expect(highBody['kind']).toBe('background');
+    expect(highBody['run_id']).toBeDefined();
+  }, 60_000);
+});
+
 describe('[step9][U27] schema-level violations raise invalid_arguments', () => {
   it('notebook_run timeout_seconds=0, notebook_edit 33 ops, notebook_read empty path', async () => {
     const nb = path.join(workspace, 'u27.ipynb');

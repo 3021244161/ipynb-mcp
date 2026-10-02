@@ -212,3 +212,28 @@ describe('[U12][D3] tool-level optimistic lock on expected_content_hash', () => 
     expect(written.cells[0]!.source).toBe('x = 1');
   });
 });
+
+describe('[D7] ops boundary: exactly 32 is accepted, 33 is not (SPEC §4.5)', () => {
+  it('applies a 32-op request end to end', async () => {
+    const nb = await writeNb('d7-ops32.ipynb', [codeCell('seed = 0', 'c0')]);
+    const ops = Array.from({ length: 32 }, (_, i) => ({
+      op: 'insert_cell',
+      at_index: 0,
+      cell_type: 'code',
+      source: `v${i} = ${i}`,
+    }));
+    const { isError, body } = await runEdit({ path: nb, ops });
+    expect(isError).toBeUndefined();
+    expect(body['applied']).toBe(32);
+    const written = JSON.parse(await readFile(nb, 'utf8')) as { cells: unknown[] };
+    expect(written.cells).toHaveLength(33);
+  });
+
+  it('rejects 33 ops with invalid_arguments', async () => {
+    const nb = await writeNb('d7-ops33.ipynb', [codeCell('seed = 0', 'c0')]);
+    const ops = Array.from({ length: 33 }, () => ({ op: 'clear_outputs', cell_index: 0 }));
+    const { isError, body } = await runEdit({ path: nb, ops });
+    expect(isError).toBe(true);
+    expect(body['code']).toBe('invalid_arguments');
+  });
+});

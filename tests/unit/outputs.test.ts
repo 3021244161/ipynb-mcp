@@ -172,10 +172,12 @@ describe('[step6][U15] 30 images: kind image everywhere, no base64 in text', () 
     expect(result.materialized).toHaveLength(20);
     expect(result.warnings.map((w) => w.code)).toContain('image_limit');
 
-    // The rendered JSON must not contain base64 that decodes to PNG/JPEG magic.
+    // The rendered JSON must not contain ANY decodable PNG/JPEG payload
+    // (review D5): rather than grepping for two literal prefixes, find every
+    // base64-shaped run and check the decoded magic bytes — an encoding or
+    // prefix change can no longer slip through.
     const json = JSON.stringify(result.items);
-    expect(json).not.toContain('iVBORw0KGgo'); // PNG magic base64 prefix
-    expect(json).not.toContain('/9j/'); // JPEG magic base64 prefix
+    expect(decodableImagePayloads(json)).toEqual([]);
     const withIndex = result.items.filter((item) => item.kind === 'image' && item.image_index !== null);
     expect(withIndex).toHaveLength(20);
     const withoutIndex = result.items.filter((item) => item.kind === 'image' && item.image_index === null);
@@ -351,5 +353,47 @@ describe('[step6][A5] image_index stays unique across cells in one call', () => 
       }
     }
     expect(allIndexes).toEqual([0, 1]);
+  });
+});
+
+/** Returns base64 runs that decode to a PNG/JPEG magic header (should be none). */
+function decodableImagePayloads(json: string): string[] {
+  const candidates = json.match(/[A-Za-z0-9+/]{40,}={0,2}/g) ?? [];
+  return candidates.filter((candidate) => {
+    let bytes: Buffer;
+    try {
+      bytes = Buffer.from(candidate, 'base64');
+    } catch {
+      return false;
+    }
+    if (bytes.length < 4) {
+      return false;
+    }
+    const isPng = bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47;
+    const isJpeg = bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+    return isPng || isJpeg;
+  });
+}
+
+describe('[D7] exactly max_images_per_call images: no limit warning (SPEC §4.4)', () => {
+  it('materializes all 20 and emits no image_limit', async () => {
+    const raws = Array.from({ length: 20 }, () => pngOutput(10, 10, 40));
+    const { items, extractedImages } = mapOutputs(raws);
+    const result = await applyImagePolicy(
+      items,
+      extractedImages,
+      { returnImages: true, maxImages: 20 },
+      { artifactRoot, notebookAbsPath: notebookPath, cellIndex: 0, platform: 'win32', realpath: (p) => p },
+    );
+    expect(result.materialized).toHaveLength(20);
+    expect(result.warnings.map((w) => w.code)).not.toContain('image_limit');
+    const indexed = result.items.filter((item) => item.kind === 'image' && item.image_index !== null);
+    expect(indexed).toHaveLength(20);
+    // Indexes are 0..19 with no duplicates or gaps.
+    const indexes = indexed
+      .map((item) => (item.kind === 'image' ? item.image_index : null))
+      .filter((value): value is number => value !== null)
+      .sort((a, b) => a - b);
+    expect(indexes).toEqual(Array.from({ length: 20 }, (_, i) => i));
   });
 });

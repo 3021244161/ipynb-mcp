@@ -115,6 +115,28 @@ describe('[step2] atomicWriteFile', () => {
     expect(await tmpFiles()).toEqual([]);
   });
 
+  it('the wx flag makes an existing temp name a hard error, never a clobber (SPEC D12)', async () => {
+    // Real assertion of the open('wx') contract: an EEXIST from the exclusive
+    // create must surface as an error and must NOT fall back to overwriting.
+    const target = path.join(dir, 'wx.ipynb');
+    let openedFlags = '';
+    const deps: AtomicWriteDeps = {
+      open: async (tmpTarget, flags) => {
+        openedFlags = flags;
+        void tmpTarget;
+        throw errorWithCode('EEXIST');
+      },
+      rename: async () => undefined,
+      unlink: async () => undefined,
+      fsyncDir: async () => undefined,
+      stat: async () => null,
+      readdir: async () => [],
+      now: () => new Date(),
+    };
+    await expect(atomicWriteFile(target, 'x', { deps })).rejects.toThrow();
+    expect(openedFlags).toBe('wx');
+  });
+
   it('skips directory fsync on win32 and performs it on linux (SPEC §9)', async () => {
     let fsyncCalls = 0;
     const deps: AtomicWriteDeps = {
@@ -134,9 +156,10 @@ describe('[step2] atomicWriteFile', () => {
     expect(fsyncCalls).toBe(1);
   });
 
-  it('refuses to clobber an existing temp file name (wx flag)', async () => {
-    // Indirect: two concurrent writes to the same target must both succeed
-    // because tmp names are uuid-unique.
+  it('concurrent writes to the same target both succeed (uuid-unique temp names)', async () => {
+    // Renamed from 'refuses to clobber ... (wx flag)' (review D5): the body
+    // tests concurrency, not the wx flag. The flag itself is asserted by the
+    // dedicated case below.
     const target = path.join(dir, 'concurrent.ipynb');
     await Promise.all([
       atomicWriteFile(target, 'a'),
