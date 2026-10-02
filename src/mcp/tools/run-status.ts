@@ -34,7 +34,15 @@ export async function handleRunStatus(
       replayed_cell_indexes: handle.replayedCellIndexes,
       stale_cells: handle.staleCells,
       stale_analysis: handle.staleAnalysis,
-      write_back: handle.writeBack,
+      // SPEC §4.8 spells this field snake_case, and the completed-run payload
+      // (notebook_run) already does: the handle's internal camelCase shape used
+      // to leak through verbatim, so the SAME field was `backup_path` in one
+      // tool and `backupPath` in the other — a tool consumer cannot guess which
+      // (review v4 FID-5).
+      write_back: {
+        performed: handle.writeBack.performed,
+        backup_path: handle.writeBack.backupPath,
+      },
       error: handle.error,
       warnings: handle.warnings,
     };

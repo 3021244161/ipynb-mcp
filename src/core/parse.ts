@@ -3,7 +3,7 @@
 // untouched cells keep their original `source` shape (string stays string,
 // array stays array) byte-for-byte after a round trip.
 
-import { IpynbError } from './errors.js';
+import { IpynbError, type JsonValue } from './errors.js';
 
 export interface Hasher {
   sha256Hex(input: string | Uint8Array): string;
@@ -130,10 +130,19 @@ export function serializeNotebook(notebook: NotebookFile): string {
 /**
  * Pre-write self check (SPEC §5.5.5): re-parse the bytes we are about to
  * write with the same parser. Any failure aborts the write (selfcheck_failed).
+ *
+ * The re-parse alone is NOT enough, and that is not a theoretical gap: it
+ * accepted `outputType`-shaped outputs and markdown cells carrying
+ * `execution_count`, so two independent write paths silently produced files
+ * that `nbformat.validate` rejects — with `write_back.performed: true` and no
+ * warning (review v4 FID-1/FID-3/FID-4). The structural gate below runs on the
+ * same bytes that are about to land, so "不会静默改坏" is a statement about the
+ * RESULT rather than about the parser (SPEC §6 R2/R9).
  */
 export function selfCheckNotebook(serialized: string, hasher: Hasher): NotebookFile {
+  let parsed: NotebookFile;
   try {
-    return parseNotebook(new TextEncoder().encode(serialized), hasher);
+    parsed = parseNotebook(new TextEncoder().encode(serialized), hasher);
   } catch (cause) {
     if (cause instanceof IpynbError && cause.code === 'nbformat_unsupported') {
       throw new IpynbError('selfcheck_failed', 'serialized notebook failed self check', { cause: cause.code });
@@ -142,6 +151,128 @@ export function selfCheckNotebook(serialized: string, hasher: Hasher): NotebookF
       cause: String(cause),
     });
   }
+  const problem = findStructuralProblem(parsed.doc);
+  if (problem !== null) {
+    throw new IpynbError('selfcheck_failed', 'serialized notebook failed the nbformat structure check', {
+      problem: problem as JsonValue,
+    });
+  }
+  return parsed;
+}
+
+/**
+ * The smallest set of nbformat structural rules this codebase can actually
+ * violate. Deliberately not a full schema validation (that is nbformat's job
+ * and would need a dependency): every rule corresponds to a file shape that
+ * the write paths have produced or could produce.
+ *
+ * Returns a JSON-safe detail object, or null when the document is acceptable.
+ */
+export function findStructuralProblem(doc: NotebookDoc): Record<string, JsonValue> | null {
+  for (let index = 0; index < doc.cells.length; index += 1) {
+    const cell = doc.cells[index];
+    if (cell === undefined) {
+      continue;
+    }
+    if (cell.cell_type !== 'code') {
+      // nbformat: markdown/raw cells have NEITHER outputs NOR execution_count.
+      if (cell.outputs !== undefined) {
+        return { cell_index: index, rule: 'non_code_cell_has_outputs', cell_type: cell.cell_type };
+      }
+      if (cell.execution_count !== undefined) {
+        return { cell_index: index, rule: 'non_code_cell_has_execution_count', cell_type: cell.cell_type };
+      }
+      continue;
+    }
+    const outputs = cell.outputs;
+    if (outputs === undefined) {
+      continue;
+    }
+    if (!Array.isArray(outputs)) {
+      return { cell_index: index, rule: 'outputs_not_an_array' };
+    }
+    for (let position = 0; position < outputs.length; position += 1) {
+      const output = outputs[position];
+      if (typeof output !== 'object' || output === null || Array.isArray(output)) {
+        return { cell_index: index, output_index: position, rule: 'output_not_an_object' };
+      }
+      const record = output as Record<string, unknown>;
+      const outputType = record['output_type'];
+      if (typeof outputType !== 'string') {
+        // The exact shape the sidecar protocol uses (`outputType`) lands here.
+        return {
+          cell_index: index,
+          output_index: position,
+          rule: 'output_type_missing',
+          saw: 'outputType' in record ? 'outputType' : 'missing',
+        };
+      }
+      const problem = outputProblem(outputType, record, index, position);
+      if (problem !== null) {
+        return problem;
+      }
+    }
+  }
+  return null;
+}
+
+function outputProblem(
+  outputType: string,
+  record: Record<string, unknown>,
+  cellIndex: number,
+  outputIndex: number,
+): Record<string, JsonValue> | null {
+  const where = { cell_index: cellIndex, output_index: outputIndex, output_type: outputType };
+  switch (outputType) {
+    case 'stream': {
+      if (record['name'] !== 'stdout' && record['name'] !== 'stderr') {
+        return { ...where, rule: 'stream_name_invalid' };
+      }
+      const text = record['text'];
+      if (typeof text !== 'string' && !Array.isArray(text)) {
+        return { ...where, rule: 'stream_text_missing' };
+      }
+      return null;
+    }
+    case 'error': {
+      for (const field of ['ename', 'evalue', 'traceback']) {
+        if (record[field] === undefined) {
+          return { ...where, rule: 'error_field_missing', field };
+        }
+      }
+      if (!Array.isArray(record['traceback'])) {
+        return { ...where, rule: 'error_traceback_not_an_array' };
+      }
+      return null;
+    }
+    case 'execute_result': {
+      // nbformat requires execution_count HERE and only here: this is the rule
+      // a bare `outputType` -> `output_type` rename would still violate.
+      if (!('execution_count' in record)) {
+        return { ...where, rule: 'execute_result_execution_count_missing' };
+      }
+      return dataProblem(record, where);
+    }
+    case 'display_data':
+      return dataProblem(record, where);
+    default:
+      return { ...where, rule: 'unknown_output_type' };
+  }
+}
+
+function dataProblem(
+  record: Record<string, unknown>,
+  where: Record<string, JsonValue>,
+): Record<string, JsonValue> | null {
+  const data = record['data'];
+  if (typeof data !== 'object' || data === null || Array.isArray(data)) {
+    return { ...where, rule: 'output_data_missing' };
+  }
+  const metadata = record['metadata'];
+  if (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata)) {
+    return { ...where, rule: 'output_metadata_missing' };
+  }
+  return null;
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

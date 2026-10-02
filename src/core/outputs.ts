@@ -16,6 +16,12 @@ export interface RawOutput {
   evalue?: string;
   traceback?: string[];
   metadata?: Record<string, unknown>;
+  /**
+   * Set by {@link rawOutputsOfCell} when a stored output had an unknown
+   * `output_type`: the entry is surfaced as `unsupported` instead of being
+   * dropped, so "this cell has no outputs" is never a false claim (FID-2).
+   */
+  unsupportedKind?: string;
 }
 
 /**
@@ -58,9 +64,12 @@ export function rawOutputsOfCell(cell: NotebookCell): RawOutput[] {
       outputType !== 'execute_result' &&
       outputType !== 'display_data'
     ) {
-      // Unknown output kinds are not this layer's business: nbformat has no
-      // catch-all shape to project, so they are dropped like any other
-      // unparseable entry rather than invented into display_data.
+      // Unknown output kinds cannot be projected into RawOutput (nbformat has
+      // no catch-all shape). They are counted, not silently dropped: the read
+      // path reports them as `unsupported` so a cell never looks empty when it
+      // is merely unreadable (review v4 FID-2 — the old behaviour reported
+      // "no outputs", which is a false claim and hid the write-back bug).
+      mapped.push({ outputType: 'display_data', data: {}, unsupportedKind: String(outputType) });
       continue;
     }
     const raw: RawOutput = { outputType };
@@ -98,6 +107,56 @@ export function rawOutputsOfCell(cell: NotebookCell): RawOutput[] {
     mapped.push(raw);
   }
   return mapped;
+}
+
+/**
+ * RawOutput[] -> nbformat cell outputs: the write direction of
+ * {@link rawOutputsOfCell}, and the reason it has to exist (review v4 FID-1).
+ *
+ * The sidecar speaks its OWN private shape (`outputType`, camelCase), and that
+ * shape was assigned straight to `cell.outputs`. Every executed cell therefore
+ * made the notebook invalid nbformat: `nbformat.validate` rejected it,
+ * JupyterLab/nbconvert would refuse it or lose the output, and this tool could
+ * not read back what it had just written — while reporting
+ * `write_back.performed: true` and no warning.
+ *
+ * nbformat requires `execution_count` on `execute_result` (and only there),
+ * which is why a bare rename of `outputType` is not enough.
+ */
+export function nbformatOutputsOfRaw(
+  raws: readonly RawOutput[],
+  executionCount: number | null,
+): unknown[] {
+  return raws.map((raw) => {
+    switch (raw.outputType) {
+      case 'stream':
+        return {
+          output_type: 'stream',
+          name: raw.name === 'stderr' ? 'stderr' : 'stdout',
+          text: raw.text ?? '',
+        };
+      case 'error':
+        return {
+          output_type: 'error',
+          ename: raw.ename ?? '',
+          evalue: raw.evalue ?? '',
+          traceback: raw.traceback ?? [],
+        };
+      case 'execute_result':
+        return {
+          output_type: 'execute_result',
+          data: raw.data ?? {},
+          metadata: raw.metadata ?? {},
+          execution_count: executionCount,
+        };
+      default:
+        return {
+          output_type: 'display_data',
+          data: raw.data ?? {},
+          metadata: raw.metadata ?? {},
+        };
+    }
+  });
 }
 
 export type OutputItem =

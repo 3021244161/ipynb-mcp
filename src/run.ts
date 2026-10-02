@@ -4,7 +4,7 @@
 // the only cross-layer assembly point; mcp/tools/run.ts calls runNotebook.
 
 import { IpynbError, createWarning, type JsonValue, type Warning } from './core/errors.js';
-import { mapRawOutputs, type OutputItem } from './core/outputs.js';
+import { mapRawOutputs, nbformatOutputsOfRaw, type OutputItem } from './core/outputs.js';
 import { cellSource, readNotebookMetadata, type Hasher, type NotebookFile } from './core/parse.js';
 import { analyzeStale, downgradeConfidence, regexDefs, regexUses, type StaleCell } from './core/stale.js';
 import type { IpynbConfig } from './config.js';
@@ -365,334 +365,338 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
       // what they asked for.
       const activeSession = deps.registry.findByNotebook(req.path);
       if (modeUsed === 'resume' && activeSession?.kernelId !== session.kernelId) {
-        throw await failedRunError(
-          'kernel_died',
-          'kernel was shut down or restarted while the run was starting',
-          executed,
-          deps,
-          abortState,
-          notebook,
-          effectiveReq,
-          platform,
-          executedCellsSet,
-        );
-      }
+          throw await failedRunError(
+            'kernel_died',
+            'kernel was shut down or restarted while the run was starting',
+            executed,
+            deps,
+            abortState,
+            notebook,
+            effectiveReq,
+            platform,
+            executedCellsSet,
+          );
+        }
       deps.onProgress?.({ phase: 'start', total: targets.length });
 
-      // ---- replay prefix: silent, no outputs, no counters, nothing written ------
+        // ---- replay prefix: silent, no outputs, no counters, nothing written ------
       for (const index of replayPrefix) {
         if (isAborted(effectiveReq.abort)) {
-          break; // outer abort branch performs the (empty) write-back and raises
-        }
+            break; // outer abort branch performs the (empty) write-back and raises
+          }
         const cell = notebook.cells[index]!;
         await deps.registry.execCell(req.path, {
-          code: cellSource(cell),
-          silent: true,
-          storeOutputs: false,
-          timeoutMs: req.timeoutSeconds * 1000,
-        });
+            code: cellSource(cell),
+            silent: true,
+            storeOutputs: false,
+            timeoutMs: req.timeoutSeconds * 1000,
+          });
       }
 
       for (const index of targets) {
         if (isAborted(effectiveReq.abort)) {
-          break; // fall through to the outer abort branch: write back completed cells
-        }
+            break; // fall through to the outer abort branch: write back completed cells
+          }
         const cell = notebook.cells[index]!;
         deps.onProgress?.({ phase: 'cell', completed: executed.length, total: targets.length, current_cell_index: index });
         const savedOutputs = cell.outputs;
         const savedCount = cell.execution_count;
         if (req.clearOutputsBefore) {
-          cell.outputs = [];
-          cell.execution_count = null;
-        }
+            cell.outputs = [];
+            cell.execution_count = null;
+          }
         let result;
-        // A kernel termination only ends the run while one of OUR cells is in
-        // flight (SPEC §4.8 rule 1). Outside that window the event is stale —
-        // the sidecar notices a killed kernel on its next request, so an old
-        // session's death can surface while this run is between cells.
+          // A kernel termination only ends the run while one of OUR cells is in
+          // flight (SPEC §4.8 rule 1). Outside that window the event is stale —
+          // the sidecar notices a killed kernel on its next request, so an old
+          // session's death can surface while this run is between cells.
         kernelAbortState.cellInFlight = true;
         try {
           result = await deps.registry.execCell(req.path, {
-            code: cellSource(cell),
-            silent: false,
-            storeOutputs: true,
-            timeoutMs: req.timeoutSeconds * 1000,
-          });
+              code: cellSource(cell),
+              silent: false,
+              storeOutputs: true,
+              timeoutMs: req.timeoutSeconds * 1000,
+            });
         } catch (cause) {
           kernelAbortState.cellInFlight = false;
-          // The in-flight cell is not a completed cell: its partial output never
-          // lands (SPEC §4.8 rule 2).
+            // The in-flight cell is not a completed cell: its partial output never
+            // lands (SPEC §4.8 rule 2).
           cell.outputs = savedOutputs;
           cell.execution_count = savedCount;
           if (isAborted(effectiveReq.abort)) {
-            // The kernel was killed while this cell was in flight (restart /
-            // shutdown / client cancel raced the execution): fall through to
-            // the abort branch so completed cells still get written back.
-            break;
-          }
+              // The kernel was killed while this cell was in flight (restart /
+              // shutdown / client cancel raced the execution): fall through to
+              // the abort branch so completed cells still get written back.
+              break;
+            }
           if (cause instanceof IpynbError && isKernelGone(cause)) {
-            // The kernel died on its own (OOM, external kill, dead sidecar) or
-            // was already gone before this cell could run (a restart/shutdown
-            // landing between two cells). With no client signal nothing sets
-            // isAborted(), and simply throwing here lost every cell that had
-            // already completed — the run's own record of what it did
-            // (SPEC §4.8 rule 3 / review R3, v3 ROB-8 item 7).
-            throw await failedRunError(
-              'kernel_died',
-              cause.message,
-              executed,
-              deps,
-              abortState,
-              notebook,
-              effectiveReq,
-              platform,
-              executedCellsSet,
-            );
-          }
+              // The kernel died on its own (OOM, external kill, dead sidecar) or
+              // was already gone before this cell could run (a restart/shutdown
+              // landing between two cells). With no client signal nothing sets
+              // isAborted(), and simply throwing here lost every cell that had
+              // already completed — the run's own record of what it did
+              // (SPEC §4.8 rule 3 / review R3, v3 ROB-8 item 7).
+              throw await failedRunError(
+                'kernel_died',
+                cause.message,
+                executed,
+                deps,
+                abortState,
+                notebook,
+                effectiveReq,
+                platform,
+                executedCellsSet,
+              );
+            }
           throw cause;
         }
         kernelAbortState.cellInFlight = false;
         const mapped = mapRawOutputs(result.result.rawOutputs, {
-          inlineTextChars: deps.config.inlineTextChars,
-          maxImageBytes: deps.config.maxImageBytes,
-          hasher: deps.hasher,
-        });
-        // Materialize images for run results (auto policy: always for runs).
+            inlineTextChars: deps.config.inlineTextChars,
+            maxImageBytes: deps.config.maxImageBytes,
+            hasher: deps.hasher,
+          });
+          // Materialize images for run results (auto policy: always for runs).
         const returnImages = shouldReturnImages(deps.imagesPolicy, true);
         const policyResult = await applyImagePolicy(
-          mapped.items,
-          mapped.extractedImages,
-          { returnImages, maxImages: deps.config.maxImagesPerCall, indexStart: imageCursor },
-          {
-            artifactRoot: deps.config.artifactDir,
-            notebookAbsPath: req.path,
-            cellIndex: index,
-            platform,
-            realpath: deps.realpath,
-          },
-        );
+            mapped.items,
+            mapped.extractedImages,
+            { returnImages, maxImages: deps.config.maxImagesPerCall, indexStart: imageCursor },
+            {
+              artifactRoot: deps.config.artifactDir,
+              notebookAbsPath: req.path,
+              cellIndex: index,
+              platform,
+              realpath: deps.realpath,
+            },
+          );
         for (const warning of policyResult.warnings) {
           if (!warnings.some((existing) => existing.code === warning.code)) {
-            warnings.push(warning);
-          }
+              warnings.push(warning);
+            }
         }
         imageCursor += policyResult.materialized.length;
         for (const materialized of policyResult.materialized) {
           const image = mapped.items[materialized.outputIndex];
           if (image === undefined || image.kind !== 'image') {
-            continue;
-          }
-          // items and rawOutputs are index-aligned (each raw output maps to
-          // exactly one item), so the base64 payload sits at the same index.
+              continue;
+            }
+            // items and rawOutputs are index-aligned (each raw output maps to
+            // exactly one item), so the base64 payload sits at the same index.
           const rawOutput = result.result.rawOutputs[materialized.outputIndex];
           const base64 = rawOutput?.data?.[image.media_type];
           if (base64 !== undefined) {
-            imageBlocks.push({ data: base64, media_type: image.media_type });
-          }
+              imageBlocks.push({ data: base64, media_type: image.media_type });
+            }
         }
 
         executed.push({
-          cell_index: index,
-          cell_id: cell.id ?? null,
-          status: result.result.status,
-          duration_ms: result.result.durationMs,
-          execution_count: result.result.executionCount,
-          outputs: mapped.items,
-        });
+            cell_index: index,
+            cell_id: cell.id ?? null,
+            status: result.result.status,
+            duration_ms: result.result.durationMs,
+            execution_count: result.result.executionCount,
+            outputs: mapped.items,
+          });
 
         if (result.result.status === 'timeout') {
-          // Half-finished outputs of the interrupted cell never reach the file:
-          // restore the pre-run outputs instead (SPEC §4.7 rule 5 / §4.8 rule 2).
-          cell.outputs = savedOutputs;
-          cell.execution_count = savedCount;
-          sawTimeout = true;
-          break;
-        }
+            // Half-finished outputs of the interrupted cell never reach the file:
+            // restore the pre-run outputs instead (SPEC §4.7 rule 5 / §4.8 rule 2).
+            cell.outputs = savedOutputs;
+            cell.execution_count = savedCount;
+            sawTimeout = true;
+            break;
+          }
 
-        // A cell interrupted by the abort (status error) is NOT a completed
-        // cell: its partial output never lands (SPEC §4.8 rule 2). Cells that
-        // finished cleanly (ok) still count, even if the abort raced in.
+          // A cell interrupted by the abort (status error) is NOT a completed
+          // cell: its partial output never lands (SPEC §4.8 rule 2). Cells that
+          // finished cleanly (ok) still count, even if the abort raced in.
         const abortedNow = isAborted(effectiveReq.abort);
         const interruptedByAbort = abortedNow && result.result.status === 'error';
         if (!interruptedByAbort) {
-          cell.outputs = [...result.result.rawOutputs];
-          cell.execution_count = result.result.executionCount;
-          executedCellsSet.add(index);
-        } else {
-          cell.outputs = savedOutputs;
-          cell.execution_count = savedCount;
-        }
+            // D15's boundary, write direction: the sidecar's private output shape
+            // must never reach the file (SPEC §4.1.1). Assigning `rawOutputs`
+            // directly produced invalid nbformat on every executed cell and the
+            // tool's own read path could not read it back (review v4 FID-1).
+            cell.outputs = nbformatOutputsOfRaw(result.result.rawOutputs, result.result.executionCount);
+            cell.execution_count = result.result.executionCount;
+            executedCellsSet.add(index);
+          } else {
+            cell.outputs = savedOutputs;
+            cell.execution_count = savedCount;
+          }
         if (abortedNow) {
-          break;
-        }
+            break;
+          }
       }
 
       if (sawTimeout) {
-        // Write back the cells that DID complete (SPEC §4.7 rule 5), then raise
-        // exec_timeout with the partial state in detail.
-        abortState.writtenBack = true;
-        const timeoutWriteBack = await writeBackCompleted(notebook, effectiveReq, deps, platform, executedCellsSet);
-        const timeoutCell = executed[executed.length - 1];
-        throw new IpynbError('exec_timeout', `cell execution timed out after ${req.timeoutSeconds}s (interrupt did not land)`, {
-          cell_index: timeoutCell?.cell_index ?? null,
-          completed_cells: executed.length - 1,
-          // ExecutedCell is structurally JSON-safe; the cast bridges it to the
-          // JsonValue union so failed-run status can report what actually ran.
-          executed: executed as unknown as JsonValue,
-          write_back: timeoutWriteBack,
-        });
-      }
+          // Write back the cells that DID complete (SPEC §4.7 rule 5), then raise
+          // exec_timeout with the partial state in detail.
+          abortState.writtenBack = true;
+          const timeoutWriteBack = await writeBackCompleted(notebook, effectiveReq, deps, platform, executedCellsSet);
+          const timeoutCell = executed[executed.length - 1];
+          throw new IpynbError('exec_timeout', `cell execution timed out after ${req.timeoutSeconds}s (interrupt did not land)`, {
+            cell_index: timeoutCell?.cell_index ?? null,
+            completed_cells: executed.length - 1,
+            // ExecutedCell is structurally JSON-safe; the cast bridges it to the
+            // JsonValue union so failed-run status can report what actually ran.
+            executed: executed as unknown as JsonValue,
+            write_back: timeoutWriteBack,
+          });
+        }
 
       if (isAborted(effectiveReq.abort)) {
-        // Completed cells stay written; the interrupted cell never lands
-        // (SPEC §4.8). This is the ONE terminal path for both the mid-cell abort
-        // and the cancel that lands while the write-back is running (v3 ROB-8).
-        throw await abortedRunError(executed, deps, abortState, notebook, effectiveReq, platform, executedCellsSet);
-      }
-
-    if (mappedTruncated(executed)) {
-      warnings.push(createWarning(
-        'output_truncated',
-        'at least one output exceeded inline_text_chars and was truncated',
-      ));
-    }
-
-    // ---- stale analysis (SPEC §5.6) --------------------------------------------
-    let staleCells: RunOutcome['stale_cells'] = [];
-    let staleAnalysis: RunOutcome['stale_analysis'] = null;
-    if (resolution.language !== 'python') {
-      staleAnalysis = { approximate: true, analysis_version: 1, method: 'skipped' };
-      warnings.push(createWarning(
-        'stale_analysis_skipped',
-        'stale analysis is only available for Python kernels',
-      ));
-    } else {
-      const codeSources = codeCellIndexes.map((index) => cellSource(notebook.cells[index]!));
-      let defsByCodeIndex: string[][] = [];
-      let usesByCodeIndex: string[][] = [];
-      let method: 'python-symtable' | 'regex' = 'python-symtable';
-      let degraded = false;
-      try {
-        const analysis = await deps.registry.analyze(req.path, codeSources);
-        if (analysis.ok) {
-          defsByCodeIndex = analysis.defs;
-          usesByCodeIndex = analysis.uses;
-        } else {
-          degraded = true;
-        }
-      } catch {
-        // Kernel unavailable (e.g. it just timed out): degrade to regex too.
-        degraded = true;
-      }
-      if (degraded) {
-        method = 'regex';
-        warnings.push(createWarning(
-          'stale_analysis_degraded',
-          'at least one cell failed AST parsing; stale analysis degraded to regex (all confidences are low)',
-        ));
-        defsByCodeIndex = codeSources.map((source) => regexDefs(source));
-        usesByCodeIndex = codeSources.map((source) => regexUses(source));
-      }
-      // Map code-index-aligned arrays onto full cell-index space. Built with
-      // one forward pass: the previous `codeCellIndexes.indexOf(i)` inside the
-      // loop was O(cells x code cells) (review v3 PERF-3).
-      const codePositionOf = new Map<number, number>();
-      for (const [position, cellIndex] of codeCellIndexes.entries()) {
-        codePositionOf.set(cellIndex, position);
-      }
-      const defs: string[][] = [];
-      const uses: string[][] = [];
-      for (let i = 0; i < notebook.cells.length; i += 1) {
-        const codePosition = codePositionOf.get(i);
-        if (codePosition !== undefined) {
-          defs[i] = defsByCodeIndex[codePosition] ?? [];
-          uses[i] = usesByCodeIndex[codePosition] ?? [];
-        } else {
-          defs[i] = [];
-          uses[i] = [];
-        }
-      }
-      const staleMeta = notebook.cells.map((cell, index) => ({
-        cell_index: index,
-        cell_id: cell.id ?? null,
-        is_code: cell.cell_type === 'code',
-        has_nonempty_outputs: Array.isArray(cell.outputs) && cell.outputs.length > 0,
-      }));
-      let computed: StaleCell[] = analyzeStale({
-        defs,
-        uses,
-        targetIndexes: executedCellsSet,
-        replayIndexes: new Set(replayPrefix),
-        cells: staleMeta,
-      });
-      if (method === 'regex') {
-        computed = downgradeConfidence(computed);
-      }
-      staleCells = computed;
-      staleAnalysis = { approximate: true, analysis_version: 1, method };
-    }
-
-    // ---- write-back -------------------------------------------------------------
-    deps.onProgress?.({ phase: 'write_back', completed: executed.length, total: targets.length });
-    let writeBack: RunOutcome['write_back'] = { performed: false, backup_path: null };
-    let contentHashAfter: string | null = null;
-    if (effectiveReq.writeOutputs && executedCellsSet.size > 0) {
-      let writeResult;
-      try {
-        writeResult = await writeNotebookFile(notebook, req.path, {
-          hasher: deps.hasher,
-          backupKeep: deps.config.backupKeep,
-          createBackup: req.createBackup,
-          expectedContentHash: notebook.contentHash,
-          // SPEC §4.1.10 / §4.6.2 (review V3): the main write-back honours the
-          // cancellation signal — aborting discards the temp file and leaves
-          // the notebook untouched. The failure-path write-back does not, by
-          // design: there the write IS the abort handling.
-          signal: req.abort?.signal,
-          platform,
-          // Diagnostics belong on the injected logger, not on atomic.ts's raw
-          // stderr fallback: --log-level must be able to silence them (review W9).
-          onCleanupError: (message) => deps.logger?.warn(message),
-        });
-      } catch (cause) {
-        if (isAbortError(cause, effectiveReq.abort?.signal)) {
-          // A cancel that lands here (after the last cell, while the results are
-          // being written) is the same terminal state as a cancel mid-cell: the
-          // completed cells must still land and be reported. Throwing a bare
-          // `cancelled` with no detail lost them silently and made one terminal
-          // code answer with two different shapes (review v3 ROB-8).
+          // Completed cells stay written; the interrupted cell never lands
+          // (SPEC §4.8). This is the ONE terminal path for both the mid-cell abort
+          // and the cancel that lands while the write-back is running (v3 ROB-8).
           throw await abortedRunError(executed, deps, abortState, notebook, effectiveReq, platform, executedCellsSet);
         }
-        throw cause;
+
+      if (mappedTruncated(executed)) {
+        warnings.push(createWarning(
+          'output_truncated',
+          'at least one output exceeded inline_text_chars and was truncated',
+        ));
       }
-      writeBack = { performed: true, backup_path: writeResult.backupPath };
-      contentHashAfter = writeResult.contentHashAfter;
+
+      // ---- stale analysis (SPEC §5.6) --------------------------------------------
+      let staleCells: RunOutcome['stale_cells'] = [];
+      let staleAnalysis: RunOutcome['stale_analysis'] = null;
+      if (resolution.language !== 'python') {
+        staleAnalysis = { approximate: true, analysis_version: 1, method: 'skipped' };
+        warnings.push(createWarning(
+          'stale_analysis_skipped',
+          'stale analysis is only available for Python kernels',
+        ));
+      } else {
+        const codeSources = codeCellIndexes.map((index) => cellSource(notebook.cells[index]!));
+        let defsByCodeIndex: string[][] = [];
+        let usesByCodeIndex: string[][] = [];
+        let method: 'python-symtable' | 'regex' = 'python-symtable';
+        let degraded = false;
+        try {
+          const analysis = await deps.registry.analyze(req.path, codeSources);
+          if (analysis.ok) {
+            defsByCodeIndex = analysis.defs;
+            usesByCodeIndex = analysis.uses;
+          } else {
+            degraded = true;
+          }
+        } catch {
+          // Kernel unavailable (e.g. it just timed out): degrade to regex too.
+          degraded = true;
+        }
+        if (degraded) {
+          method = 'regex';
+          warnings.push(createWarning(
+            'stale_analysis_degraded',
+            'at least one cell failed AST parsing; stale analysis degraded to regex (all confidences are low)',
+          ));
+          defsByCodeIndex = codeSources.map((source) => regexDefs(source));
+          usesByCodeIndex = codeSources.map((source) => regexUses(source));
+        }
+        // Map code-index-aligned arrays onto full cell-index space. Built with
+        // one forward pass: the previous `codeCellIndexes.indexOf(i)` inside the
+        // loop was O(cells x code cells) (review v3 PERF-3).
+        const codePositionOf = new Map<number, number>();
+        for (const [position, cellIndex] of codeCellIndexes.entries()) {
+          codePositionOf.set(cellIndex, position);
+        }
+        const defs: string[][] = [];
+        const uses: string[][] = [];
+        for (let i = 0; i < notebook.cells.length; i += 1) {
+          const codePosition = codePositionOf.get(i);
+          if (codePosition !== undefined) {
+            defs[i] = defsByCodeIndex[codePosition] ?? [];
+            uses[i] = usesByCodeIndex[codePosition] ?? [];
+          } else {
+            defs[i] = [];
+            uses[i] = [];
+          }
+        }
+        const staleMeta = notebook.cells.map((cell, index) => ({
+          cell_index: index,
+          cell_id: cell.id ?? null,
+          is_code: cell.cell_type === 'code',
+          has_nonempty_outputs: Array.isArray(cell.outputs) && cell.outputs.length > 0,
+        }));
+        let computed: StaleCell[] = analyzeStale({
+          defs,
+          uses,
+          targetIndexes: executedCellsSet,
+          replayIndexes: new Set(replayPrefix),
+          cells: staleMeta,
+        });
+        if (method === 'regex') {
+          computed = downgradeConfidence(computed);
+        }
+        staleCells = computed;
+        staleAnalysis = { approximate: true, analysis_version: 1, method };
+      }
+
+      // ---- write-back -------------------------------------------------------------
+      deps.onProgress?.({ phase: 'write_back', completed: executed.length, total: targets.length });
+      let writeBack: RunOutcome['write_back'] = { performed: false, backup_path: null };
+      let contentHashAfter: string | null = null;
+      if (effectiveReq.writeOutputs && executedCellsSet.size > 0) {
+        let writeResult;
+        try {
+          writeResult = await writeNotebookFile(notebook, req.path, {
+            hasher: deps.hasher,
+            backupKeep: deps.config.backupKeep,
+            createBackup: req.createBackup,
+            expectedContentHash: notebook.contentHash,
+            // SPEC §4.1.10 / §4.6.2 (review V3): the main write-back honours the
+            // cancellation signal — aborting discards the temp file and leaves
+            // the notebook untouched. The failure-path write-back does not, by
+            // design: there the write IS the abort handling.
+            signal: req.abort?.signal,
+            platform,
+            // Diagnostics belong on the injected logger, not on atomic.ts's raw
+            // stderr fallback: --log-level must be able to silence them (review W9).
+            onCleanupError: (message) => deps.logger?.warn(message),
+          });
+        } catch (cause) {
+          if (isAbortError(cause, effectiveReq.abort?.signal)) {
+            // A cancel that lands here (after the last cell, while the results are
+            // being written) is the same terminal state as a cancel mid-cell: the
+            // completed cells must still land and be reported. Throwing a bare
+            // `cancelled` with no detail lost them silently and made one terminal
+            // code answer with two different shapes (review v3 ROB-8).
+            throw await abortedRunError(executed, deps, abortState, notebook, effectiveReq, platform, executedCellsSet);
+          }
+          throw cause;
+        }
+        writeBack = { performed: true, backup_path: writeResult.backupPath };
+        contentHashAfter = writeResult.contentHashAfter;
+      }
+
+      deps.registry.setLastSeenContentHash(req.path, contentHashAfter ?? notebook.contentHash);
+
+      const aliveSession = deps.registry.findByNotebook(req.path);
+      return {
+        kind: 'completed',
+        path: req.path,
+        mode_requested: req.mode,
+        mode_used: modeUsed,
+        kernel_id: session.kernelId,
+        interpreter_path: resolution.interpreterPath,
+        kernel_language: resolution.language,
+        executed,
+        replayed_cell_indexes: replayPrefix,
+        stale_cells: staleCells,
+        stale_analysis: staleAnalysis,
+        kernel_alive: aliveSession !== null && !sawTimeout,
+        write_back: writeBack,
+        warnings,
+        image_blocks: imageBlocks,
+        content_hash_after: contentHashAfter,
+      };
+    } finally {
+      releaseRun();
     }
-
-    deps.registry.setLastSeenContentHash(req.path, contentHashAfter ?? notebook.contentHash);
-
-    const aliveSession = deps.registry.findByNotebook(req.path);
-    return {
-      kind: 'completed',
-      path: req.path,
-      mode_requested: req.mode,
-      mode_used: modeUsed,
-      kernel_id: session.kernelId,
-      interpreter_path: resolution.interpreterPath,
-      kernel_language: resolution.language,
-      executed,
-      replayed_cell_indexes: replayPrefix,
-      stale_cells: staleCells,
-      stale_analysis: staleAnalysis,
-      kernel_alive: aliveSession !== null && !sawTimeout,
-      write_back: writeBack,
-      warnings,
-      image_blocks: imageBlocks,
-      content_hash_after: contentHashAfter,
-    };
-  } finally {
-    releaseRun();
-  }
   } finally {
     merged.cleanup();
     unregisterKernelAbort();

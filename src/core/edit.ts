@@ -275,9 +275,13 @@ export function applyEditOps(
         checkAnchorsHashOrText(notebook, cell, raw, options, opIndex);
         cell.cell_type = cellType;
         if (cellType === 'markdown') {
-          // SPEC §4.5 write rule 4 + U9: outputs deleted, execution_count null.
+          // SPEC §4.5 write rule 4: outputs and execution_count are DELETED,
+          // not nulled. A markdown cell with `execution_count: null` is invalid
+          // nbformat ("Additional properties are not allowed"), and
+          // serializeNotebook only fills the key for code cells, so the residue
+          // stayed in the user's file forever (review v4 FID-3).
           delete cell.outputs;
-          cell.execution_count = null;
+          delete cell.execution_count;
         } else if (cellType === 'code') {
           if (cell.outputs === undefined) {
             cell.outputs = [];
