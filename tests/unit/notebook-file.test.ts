@@ -67,6 +67,25 @@ describe('[W1] lock errors map to notebook_locked on the READ path too', () => {
       code: 'file_not_found',
     });
   });
+
+  it('[TST-7] the READ PATH itself maps a lock errno (wiring, not just the helper)', async () => {
+    // Mutation-proven gap: asserting translateLockError() alone stayed green
+    // when the read path was reverted to `throw cause` — it guarded the
+    // helper's semantics but not its use (review v3 TST-7). This drives
+    // readNotebookFile with a reader that fails the way a held-open file does.
+    for (const code of ['EBUSY', 'EPERM', 'EACCES']) {
+      await expect(
+        readNotebookFile(path.join(dir, 'locked.ipynb'), hasher, {
+          readFileImpl: () => Promise.reject(errorWithCode(code)),
+        }),
+      ).rejects.toMatchObject({ code: 'notebook_locked' });
+    }
+    await expect(
+      readNotebookFile(path.join(dir, 'gone.ipynb'), hasher, {
+        readFileImpl: () => Promise.reject(errorWithCode('ENOENT')),
+      }),
+    ).rejects.toMatchObject({ code: 'file_not_found' });
+  });
 });
 
 describe('[W7] the per-path write lock is released and does not accumulate', () => {

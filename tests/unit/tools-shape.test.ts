@@ -243,6 +243,69 @@ describe('[step9][U27] schema-level violations raise invalid_arguments', () => {
     expect(readBody['code']).toBe('invalid_arguments');
   }, 60_000);
 
+  it('[ROB-5] cell_indexes is deduped and capped before rendering', async () => {
+    const nb = path.join(workspace, 'rob5.ipynb');
+    await writeFile(nb, JSON.stringify({
+      nbformat: 4,
+      nbformat_minor: 5,
+      metadata: {},
+      cells: Array.from({ length: 5 }, (_, i) => ({
+        cell_type: 'code', id: `c${i}`, metadata: {}, source: `x = ${i}`, outputs: [], execution_count: null,
+      })),
+    }));
+
+    // Repeating one index used to scale the RESPONSE with the ARGUMENT: 20 000
+    // repeats produced a 5.6 MB text block from a 5-cell notebook (review v3
+    // ROB-5). Dedup means the rendered cell count is what the caller asked for.
+    const repeated = await callTool('notebook_read', { path: nb, cell_indexes: Array.from({ length: 200 }, () => 0) });
+    const repeatedBody = JSON.parse(assertSingleTextBlock(repeated));
+    expect((repeatedBody['cells'] as unknown[]).length).toBe(1);
+
+    // Over the cap: rejected as an argument error, not silently truncated.
+    const tooMany = await callTool('notebook_read', {
+      path: nb,
+      cell_indexes: Array.from({ length: 1001 }, (_, i) => i),
+    });
+    expect(tooMany.isError).toBe(true);
+    const tooManyBody = JSON.parse(assertSingleTextBlock(tooMany));
+    expect(tooManyBody['code']).toBe('invalid_arguments');
+    expect(String(tooManyBody['detail']['field'])).toBe('cell_indexes');
+  }, 60_000);
+
+  it('[SEC-1] an unknown argument is rejected instead of silently defaulted', async () => {
+    const nb = path.join(workspace, 'sec1.ipynb');
+    await writeFile(nb, JSON.stringify({
+      nbformat: 4,
+      nbformat_minor: 5,
+      metadata: {},
+      cells: [{ cell_type: 'code', id: 'c0', metadata: {}, source: 'x = 1', outputs: [], execution_count: null }],
+    }));
+
+    // `cell_selector` belongs to notebook_run (SPEC §4.1.11 keeps the two names
+    // deliberately different). Sending it here used to read the whole notebook
+    // with no error at all, because the SDK validated with a NON-strict object
+    // and dropped the key before the handler could ever see it (review v3
+    // SEC-1). The tool schemas are strict now, so the request fails; the exact
+    // failure shape belongs to the SDK, which is why this asserts "rejected
+    // with an invalid-argument style message" rather than one code
+    // (see DEVIATIONS D-024).
+    const wrongArg = await callTool('notebook_read', { path: nb, cell_selector: '0' });
+    const raw = String((wrongArg.content ?? [])[0]?.['text'] ?? '');
+    expect(wrongArg.isError).toBe(true);
+    expect(raw).toMatch(/invalid|unrecognized|additional/i);
+    // It must NOT have silently read the notebook it was asked not to read.
+    expect(raw).not.toContain('cell_count');
+
+    // Every tool's advertised JSON Schema now matches the enforcement: the old
+    // mismatch was "additionalProperties:false advertised, key silently
+    // stripped in practice".
+    const tools = await client.listTools();
+    for (const tool of tools.tools) {
+      const schema = tool.inputSchema as { additionalProperties?: boolean };
+      expect(schema.additionalProperties, `${tool.name} is not strict`).toBe(false);
+    }
+  }, 60_000);
+
   it('enum violations also raise invalid_arguments (not invalid_ops/internal)', async () => {
     const nb = path.join(workspace, 'u27b.ipynb');
     await writeFile(nb, JSON.stringify({

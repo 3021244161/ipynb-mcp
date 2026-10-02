@@ -33,16 +33,38 @@ function interpreter(): string {
 }
 
 /**
- * Can this machine actually run a kernel? Starts one on a throwaway transport
- * and tears it down again. Cached: the probe costs a process spawn, and every
- * case in this file that needs a kernel needs the same answer.
+ * Can this machine actually run a kernel?
+ *
+ * Three outcomes, deliberately distinguished (review v3 TST-5): the old
+ * "any failure -> skip" turned a regression in `start_kernel` itself into a
+ * silently skipping, fully green suite.
+ *   - started:           proceed.
+ *   - noInterpreter:     nothing to test here; skip with the reason.
+ *   - ipykernelMissing:  interpreter present but no kernel support; skip.
+ *   - broken:            anything else (spawn regression, sidecar crash on an
+ *                        interpreter that claims ipykernel) -> the caller FAILS.
  */
-let kernelProbe: Promise<{ ok: boolean; reason: string }> | null = null;
+type ProbeOutcome =
+  | { status: 'started' }
+  | { status: 'noInterpreter' | 'ipykernelMissing' | 'zmqBroken' | 'broken'; reason: string };
 
-function probeKernelStartup(): Promise<{ ok: boolean; reason: string }> {
+let kernelProbe: Promise<ProbeOutcome> | null = null;
+
+function probeKernelStartup(): Promise<ProbeOutcome> {
   kernelProbe ??= (async () => {
     if (!PYTHON_AVAILABLE) {
-      return { ok: false, reason: 'no Python interpreter on this machine' };
+      return { status: 'noInterpreter', reason: 'no Python interpreter on this machine' };
+    }
+    if (!runs(interpreter(), 'import ipykernel')) {
+      return { status: 'ipykernelMissing', reason: `${interpreter()} cannot import ipykernel` };
+    }
+    if (!runs(interpreter(), 'import zmq; zmq.Context().socket(zmq.PAIR)')) {
+      // The interpreter advertises ipykernel but its pyzmq cannot open a
+      // socket at all (this machine's `.venv-test`: pyzmq 26.2.0 aborts with
+      // STATUS_STACK_BUFFER_OVERRUN). That is an environment defect, and it is
+      // NOT ipynb-mcp's business to fail on it — but it must not be reported as
+      // "no interpreter" either, so it gets its own outcome.
+      return { status: 'zmqBroken', reason: `${interpreter()} cannot use pyzmq sockets` };
     }
     const transport = new SidecarTransport({ interpreterPath: interpreter(), onLog: () => undefined });
     try {
@@ -52,14 +74,19 @@ function probeKernelStartup(): Promise<{ ok: boolean; reason: string }> {
         kernelSpecName: 'python3',
         language: 'python',
       });
-      return { ok: true, reason: 'kernel started' };
+      return { status: 'started' };
     } catch (cause) {
-      return { ok: false, reason: String(cause) };
+      return { status: 'broken', reason: String(cause) };
     } finally {
       await transport.shutdownAll().catch(() => undefined);
     }
   })();
   return kernelProbe;
+}
+
+/** Whether the chosen interpreter can run a snippet (probing capability). */
+function runs(candidate: string, snippet: string): boolean {
+  return spawnSync(candidate, ['-c', snippet], { timeout: 10_000 }).status === 0;
 }
 
 describe('[U18][D2] the symtable analyzer maps real source to defs/uses', () => {
@@ -106,21 +133,29 @@ describe('[U18][D2] the symtable analyzer maps real source to defs/uses', () => 
 
 describe('[U20][D2] non-Python kernels report method skipped', () => {
   it('stale_analysis.method is "skipped" and stale_cells stays empty', async (context) => {
+    // This case needs a kernel that actually BOOTS: it drives runNotebook end
+    // to end. Probe that capability BEFORE creating anything — the old order
+    // built a venv first, so on a machine without Python the suite went red
+    // before any guard ran, contradicting AGENTS §9 (review v3 TST-5).
+    const kernelReady = await probeKernelStartup();
+    if (
+      kernelReady.status === 'noInterpreter' ||
+      kernelReady.status === 'ipykernelMissing' ||
+      kernelReady.status === 'zmqBroken'
+    ) {
+      context.skip(`cannot run this case here: ${kernelReady.reason}`);
+      return;
+    }
+    if (kernelReady.status === 'broken') {
+      // An interpreter that CLAIMS ipykernel but whose kernel cannot start is a
+      // sidecar/spawn defect, not an environment gap: fail loudly.
+      throw new Error(`start_kernel is broken with a capable interpreter: ${kernelReady.reason}`);
+    }
+
     const { execFileSync } = await import('node:child_process');
     if (!existsSync(VENV_PY)) {
       execFileSync(BASE_PYTHON, ['-m', 'venv', '--system-site-packages', VENV_DIR], { stdio: 'ignore', timeout: 120_000 });
     }
-    // This case needs a kernel that actually BOOTS: it drives runNotebook end
-    // to end. `PYTHON_AVAILABLE` only proves an interpreter exists — a Python
-    // without ipykernel (CI's unit job) would fail here instead of skipping,
-    // and a broken pyzmq/ipykernel pair would too. Probe the real capability
-    // once and record the reason instead of pretending the case ran.
-    const kernelReady = await probeKernelStartup();
-    if (!kernelReady.ok) {
-      context.skip(`no interpreter that can start a kernel here: ${kernelReady.reason}`);
-      return;
-    }
-
     const { KernelRegistry } = await import('../../src/kernel/registry.js');
     const { runNotebook } = await import('../../src/run.js');
     const { mkdtemp, mkdir, rm, writeFile } = await import('node:fs/promises');
@@ -136,7 +171,7 @@ describe('[U20][D2] non-Python kernels report method skipped', () => {
     await mkdir(path.join(kernelsRoot, 'kernels', 'fake-r'), { recursive: true });
     await writeFile(
       path.join(kernelsRoot, 'kernels', 'fake-r', 'kernel.json'),
-      JSON.stringify({ argv: [VENV_PY, '-m', 'ipykernel', '-f', '{connection_file}'], display_name: 'Fake R', language: 'r' }),
+      JSON.stringify({ argv: [interpreter(), '-m', 'ipykernel', '-f', '{connection_file}'], display_name: 'Fake R', language: 'r' }),
     );
     process.env['JUPYTER_PATH'] = kernelsRoot;
     const nb = path.join(workspace, 'u20.ipynb');

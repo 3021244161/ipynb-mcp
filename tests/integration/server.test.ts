@@ -420,6 +420,30 @@ describe('[I12] stdout purity of the real stdio server', () => {
     send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'notebook_read', arguments: { path: nbPath } } });
     await waitFor(() => stdoutLines.filter((line) => line.includes('"id":3')).length >= 1, 30_000);
 
+    // SPEC §10.2 I12 asks for stdout purity across a REAL workload, not just the
+    // read path: an edit (backup + atomic write diagnostics) and a run (kernel
+    // startup, sidecar stderr forwarding, progress notifications) are where a
+    // stray console write would actually show up (review v3 TST-6).
+    send({
+      jsonrpc: '2.0',
+      id: 4,
+      method: 'tools/call',
+      params: {
+        name: 'notebook_edit',
+        arguments: {
+          path: nbPath,
+          ops: [{ op: 'replace_source', cell_index: 0, expected_source_hash: `sha256:${hasher.sha256Hex('x = 1')}`, new_text: 'x = 2' }],
+        },
+      },
+    });
+    send({
+      jsonrpc: '2.0',
+      id: 5,
+      method: 'tools/call',
+      params: { name: 'notebook_run', arguments: { path: nbPath, cell_selector: 'all', timeout_seconds: 60 } },
+    });
+    await waitFor(() => stdoutLines.filter((line) => line.includes('"id":5')).length >= 1, 120_000);
+
     child.stdin.end();
     await new Promise<void>((resolve) => {
       child.on('close', () => resolve());
@@ -427,7 +451,9 @@ describe('[I12] stdout purity of the real stdio server', () => {
     });
 
     // R14/I12: every stdout line parses as JSON; diagnostics only on stderr.
-    expect(stdoutLines.length).toBeGreaterThanOrEqual(3);
+    // Five responses are expected now that the workload includes an edit and a
+    // run, so a regression that silently drops frames is visible too.
+    expect(stdoutLines.length).toBeGreaterThanOrEqual(5);
     for (const line of stdoutLines) {
       expect(() => JSON.parse(line)).not.toThrow();
     }

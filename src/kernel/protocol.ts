@@ -39,41 +39,94 @@ export class ProtocolFramingError extends Error {
 }
 
 export class NdjsonFramer {
-  #buffer: Buffer = Buffer.alloc(0);
+  /**
+   * Chunks of the UNTERMINATED remainder only, plus how many bytes they hold.
+   * Accumulating into one growing buffer re-copied the whole line on every
+   * chunk (`Buffer.concat`), so a single max-size line cost O(L^2/chunk) — a
+   * 64 MiB line took ~9.4 s of main-thread CPU, which blocks the whole stdio
+   * server (review v3 PERF-1). Chunks are only concatenated when a line is
+   * actually emitted.
+   */
+  #chunks: Buffer[] = [];
+  #pending = 0;
 
   /** Feed a chunk; returns all complete lines (without trailing newline). */
   push(chunk: Buffer): string[] {
-    this.#buffer = this.#buffer.length === 0 ? chunk : Buffer.concat([this.#buffer, chunk]);
+    if (chunk.length === 0) {
+      return [];
+    }
+    this.#chunks.push(chunk);
+    this.#pending += chunk.length;
     const lines: string[] = [];
-    let newlineIndex = this.#buffer.indexOf(0x0a);
-    while (newlineIndex >= 0) {
-      const line = this.#buffer.subarray(0, newlineIndex);
-      if (line.length > MAX_LINE_BYTES) {
-        // SPEC §5.8 caps a SINGLE line: check complete lines here so a chunk
-        // holding many small lines never trips the cap (review A21).
-        throw new ProtocolFramingError(
-          `sidecar line exceeds ${MAX_LINE_BYTES} bytes (protocol error)`,
-        );
+    try {
+      for (;;) {
+        const newlineIndex = this.#indexOfNewline();
+        if (newlineIndex < 0) {
+          break;
+        }
+        // Checked BEFORE copying: an over-long complete line must be rejected
+        // without materialising it (SPEC §5.8).
+        if (newlineIndex > MAX_LINE_BYTES) {
+          throw new ProtocolFramingError(`sidecar line exceeds ${MAX_LINE_BYTES} bytes (protocol error)`);
+        }
+        const line = this.#take(newlineIndex);
+        // Tolerate \r\n: strip a trailing CR.
+        const text = line.toString('utf8');
+        lines.push(text.endsWith('\r') ? text.slice(0, -1) : text);
       }
-      this.#buffer = this.#buffer.subarray(newlineIndex + 1);
-      // Tolerate \r\n: strip a trailing CR.
-      const text = line.toString('utf8');
-      lines.push(text.endsWith('\r') ? text.slice(0, -1) : text);
-      newlineIndex = this.#buffer.indexOf(0x0a);
+    } finally {
+      if (this.#pending === 0) {
+        // Free an empty chunk list even when the loop threw.
+        this.#chunks = [];
+      }
     }
     // Only the unterminated remainder counts toward the cap: it is the only
     // thing that can still grow into an over-long single line.
-    if (this.#buffer.length > MAX_LINE_BYTES) {
-      throw new ProtocolFramingError(
-        `sidecar line exceeds ${MAX_LINE_BYTES} bytes (protocol error)`,
-      );
+    if (this.#pending > MAX_LINE_BYTES) {
+      throw new ProtocolFramingError(`sidecar line exceeds ${MAX_LINE_BYTES} bytes (protocol error)`);
     }
     return lines;
   }
 
+  /** Offset of the first '\n' across the pending chunks, or -1. */
+  #indexOfNewline(): number {
+    if (this.#pending === 0) {
+      return -1;
+    }
+    let offset = 0;
+    for (const chunk of this.#chunks) {
+      const found = chunk.indexOf(0x0a);
+      if (found >= 0) {
+        return offset + found;
+      }
+      offset += chunk.length;
+    }
+    return -1;
+  }
+
+  /** Copy `length` bytes off the front of the pending chunks (nearly always one). */
+  #take(length: number): Buffer {
+    if (this.#chunks.length === 1) {
+      const only = this.#chunks[0]!;
+      // subarray shares the chunk's memory, so a fast path that slices is
+      // enough; the chunk stays referenced only for as long as `line` is.
+      const line = only.subarray(0, length);
+      const rest = only.subarray(length + 1);
+      this.#chunks = rest.length === 0 ? [] : [rest];
+      this.#pending = rest.length;
+      return line;
+    }
+    const joined = Buffer.concat(this.#chunks, length + 1);
+    const line = joined.subarray(0, length);
+    const rest = joined.subarray(length + 1);
+    this.#pending = rest.length;
+    this.#chunks = rest.length === 0 ? [] : [rest];
+    return line;
+  }
+
   /** Current partial line length (diagnostics). */
   get pendingBytes(): number {
-    return this.#buffer.length;
+    return this.#pending;
   }
 }
 

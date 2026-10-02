@@ -70,6 +70,13 @@ beforeAll(async () => {
     });
   }
   if (!(await canStartKernel(VENV_PY)) && (await canStartKernel(BASE_PYTHON))) {
+    // Same TST-1 rule as kernel.test.ts: on CI the venv must work, so a
+    // fallback there is a failure rather than a quieter green run.
+    if (process.env['CI'] === 'true' || process.env['IPYNB_TEST_REQUIRE_VENV'] === '1') {
+      throw new Error(
+        `test interpreter fallback: ${VENV_PY} cannot start a kernel and the run fell back to ${BASE_PYTHON}`,
+      );
+    }
     sidecarInterpreter = BASE_PYTHON;
   }
   workspace = await mkdtemp(path.join(tmpdir(), 'ipynb-mcp-run-'));
@@ -687,8 +694,7 @@ describe('[R3] a kernel that dies mid-run still writes back the completed cells'
   }, 180_000);
 });
 
-describe('[W3] a failed write-back never replaces the primary error code', () => {
-  it('still reports exec_timeout when the notebook changed under the run', async () => {
+describe('[W3] a failed write-back never replaces the primary error code', () => {  it('still reports exec_timeout when the notebook changed under the run', async () => {
     const nb = await writeNb('w3-timeout.ipynb', [
       codeCell('print("done")', 'c0'),
       // Ignores SIGINT so the run ends in the timeout path (not a cancel).
@@ -738,9 +744,56 @@ describe('[W3] a failed write-back never replaces the primary error code', () =>
     const err = caught as IpynbError;
     expect(err.code).toBe('exec_timeout');
     const writeBack = (err.detail as Record<string, unknown>)['write_back'] as Record<string, unknown>;
-    // The failure is reported, not hidden ... 
+    // The failure is reported, not hidden ...
     expect(writeBack['performed']).toBe(false);
     // ... and says why.
     expect(String(writeBack['reason'])).toContain('file_changed');
+  }, 120_000);
+});
+
+describe('[ROB-8] a cancel that lands AFTER the last cell still reports what it did', () => {
+  it('cancelled carries write_back and the completed cell is on disk', async () => {
+    // The window: every cell finished, the write-back has not started yet. The
+    // old code threw a bare `cancelled` with an EMPTY detail, so the finished
+    // cell was neither written nor reported — while the same terminal code
+    // reached through the mid-cell path DID report it (review v3 ROB-8).
+    const nb = await writeNb('rob8-cancel-window.ipynb', [codeCell('print("finished")', 'c0')]);
+
+    const controller = new AbortController();
+    let caught: unknown;
+    try {
+      await runNotebook(
+        request(nb, {
+          cellSelector: 'all',
+          abort: { signal: controller.signal, reason: 'cancelled' },
+        }),
+        {
+          ...deps(),
+          // The write_back progress event is emitted immediately before the
+          // real write starts, so aborting here lands in the window
+          // deterministically instead of racing it.
+          onProgress: (event) => {
+            if (event.phase === 'write_back') {
+              controller.abort();
+            }
+          },
+        },
+      );
+    } catch (cause) {
+      caught = cause;
+    }
+
+    expect(caught).toBeInstanceOf(IpynbError);
+    const err = caught as IpynbError;
+    expect(err.code).toBe('cancelled');
+    const detail = err.detail as Record<string, unknown>;
+    // The terminal state must report the work that finished (SPEC §4.8 rule 3).
+    expect(detail['executed_cells']).toBe(1);
+    expect((detail['executed'] as unknown[]).length).toBe(1);
+    // The signal-aborted write is discarded, then the failure-path write-back
+    // (which deliberately ignores the abort signal) commits the result.
+    expect(detail['write_back']).toMatchObject({ performed: true });
+    const cells = await readCells(nb);
+    expect(cells[0]!['execution_count']).toBe(1);
   }, 120_000);
 });

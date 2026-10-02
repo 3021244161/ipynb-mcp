@@ -68,6 +68,14 @@ beforeAll(async () => {
   // Prefer the dedicated venv; fall back to the base interpreter when it cannot
   // actually host a kernel, and say which one is in use.
   if (!(await canStartKernel(VENV_PY)) && (await canStartKernel(BASE_PYTHON))) {
+    // TST-1: a fallback means the test environment — or our own interpreter
+    // handling — is broken. In CI the venv is built from setup-python plus
+    // `pip install ipykernel` and must work, so refuse to mask it there.
+    if (process.env['CI'] === 'true' || process.env['IPYNB_TEST_REQUIRE_VENV'] === '1') {
+      throw new Error(
+        `test interpreter fallback: ${VENV_PY} cannot start a kernel and the run fell back to ${BASE_PYTHON}; refusing to mask an environment or spawn regression`,
+      );
+    }
     interpreter = BASE_PYTHON;
     process.stderr.write(
       `[kernel.test] ${VENV_PY} cannot start a kernel here; falling back to ${BASE_PYTHON}\n`,
@@ -187,23 +195,38 @@ describe('[I-smoke] sidecar transport with a real kernel', () => {
     expect(session!.alive).toBe(true);
   });
 
-  it('restart gives a new kernel id and runs no cells (I9)', async () => {
+  it('[I9] restart gives a new kernel id and runs no cells', async () => {
     const oldSession = (await registry.findByNotebook(notebookPath))!;
+    // Falsifiable evidence that nothing ran on the FRESH kernel: execute a cell
+    // that would leave a marker in the kernel's namespace, then restart and
+    // read that name back. An empty kernel raises NameError (a domain result,
+    // not a tool error); a reused one would print the old value. This replaces
+    // `executionCount === null`, which was true by construction because only
+    // execCell ever writes that field (review v3 TST-6).
+    await registry.execCell(notebookPath, {
+      code: 'restart_marker = "ran-before-restart"',
+      silent: true,
+      storeOutputs: false,
+      timeoutMs: 60_000,
+    });
+
     const newSession = await registry.restart(notebookPath);
     expect(newSession).not.toBeNull();
     expect(newSession!.kernelId).not.toBe(oldSession.kernelId);
-    // The name is the assertion (review D4): restart must NOT execute anything.
-    // A fresh kernel reports no execution count and holds none of the old
-    // state, and the session's own counter starts empty.
-    expect(newSession!.executionCount).toBeNull();
     expect(newSession!.alive).toBe(true);
-    // Prove freshness without executing a cell: a variable from the previous
-    // kernel is gone (documented as not-runnable here because a real check
-    // would itself be an execution — the counter assertions above are the
-    // observable contract).
+    expect(newSession!.executionCount).toBeNull();
+
+    const probe = await registry.execCell(notebookPath, {
+      code: 'print(restart_marker)',
+      silent: false,
+      storeOutputs: true,
+      timeoutMs: 60_000,
+    });
+    expect(probe.result.status).toBe('error');
+    expect(probe.result.rawOutputs[0]).toMatchObject({ outputType: 'error', ename: 'NameError' });
+
     const current = (await registry.findByNotebook(notebookPath))!;
     expect(current.kernelId).toBe(newSession!.kernelId);
-    expect(current.executionCount).toBeNull();
   });
 
   it('rejects concurrent executions on the same kernel with kernel_busy (I10)', async () => {

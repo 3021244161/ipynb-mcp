@@ -49,7 +49,6 @@ class FakeTransport implements KernelTransport {
     void params;
     return Promise.resolve({ status: 'ok', executionCount: 1, rawOutputs: [], durationMs: 1 });
   }
-
   interrupt(): Promise<void> {
     return Promise.resolve();
   }
@@ -95,8 +94,10 @@ interface FakeSidecar {
 function makeSidecar(
   failure: { onShutdown?: () => void; onStart?: () => void } = {},
 ): FakeSidecar {
-  const sidecar = { options: {} as { onExit?: (reason: string) => void }, transport: undefined as unknown as FakeTransport };
-  sidecar.transport = new FakeTransport(failure);
+  const sidecar = {
+    options: {} as { onExit?: (reason: string) => void },
+    transport: new FakeTransport(failure),
+  };
   return sidecar;
 }
 
@@ -382,5 +383,130 @@ describe('[W8] a missing session fails fast instead of hanging', () => {
     await expect(
       registry.execCell(NOTEBOOK, { code: 'x = 1', silent: true, storeOutputs: false, timeoutMs: 1000 }),
     ).rejects.toBeInstanceOf(IpynbError);
+  });
+});
+
+describe('[ROB-2] a timed-out cell actually shuts its kernel down', () => {
+  it('calls shutdownKernel exactly once and leaves no session behind', async () => {
+    const sidecar = makeSidecar();
+    sidecar.transport.execCell = () =>
+      Promise.resolve({ status: 'timeout', executionCount: null, rawOutputs: [], durationMs: 5 });
+    const registry = registryWith(sidecar);
+    await registry.getOrCreate(createInput());
+
+    const result = await registry.execCell(NOTEBOOK, {
+      code: 'while True: pass',
+      silent: false,
+      storeOutputs: true,
+      timeoutMs: 10,
+    });
+    expect(result.result.status).toBe('timeout');
+    // SPEC §4.7 rule 6: timeout kills the kernel. Removing the session first
+    // made shutdown() find nothing and return, so the process stayed alive
+    // while the registry forgot it (review v3 ROB-2 — 0 calls, kernel leaked).
+    expect(sidecar.transport.shutdownCalls).toBe(1);
+    expect(registry.findByNotebook(NOTEBOOK)).toBeNull();
+
+    // …and the next run starts ONE new kernel rather than coexisting with the
+    // old one under the same reuse key (SPEC §5.3).
+    const next = await registry.getOrCreate(createInput());
+    expect(next.kernelId).toBe('kernel-2');
+    expect(registry.listKernels()).toHaveLength(1);
+  });
+
+  it('removes the session even when the shutdown call itself fails', async () => {
+    const sidecar = makeSidecar({
+      onShutdown: () => {
+        throw new Error('sidecar is wedged');
+      },
+    });
+    sidecar.transport.execCell = () =>
+      Promise.resolve({ status: 'timeout', executionCount: null, rawOutputs: [], durationMs: 5 });
+    const registry = registryWith(sidecar);
+    await registry.getOrCreate(createInput());
+
+    await registry.execCell(NOTEBOOK, {
+      code: 'while True: pass',
+      silent: false,
+      storeOutputs: true,
+      timeoutMs: 10,
+    });
+    // The timeout result still wins (A30), but a kernel we cannot close must
+    // not stay registered as if it were usable.
+    expect(registry.findByNotebook(NOTEBOOK)).toBeNull();
+  });
+});
+
+describe('[ROB-6] path identity resolves symlinks before keying', () => {
+  it('treats two spellings of one file as one kernel and one run lock', async () => {
+    const sidecar = makeSidecar();
+    const canonical = 'C:/real/nb.ipynb';
+    const viaLink = 'C:/link/nb.ipynb';
+    const registry = registryWith(sidecar, {
+      canonicalPath: (target) => (target === viaLink ? canonical : target),
+    });
+
+    const first = await registry.getOrCreate({ ...createInput(), notebookPath: canonical });
+    const second = await registry.getOrCreate({ ...createInput(), notebookPath: viaLink });
+    expect(second.kernelId).toBe(first.kernelId);
+    expect(sidecar.transport.startCalls).toBe(1);
+
+    // The run lock follows the same identity: a second run through the link is
+    // refused while the canonical spelling holds it (SPEC §5.3).
+    const release = registry.acquireRun(canonical);
+    expect(() => registry.acquireRun(viaLink)).toThrow(
+      expect.objectContaining({ code: 'kernel_busy' }),
+    );
+    release();
+  });
+
+  it('falls back to the literal spelling when the path cannot be resolved', async () => {
+    const sidecar = makeSidecar();
+    const registry = registryWith(sidecar, {
+      canonicalPath: () => {
+        throw new Error('ENOENT');
+      },
+    });
+    const session = await registry.getOrCreate(createInput());
+    expect(session.kernelId).toBe('kernel-1');
+  });
+});
+
+describe('[ROB-13] a kernel reported dead is still asked to shut down', () => {
+  it('calls shutdownKernel so a wrong alive:false cannot orphan a live process', async () => {
+    const sidecar = makeSidecar();
+    const registry = registryWith(sidecar);
+    await registry.getOrCreate(createInput());
+    // The probe now says "dead" (an unstable/false answer): the kernel must not
+    // simply be forgotten while its process keeps running (R19).
+    sidecar.transport.statusQuery = () => Promise.resolve({ alive: false, executionCount: null, pid: null });
+
+    const next = await registry.getOrCreate(createInput());
+    expect(sidecar.transport.shutdownCalls).toBe(1);
+    expect(next.kernelId).toBe('kernel-2');
+  });
+});
+
+describe('[ROB-14] one probe decides the mode and the reuse', () => {
+  it('liveKernel answers with the kernel id and getOrCreate reuses it without probing again', async () => {
+    const sidecar = makeSidecar();
+    let probes = 0;
+    const registry = registryWith(sidecar);
+    await registry.getOrCreate(createInput());
+    const originalStatus = sidecar.transport.statusQuery;
+    sidecar.transport.statusQuery = () => {
+      probes += 1;
+      return originalStatus();
+    };
+
+    const live = await registry.liveKernel(NOTEBOOK);
+    expect(live).toEqual({ kernelId: 'kernel-1' });
+    expect(probes).toBe(1);
+
+    // The run hands that answer to getOrCreate, so no second round-trip — and
+    // no window in which the two answers could disagree.
+    const session = await registry.getOrCreate({ ...createInput(), knownAlive: true });
+    expect(session.kernelId).toBe('kernel-1');
+    expect(probes).toBe(1);
   });
 });
