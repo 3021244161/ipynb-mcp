@@ -113,7 +113,14 @@ async function main(): Promise<number> {
       .finally(() => process.exit(2));
   };
   process.on('uncaughtException', (cause) => fatal('uncaughtException', cause));
-  process.on('unhandledRejection', (cause) => fatal('unhandledRejection', cause));
+  // An unhandled rejection used to run the same fatal path, which made any
+  // stray rejection a mid-session server exit (review R2: the idle-reclaim
+  // timer was a reachable trigger). SPEC §5.1's exit-code-2 rule is about
+  // STARTUP failures; a runtime rejection that the process survived is a
+  // diagnosable event, not a reason to drop the client mid-conversation.
+  process.on('unhandledRejection', (cause) => {
+    logger.error(`unhandled rejection (continuing to serve): ${String(cause)}`);
+  });
 
   return 0;
 }

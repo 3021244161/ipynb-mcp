@@ -65,7 +65,16 @@ export interface RunOutcome {
   }>;
   readonly stale_analysis: { approximate: true; analysis_version: 1; method: 'python-symtable' | 'regex' | 'skipped' } | null;
   readonly kernel_alive: boolean;
-  readonly write_back: { performed: boolean; backup_path: string | null };
+  /**
+   * `performed: false` alone cannot tell "nothing to write" from "the write
+   * itself failed"; a failure on the error path carries `reason` so the
+   * primary error code is never replaced by it (review W3).
+   */
+  readonly write_back: {
+    performed: boolean;
+    backup_path: string | null;
+    reason?: string;
+  };
   readonly warnings: Warning[];
   readonly image_blocks: RunImageBlock[];
   readonly content_hash_after: string | null;
@@ -118,8 +127,16 @@ export function parseCellSelector(
           cell_selector: selector,
         });
       }
-      const rawStart = parts[0];
-      const rawEnd = parts[1];
+      const rawStart = parts[0] ?? '';
+      const rawEnd = parts[1] ?? '';
+      // A leading '-' is the same class of silent misread as '1-2-3': '-1'
+      // split into '' and '1', and Number('') === 0 turned it into the range
+      // 0-1 — running cells the caller never asked for (review W10).
+      if (rawStart === '' || rawEnd === '') {
+        throw new IpynbError('invalid_targets', `invalid range in cell_selector: ${piece}`, {
+          cell_selector: selector,
+        });
+      }
       const start = Number(rawStart);
       const end = Number(rawEnd);
       if (!Number.isInteger(start) || !Number.isInteger(end)) {
@@ -218,7 +235,10 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
   }
 
   // ---- mode matrix (SPEC §4.7) ----------------------------------------------
-  const hasLiveKernel = deps.registry.findByNotebook(req.path) !== null;
+  // "Live keeper" is a real probe, not the session record: a killed kernel
+  // lingers in the registry until the sidecar's next request, and choosing
+  // `resume` for it would run the prefix-less path against a dead kernel.
+  const hasLiveKernel = await deps.registry.hasLiveKernel(req.path);
   let modeUsed: ModeUsed;
   let targets = selected;
   let replayPrefix: number[] = [];
@@ -272,80 +292,133 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
     }
   }
 
-  // Ensure the kernel exists (getOrCreate is idempotent per reuse key).
-  const session = await deps.registry.getOrCreate({
-    notebookPath: req.path,
-    interpreterPath: resolution.interpreterPath,
-    kernelSpecName: resolution.kernelSpecName,
-    language: resolution.language,
-    // replay must rebuild state on a NEW kernel (SPEC §4.7 matrix, review A4):
-    // reusing a live one would leave stale variables masking prefix failures.
-    fresh: modeUsed === 'replay',
-  });
-
-  // Run-level lock (review A6 / SPEC §10.2 I10): a second concurrent run on
-  // the same kernel raises kernel_busy instead of interleaving cells.
-  const releaseRun = deps.registry.acquireRun(req.path);
-  try {
-    deps.onProgress?.({ phase: 'start', total: targets.length });
-
-    // ---- replay prefix: silent, no outputs, no counters, nothing written ------
-    for (const index of replayPrefix) {
-      if (isAborted(req.abort)) {
-        break; // outer abort branch performs the (empty) write-back and raises
-      }
-      const cell = notebook.cells[index]!;
-      await deps.registry.execCell(req.path, {
-        code: cellSource(cell),
-        silent: true,
-        storeOutputs: false,
-        timeoutMs: req.timeoutSeconds * 1000,
-      });
+  // Kernel death is an abort condition, not just an exception: when the kernel
+  // is killed (OOM, external taskkill, restart) the cells that already finished
+  // must still be written back and reported (SPEC §4.8 rule 3 / review R3).
+  //
+  // A termination only counts once a cell is actually in flight. Before that,
+  // the death being reported belongs to the PREVIOUS session — the sidecar
+  // notices a killed kernel on its next request, so a stale session's death can
+  // surface while the run that replaced it is starting. Latching an abort there
+  // would fail a run that never touched a kernel.
+  const kernelAbort = new AbortController();
+  const kernelAbortState = { cellInFlight: false };
+  const unregisterKernelAbort = deps.registry.onRunAbort(req.path, () => {
+    if (kernelAbortState.cellInFlight) {
+      kernelAbort.abort();
     }
+  });
+  const abort: RunRequest['abort'] = {
+    signal: combineAbortSignals(req.abort?.signal, kernelAbort.signal),
+    // Without a client signal the only way this run can be aborted is the
+    // kernel terminating, so that is the honest reason (SPEC §4.8 rule 1).
+    reason: req.abort?.reason ?? 'kernel_died',
+  };
+  const effectiveReq: RunRequest = { ...req, abort };
 
-    // ---- execution loop --------------------------------------------------------
-    // clear_outputs_before applies per cell, immediately before that cell runs:
-    // pre-clearing the whole target set would wipe outputs of cells that never
-    // execute when a timeout/cancel interrupts the run (SPEC §4.7 rule 3).
-    const executed: ExecutedCell[] = [];
-    const imageBlocks: RunImageBlock[] = [];
-    const executedCellsSet = new Set<number>();
-    // Running cursor so image_index stays unique across the whole call
-    // (SPEC §4.3), not reset per cell (review A5).
-    let imageCursor = 0;
-    let sawTimeout = false;
+  try {
+    // Ensure the kernel exists (getOrCreate is idempotent per reuse key).
+    const session = await deps.registry.getOrCreate({
+      notebookPath: req.path,
+      interpreterPath: resolution.interpreterPath,
+      kernelSpecName: resolution.kernelSpecName,
+      language: resolution.language,
+      // replay must rebuild state on a NEW kernel (SPEC §4.7 matrix, review A4):
+      // reusing a live one would leave stale variables masking prefix failures.
+      fresh: modeUsed === 'replay',
+    });
 
-    for (const index of targets) {
-      if (isAborted(req.abort)) {
-        break; // fall through to the outer abort branch: write back completed cells
-      }
-      const cell = notebook.cells[index]!;
-      deps.onProgress?.({ phase: 'cell', completed: executed.length, total: targets.length, current_cell_index: index });
-      const savedOutputs = cell.outputs;
-      const savedCount = cell.execution_count;
-      if (req.clearOutputsBefore) {
-        cell.outputs = [];
-        cell.execution_count = null;
-      }
-      let result;
-      try {
-        result = await deps.registry.execCell(req.path, {
+    // Run-level lock (review A6 / SPEC §10.2 I10): a second concurrent run on
+    // the same kernel raises kernel_busy instead of interleaving cells.
+    const releaseRun = deps.registry.acquireRun(req.path);
+    try {
+      deps.onProgress?.({ phase: 'start', total: targets.length });
+
+      // ---- replay prefix: silent, no outputs, no counters, nothing written ------
+      for (const index of replayPrefix) {
+        if (isAborted(effectiveReq.abort)) {
+          break; // outer abort branch performs the (empty) write-back and raises
+        }
+        const cell = notebook.cells[index]!;
+        await deps.registry.execCell(req.path, {
           code: cellSource(cell),
-          silent: false,
-          storeOutputs: true,
+          silent: true,
+          storeOutputs: false,
           timeoutMs: req.timeoutSeconds * 1000,
         });
-      } catch (cause) {
-        cell.outputs = savedOutputs;
-        cell.execution_count = savedCount;
-        if (isAborted(req.abort)) {
-          // The kernel was killed while this cell was in flight (restart/
-          // shutdown raced the execution): fall through to the abort branch so
-          // completed cells still get written back (SPEC §4.8 rule 3).
-          break;
-        }
-        throw cause;
       }
+
+      // ---- execution loop ------------------------------------------------------
+      // clear_outputs_before applies per cell, immediately before that cell runs:
+      // pre-clearing the whole target set would wipe outputs of cells that never
+      // execute when a timeout/cancel interrupts the run (SPEC §4.7 rule 3).
+      const executed: ExecutedCell[] = [];
+      const imageBlocks: RunImageBlock[] = [];
+      const executedCellsSet = new Set<number>();
+      // Running cursor so image_index stays unique across the whole call
+      // (SPEC §4.3), not reset per cell (review A5).
+      let imageCursor = 0;
+      let sawTimeout = false;
+      // Guards the failure-path write-back against running twice for one run.
+      const abortState: AbortState = { writtenBack: false };
+
+      for (const index of targets) {
+        if (isAborted(effectiveReq.abort)) {
+          break; // fall through to the outer abort branch: write back completed cells
+        }
+        const cell = notebook.cells[index]!;
+        deps.onProgress?.({ phase: 'cell', completed: executed.length, total: targets.length, current_cell_index: index });
+        const savedOutputs = cell.outputs;
+        const savedCount = cell.execution_count;
+        if (req.clearOutputsBefore) {
+          cell.outputs = [];
+          cell.execution_count = null;
+        }
+        let result;
+        // A kernel termination only ends the run while one of OUR cells is in
+        // flight (SPEC §4.8 rule 1). Outside that window the event is stale —
+        // the sidecar notices a killed kernel on its next request, so an old
+        // session's death can surface while this run is between cells.
+        kernelAbortState.cellInFlight = true;
+        try {
+          result = await deps.registry.execCell(req.path, {
+            code: cellSource(cell),
+            silent: false,
+            storeOutputs: true,
+            timeoutMs: req.timeoutSeconds * 1000,
+          });
+        } catch (cause) {
+          kernelAbortState.cellInFlight = false;
+          // The in-flight cell is not a completed cell: its partial output never
+          // lands (SPEC §4.8 rule 2).
+          cell.outputs = savedOutputs;
+          cell.execution_count = savedCount;
+          if (isAborted(effectiveReq.abort)) {
+            // The kernel was killed while this cell was in flight (restart /
+            // shutdown / client cancel raced the execution): fall through to
+            // the abort branch so completed cells still get written back.
+            break;
+          }
+          if (cause instanceof IpynbError && cause.code === 'kernel_died') {
+            // The kernel died on its own (OOM, external kill, dead sidecar).
+            // With no client signal there is nothing to set isAborted(), and
+            // simply throwing here lost every cell that had already completed
+            // — the run's own record of what it did (review R3).
+            throw await failedRunError(
+              'kernel_died',
+              cause.message,
+              executed,
+              deps,
+              abortState,
+              notebook,
+              req,
+              platform,
+              executedCellsSet,
+            );
+          }
+          throw cause;
+        }
+        kernelAbortState.cellInFlight = false;
       const mapped = mapRawOutputs(result.result.rawOutputs, {
         inlineTextChars: deps.config.inlineTextChars,
         maxImageBytes: deps.config.maxImageBytes,
@@ -406,7 +479,7 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
       // A cell interrupted by the abort (status error) is NOT a completed cell:
       // its partial output never lands (SPEC §4.8 rule 2). Cells that finished
       // cleanly (ok) still count, even if the abort raced in afterwards.
-      const abortedNow = isAborted(req.abort);
+      const abortedNow = isAborted(effectiveReq.abort);
       const interruptedByAbort = abortedNow && result.result.status === 'error';
       if (!interruptedByAbort) {
         cell.outputs = [...result.result.rawOutputs];
@@ -424,7 +497,8 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
     if (sawTimeout) {
       // Write back the cells that DID complete (SPEC §4.7 rule 5), then raise
       // exec_timeout with the partial state in detail.
-      const timeoutWriteBack = await writeBackCompleted(notebook, req, deps, platform, executedCellsSet);
+      abortState.writtenBack = true;
+      const timeoutWriteBack = await writeBackCompleted(notebook, effectiveReq, deps, platform, executedCellsSet);
       const timeoutCell = executed[executed.length - 1];
       throw new IpynbError('exec_timeout', `cell execution timed out after ${req.timeoutSeconds}s (interrupt did not land)`, {
         cell_index: timeoutCell?.cell_index ?? null,
@@ -436,15 +510,20 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
       });
     }
 
-    if (isAborted(req.abort)) {
+    if (isAborted(effectiveReq.abort)) {
       // Completed cells stay written; the interrupted cell never lands (SPEC §4.8).
-      const abortWriteBack = await writeBackCompleted(notebook, req, deps, platform, executedCellsSet);
-      const code = req.abort!.reason === 'kernel_died' ? 'kernel_died' : 'cancelled';
-      throw new IpynbError(code, `run aborted (${code})`, {
-        executed_cells: executed.length,
-        executed: executed as unknown as JsonValue,
-        write_back: abortWriteBack,
-      });
+      const code = effectiveReq.abort!.reason === 'kernel_died' ? 'kernel_died' : 'cancelled';
+      throw await failedRunError(
+        code,
+        `run aborted (${code})`,
+        executed,
+        deps,
+        abortState,
+        notebook,
+        effectiveReq,
+        platform,
+        executedCellsSet,
+      );
     }
 
     if (mappedTruncated(executed)) {
@@ -527,14 +606,30 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
     deps.onProgress?.({ phase: 'write_back', completed: executed.length, total: targets.length });
     let writeBack: RunOutcome['write_back'] = { performed: false, backup_path: null };
     let contentHashAfter: string | null = null;
-    if (req.writeOutputs && executedCellsSet.size > 0) {
-      const writeResult = await writeNotebookFile(notebook, req.path, {
-        hasher: deps.hasher,
-        backupKeep: deps.config.backupKeep,
-        createBackup: req.createBackup,
-        expectedContentHash: notebook.contentHash,
-        platform,
-      });
+    if (effectiveReq.writeOutputs && executedCellsSet.size > 0) {
+      let writeResult;
+      try {
+        writeResult = await writeNotebookFile(notebook, req.path, {
+          hasher: deps.hasher,
+          backupKeep: deps.config.backupKeep,
+          createBackup: req.createBackup,
+          expectedContentHash: notebook.contentHash,
+          // SPEC §4.1.10 / §4.6.2 (review V3): the main write-back honours the
+          // cancellation signal — aborting discards the temp file and leaves
+          // the notebook untouched. The failure-path write-back does not, by
+          // design: there the write IS the abort handling.
+          signal: req.abort?.signal,
+          platform,
+          // Diagnostics belong on the injected logger, not on atomic.ts's raw
+          // stderr fallback: --log-level must be able to silence them (review W9).
+          onCleanupError: (message) => deps.logger?.warn(message),
+        });
+      } catch (cause) {
+        if (isAbortCause(cause, req.abort?.signal)) {
+          throw new IpynbError('cancelled', 'run cancelled while writing results back', {});
+        }
+        throw cause;
+      }
       writeBack = { performed: true, backup_path: writeResult.backupPath };
       contentHashAfter = writeResult.contentHashAfter;
     }
@@ -562,6 +657,9 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
     };
   } finally {
     releaseRun();
+    }
+  } finally {
+    unregisterKernelAbort();
   }
 }
 
@@ -571,6 +669,86 @@ function isAborted(abort: RunRequest['abort']): boolean {
   return abort?.signal.aborted === true;
 }
 
+/**
+ * Merge the client's cancellation signal with the registry's kernel-death
+ * signal. A run has exactly one abort state, so both triggers must feed it
+ * (review R3): completed cells are written back either way, and the terminal
+ * error code comes from the reason the run was created with.
+ */
+function combineAbortSignals(
+  clientSignal: AbortSignal | undefined,
+  kernelSignal: AbortSignal,
+): AbortSignal {
+  if (clientSignal === undefined) {
+    return kernelSignal;
+  }
+  if (clientSignal.aborted || kernelSignal.aborted) {
+    return clientSignal.aborted ? clientSignal : kernelSignal;
+  }
+  const controller = new AbortController();
+  const forward = (): void => controller.abort();
+  // once:true so neither listener outlives the run it belongs to (review W8).
+  clientSignal.addEventListener('abort', forward, { once: true });
+  kernelSignal.addEventListener('abort', forward, { once: true });
+  return controller.signal;
+}
+
+/**
+ * Did this throw come from the abort signal rather than from a real write
+ * failure? atomic.ts rejects with `signal.reason` (or a plain Error('aborted'))
+ * when it discards the temp file (SPEC §4.6.2).
+ */
+function isAbortCause(cause: unknown, signal: AbortSignal | undefined): boolean {
+  if (signal === undefined || !signal.aborted) {
+    return false;
+  }
+  return (
+    cause === signal.reason ||
+    (cause instanceof Error && (cause.name === 'AbortError' || cause.message === 'aborted'))
+  );
+}
+
+/** Guards the failure-path write-back against running twice for one run. */
+interface AbortState {
+  writtenBack: boolean;
+}
+
+/**
+ * Terminal error for a run that was cut short (cancelled / kernel_died). The
+ * completed cells are written back exactly once per run and reported in the
+ * error detail, so a failed run still tells the caller what it did
+ * (SPEC §4.8 rules 3/5, review R3/W3).
+ */
+async function failedRunError(
+  code: 'cancelled' | 'kernel_died',
+  message: string,
+  executed: readonly ExecutedCell[],
+  deps: RunDeps,
+  abortState: AbortState,
+  notebook: NotebookFile,
+  req: RunRequest,
+  platform: NodeJS.Platform,
+  executedCellsSet: ReadonlySet<number>,
+): Promise<IpynbError> {
+  const writeBack = abortState.writtenBack
+    ? { performed: false, backup_path: null }
+    : await writeBackCompleted(notebook, req, deps, platform, executedCellsSet);
+  abortState.writtenBack = true;
+  return new IpynbError(code, message, {
+    executed_cells: executed.length,
+    executed: executed as unknown as JsonValue,
+    write_back: writeBack,
+  });
+}
+
+/**
+ * Failure-path write-back (SPEC §4.7 rule 5, §4.8 rule 3). A failing write
+ * must NOT replace the primary outcome: the caller is reporting
+ * exec_timeout/cancelled/kernel_died, and a `file_changed` or
+ * `notebook_locked` from here would hide exactly the error the model needs
+ * (review W3). The failure is reported through `write_back.reason` and a
+ * warning instead.
+ */
 async function writeBackCompleted(
   notebook: NotebookFile,
   req: RunRequest,
@@ -581,18 +759,24 @@ async function writeBackCompleted(
   if (!req.writeOutputs || executedCellsSet.size === 0) {
     return { performed: false, backup_path: null };
   }
-  const partialWrite = await writeNotebookFile(notebook, req.path, {
-    hasher: deps.hasher,
-    backupKeep: deps.config.backupKeep,
-    createBackup: req.createBackup,
-    expectedContentHash: notebook.contentHash,
-    // Deliberately NOT passing req.abort.signal here: this write-back IS the
-    // abort handling (SPEC §4.8 rule 3 — completed cells are written back
-    // when a run dies), so an already-aborted signal must not block it.
-    platform,
-    onCleanupError: (message) => deps.logger?.warn(message),
-  });
-  return { performed: true, backup_path: partialWrite.backupPath };
+  try {
+    const partialWrite = await writeNotebookFile(notebook, req.path, {
+      hasher: deps.hasher,
+      backupKeep: deps.config.backupKeep,
+      createBackup: req.createBackup,
+      expectedContentHash: notebook.contentHash,
+      // Deliberately NOT passing req.abort.signal here: this write-back IS the
+      // abort handling (SPEC §4.8 rule 3 — completed cells are written back
+      // when a run dies), so an already-aborted signal must not block it.
+      platform,
+      onCleanupError: (message) => deps.logger?.warn(message),
+    });
+    return { performed: true, backup_path: partialWrite.backupPath };
+  } catch (cause) {
+    const reason = cause instanceof IpynbError ? cause.code : String(cause);
+    deps.logger?.warn(`write-back of already-completed cells failed (${reason}) for ${req.path}`);
+    return { performed: false, backup_path: null, reason };
+  }
 }
 
 function mappedTruncated(executed: readonly ExecutedCell[]): boolean {

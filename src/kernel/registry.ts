@@ -26,6 +26,10 @@ export interface KernelSessionInfo {
 }
 
 interface Session {
+  /** Reuse key this session is stored under; recomputing it is lossy (a
+   *  kernelspec name that resolves differently at start time would leak the
+   *  session in #sessions forever). */
+  readonly reuseKey: string;
   readonly kernelId: string;
   readonly notebookPath: string;
   readonly interpreterPath: string;
@@ -37,8 +41,6 @@ interface Session {
   pid: number | null;
   generation: number;
   busy: boolean;
-  /** Run-level lock: a whole notebook_run holds it for its duration (I10). */
-  runActive: boolean;
   lastSeenContentHash: string | null;
   readonly transport: KernelTransport;
 }
@@ -58,6 +60,13 @@ export class KernelRegistry {
   readonly #kernels = new Map<string, Session>(); // kernelId -> session
   readonly #transports = new Map<string, KernelTransport>(); // interpreter -> transport
   readonly #starting = new Map<string, Promise<KernelSessionInfo>>(); // reuseKey -> in-flight start
+  // Run-level locks keyed by NORMALIZED notebook path: a restart/fresh session
+  // replaces the session object, so hanging the lock off the session let a
+  // second run slip in with the first still in flight (review W5).
+  readonly #runKeys = new Map<string, string>(); // normalized path -> reuseKey
+  readonly #runActive = new Set<string>(); // reuseKeys with a whole run in flight
+  /** normalized notebook path -> run abort sinks (see onRunAbort). */
+  readonly #runAborts = new Map<string, Set<() => void>>();
   readonly #idleSeconds: number;
   readonly #logger?: Logger;
   readonly #platform: NodeJS.Platform;
@@ -86,7 +95,7 @@ export class KernelRegistry {
     }
     const intervalSeconds = Math.max(5, Math.min(60, this.#idleSeconds / 2));
     this.#timer = setInterval(() => {
-      void this.#reclaimIdle();
+      void this.reclaimIdle();
     }, intervalSeconds * 1000);
     this.#timer.unref?.();
   }
@@ -113,6 +122,20 @@ export class KernelRegistry {
     return null;
   }
 
+  /**
+   * Is there a kernel we could actually resume on? Answered with a real
+   * kernel_status probe, because "the sidecar is up" outlives "the kernel is
+   * up" (a killed kernel lingers until the sidecar's next request) and the mode
+   * matrix must not pick `resume` for a kernel that is already gone (SPEC §4.7).
+   */
+  async hasLiveKernel(notebookPath: string): Promise<boolean> {
+    const session = this.#findSessionByNotebook(notebookPath);
+    if (session === null || isTransportDead(session.transport)) {
+      return false;
+    }
+    return this.#probeKernel(session);
+  }
+
   listKernels(): KernelSessionInfo[] {
     return [...this.#sessions.values()].map((session) => this.#toInfo(session));
   }
@@ -124,27 +147,33 @@ export class KernelRegistry {
    * alive: true until the next exec).
    */
   async listKernelsWithStatus(): Promise<KernelSessionInfo[]> {
-    const infos: KernelSessionInfo[] = [];
-    for (const session of Array.from(this.#sessions.values())) {
-      const base = this.#toInfo(session);
-      if (!base.alive) {
-        infos.push(base);
-        continue;
-      }
-      try {
-        const status = await session.transport.kernelStatus(session.kernelId);
-        infos.push({
-          ...base,
-          alive: status.alive,
-          executionCount: status.executionCount ?? base.executionCount,
-          pid: status.pid ?? base.pid,
-        });
-      } catch (cause) {
-        this.#logger?.warn(`kernel_status query failed for ${session.kernelId}: ${String(cause)}`);
-        infos.push({ ...base, alive: false });
-      }
-    }
-    return infos;
+    // Queried concurrently: N sessions answered serially cost up to N x 15s of
+    // transport timeouts before the model sees anything (review W8).
+    return Promise.all(
+      Array.from(this.#sessions.values()).map(async (session) => {
+        const base = this.#toInfo(session);
+        if (!base.alive) {
+          return base;
+        }
+        try {
+          const status = await session.transport.kernelStatus(session.kernelId);
+          return {
+            ...base,
+            alive: status.alive,
+            executionCount: status.executionCount ?? base.executionCount,
+            pid: status.pid ?? base.pid,
+          };
+        } catch (cause) {
+          // A failed query is NOT proof of death: reporting alive:false here
+          // was indistinguishable from a confirmed dead kernel and the model
+          // had no way to tell them apart (review W8). Keep the
+          // transport-derived value — the warning-code list is closed
+          // (SPEC §7), so a status-query failure has no code to carry.
+          this.#logger?.warn(`kernel_status query failed for ${session.kernelId}: ${String(cause)}`);
+          return base;
+        }
+      }),
+    );
   }
 
   /**
@@ -163,12 +192,29 @@ export class KernelRegistry {
   }): Promise<KernelSessionInfo> {
     const key = this.#reuseKey(input.notebookPath, input.interpreterPath, input.kernelSpecName);
     const existing = this.#sessions.get(key);
-    if (existing !== undefined && existing.transport.alive && input.fresh !== true) {
-      existing.lastUsedAt = this.#now();
-      return this.#toInfo(existing);
-    }
     if (existing !== undefined) {
-      await this.shutdown(input.notebookPath);
+      if (!existing.transport.alive) {
+        // The sidecar backing this session is gone, so its kernel is gone with
+        // it: there is nothing left to shut down. Dropping the session here is
+        // what makes recovery work — routing this case through shutdown() threw
+        // kernel_died on a dead transport and kept the session, so the notebook
+        // could never run again in this process (review R1 / SPEC §5.3).
+        this.#forgetTransport(existing.transport);
+        this.#removeSession(existing);
+        this.#logger?.warn(`dropped a session whose sidecar died: ${existing.kernelId}`);
+      } else if (input.fresh === true) {
+        await this.shutdown(input.notebookPath);
+      } else if (await this.#probeKernel(existing)) {
+        existing.lastUsedAt = this.#now();
+        return this.#toInfo(existing);
+      } else {
+        // The kernel process itself is gone (OOM / external kill) and only the
+        // sidecar outlived it. Reusing the session would fail the run ~5s later
+        // (the sidecar's iopub poll is what first notices) instead of rebuilding
+        // here — SPEC §5.3: no live kernel means replay, not a failure.
+        this.#removeSession(existing);
+        this.#logger?.warn(`dropped a session whose kernel died: ${existing.kernelId}`);
+      }
     }
     const inflight = this.#starting.get(key);
     if (inflight !== undefined) {
@@ -179,6 +225,19 @@ export class KernelRegistry {
     });
     this.#starting.set(key, promise);
     return promise;
+  }
+
+  /** Real kernel process state, so a reused session is not already dead. */
+  async #probeKernel(session: Session): Promise<boolean> {
+    try {
+      const status = await session.transport.kernelStatus(session.kernelId);
+      return status.alive;
+    } catch (cause) {
+      // An unanswerable query is not proof of death: fall back to reuse and let
+      // the run's own exec surface a real failure.
+      this.#logger?.warn(`kernel_status probe failed for ${session.kernelId}: ${String(cause)}`);
+      return true;
+    }
   }
 
   async #startNew(
@@ -204,6 +263,7 @@ export class KernelRegistry {
       language: input.language,
     });
     const session: Session = {
+      reuseKey: key,
       kernelId,
       notebookPath: input.notebookPath,
       interpreterPath: input.interpreterPath,
@@ -215,7 +275,6 @@ export class KernelRegistry {
       pid: result.pid,
       generation: 0,
       busy: false,
-      runActive: false,
       lastSeenContentHash: null,
       transport,
     };
@@ -231,13 +290,8 @@ export class KernelRegistry {
       return existing;
     }
     if (existing !== undefined) {
-      this.#transports.delete(interpreterPath);
       // Kernels hosted by a dead sidecar are gone too.
-      for (const session of Array.from(this.#sessions.values())) {
-        if (session.transport === existing) {
-          this.#removeSession(session);
-        }
-      }
+      this.#forgetTransport(existing);
     }
     const transport = this.#transportFactory({
       interpreterPath,
@@ -250,6 +304,19 @@ export class KernelRegistry {
           this.#logger?.warn(message);
         } else {
           this.#logger?.error(message);
+        }
+      },
+      // The sidecar owns the kernels: when its process dies, every session it
+      // hosted is unreachable and must be dropped immediately, otherwise the
+      // next getOrCreate finds a session it cannot shut down (review R1/V4).
+      onExit: (reason) => {
+        this.#logger?.warn(`sidecar for ${interpreterPath} is gone: ${reason}`);
+        const hosted = Array.from(this.#sessions.values())
+          .filter((session) => session.transport === transport)
+          .map((session) => session.notebookPath);
+        this.#forgetTransport(transport);
+        for (const notebookPath of hosted) {
+          this.#notifyRunAborted(notebookPath);
         }
       },
       spawnImpl: this.#spawnOptionsExtras.spawnImpl,
@@ -271,15 +338,29 @@ export class KernelRegistry {
    * function must be called in a finally block.
    */
   acquireRun(notebookPath: string): () => void {
-    const session = this.#requireSession(notebookPath, 'kernel_not_available');
-    if (session.runActive) {
-      throw new IpynbError('kernel_busy', `a run is already in flight on kernel ${session.kernelId}`, {
-        kernel_id: session.kernelId,
+    const normalized = normalizeForCompare(notebookPath, this.#platform);
+    let key = this.#runKeys.get(normalized);
+    if (key === undefined) {
+      const session = this.#findSessionByNotebook(notebookPath);
+      if (session === null) {
+        throw new IpynbError('kernel_not_available', `no live kernel for ${notebookPath}`, {
+          path: notebookPath,
+        });
+      }
+      key = session.reuseKey;
+    }
+    if (this.#runActive.has(key)) {
+      throw new IpynbError('kernel_busy', 'a run is already in flight on this notebook', {
+        path: notebookPath,
       });
     }
-    session.runActive = true;
+    this.#runActive.add(key);
+    this.#runKeys.set(normalized, key);
     return () => {
-      session.runActive = false;
+      this.#runActive.delete(key);
+      if (this.#runKeys.get(normalized) === key) {
+        this.#runKeys.delete(normalized);
+      }
     };
   }
 
@@ -305,9 +386,14 @@ export class KernelRegistry {
         session.executionCount = result.executionCount;
       }
       if (result.status === 'timeout') {
-        // Timeout kills the kernel (SPEC §4.7 rule 6). The timeout result is
-        // the primary outcome: a failed cleanup must not replace it (the
-        // session stays registered for shutdown_all to retry — review A30).
+        // Timeout kills the kernel (SPEC §4.7 rule 6). The session leaves the
+        // registry FIRST: the kernel it points at is already being torn down, so
+        // leaving it visible would let the next cell reuse a dead kernel — and
+        // since the sidecar only notices the death on its next request, the
+        // caller would wait out an iopub poll before failing. The timeout
+        // result stays the primary outcome: a failed cleanup is logged, not
+        // thrown (review A30).
+        this.#removeSession(session);
         try {
           await this.shutdown(notebookPath);
         } catch (shutdownCause) {
@@ -336,18 +422,38 @@ export class KernelRegistry {
     if (session === null) {
       return;
     }
+    if (isTransportDead(session.transport)) {
+      // Nothing to shut down: the sidecar that hosted this kernel is gone, so
+      // the kernel is gone too. Treat it as cleaned up instead of turning a
+      // maintenance operation into a permanent kernel_died (review R1/R2).
+      this.#forgetTransport(session.transport);
+      this.#removeSession(session);
+      this.#logger?.info(`dropped a session with a dead sidecar: ${session.kernelId}`);
+      return;
+    }
+    let failed = false;
     try {
       await session.transport.shutdownKernel(session.kernelId);
     } catch (cause) {
       // Keep the session registered so a retry (or the final shutdown_all)
       // can still reach this kernel — removing it first made the kernel
-      // invisible-but-alive (review A30).
+      // invisible-but-alive (review A30). This is not a dead end: the
+      // dead-transport branch above covers the case where a retry cannot
+      // work either, and this branch only fires while the sidecar is up.
+      failed = true;
       this.#logger?.warn(`kernel shutdown failed for ${session.kernelId}; keeping the session for retry: ${String(cause)}`);
+    }
+    if (failed) {
       throw new IpynbError('kernel_died', `failed to shut down kernel ${session.kernelId}`, {
         kernel_id: session.kernelId,
       });
     }
     this.#removeSession(session);
+    // Deliberately NOT notifying run sinks here: this branch is also the
+    // session-replacement path (getOrCreate → fresh), where the very run doing
+    // the replacing would abort itself before its first cell. Terminations the
+    // run cannot observe arrive through #handleKernelDied / the sidecar exit
+    // hook; a run whose in-flight exec hits a shutdown sees the rejection.
     this.#logger?.info(`kernel shutdown: ${session.kernelId}`);
   }
 
@@ -393,12 +499,20 @@ export class KernelRegistry {
     const sessions = Array.from(this.#sessions.values());
     this.#sessions.clear();
     this.#kernels.clear();
+    // Every run dies with its kernel, and shutdown_all is the process-exit
+    // path: runs must not keep waiting on kernels that are being torn down.
+    const notebooks = new Set(sessions.map((session) => session.notebookPath));
+    this.#runActive.clear();
+    this.#runKeys.clear();
     for (const session of sessions) {
       try {
         await session.transport.shutdownKernel(session.kernelId);
       } catch (cause) {
         this.#logger?.warn(`kernel shutdown_all failure for ${session.kernelId}: ${String(cause)}`);
       }
+    }
+    for (const notebookPath of notebooks) {
+      this.#notifyRunAborted(notebookPath);
     }
     const transports = Array.from(this.#transports.values());
     this.#transports.clear();
@@ -414,9 +528,73 @@ export class KernelRegistry {
 
   #handleKernelDied(kernelId: string): void {
     const session = this.#kernels.get(kernelId);
-    if (session !== undefined) {
-      this.#removeSession(session);
-      this.#logger?.warn(`kernel died unexpectedly: ${kernelId}`);
+    if (session === undefined) {
+      return;
+    }
+    this.#removeSession(session);
+    this.#logger?.warn(`kernel died unexpectedly: ${kernelId}`);
+    // A run waiting on this kernel has to learn it is over HERE: its in-flight
+    // exec fails with kernel_died either way, but cells that already completed
+    // must still be written back and reported (SPEC §4.8 rule 3 / review R3).
+    this.#notifyRunAborted(session.notebookPath);
+  }
+
+  /** Drop a transport and every session it hosts (the sidecar process is gone). */
+  #forgetTransport(transport: KernelTransport): void {
+    for (const [interpreterPath, candidate] of Array.from(this.#transports.entries())) {
+      if (candidate === transport) {
+        this.#transports.delete(interpreterPath);
+      }
+    }
+    for (const session of Array.from(this.#sessions.values())) {
+      if (session.transport === transport) {
+        this.#removeSession(session);
+      }
+    }
+  }
+
+  /**
+   * Register a run-level abort sink for a notebook. The registry owns the
+   * kernel lifecycle, so it is the only layer that can tell a run waiting on
+   * this kernel that the kernel is gone (SPEC §4.8 rule 1). Returns an
+   * unregister function; the run calls it when it ends.
+   *
+   * Sinks fire only for terminations a run cannot observe on its own:
+   * explicit shutdown/restart, idle reclamation, a sidecar exit and an
+   * unexpected kernel death. `execCell`'s post-timeout cleanup deliberately
+   * does NOT fire them — that death is the documented consequence of the
+   * `timeout` result the caller already holds, and the run may continue with
+   * the next cell (SPEC §4.7 rules 5/6).
+   */
+  onRunAbort(notebookPath: string, callback: () => void): () => void {
+    const normalized = normalizeForCompare(notebookPath, this.#platform);
+    const sinks = this.#runAborts.get(normalized) ?? new Set<() => void>();
+    sinks.add(callback);
+    this.#runAborts.set(normalized, sinks);
+    return () => {
+      const current = this.#runAborts.get(normalized);
+      if (current === undefined) {
+        return;
+      }
+      current.delete(callback);
+      if (current.size === 0) {
+        this.#runAborts.delete(normalized);
+      }
+    };
+  }
+
+  /** Tell every run waiting on this notebook that its kernel terminated. */
+  #notifyRunAborted(notebookPath: string): void {
+    const sinks = this.#runAborts.get(normalizeForCompare(notebookPath, this.#platform));
+    if (sinks === undefined) {
+      return;
+    }
+    for (const sink of Array.from(sinks)) {
+      try {
+        sink();
+      } catch (cause) {
+        this.#logger?.warn(`run abort sink failed for ${notebookPath}: ${String(cause)}`);
+      }
     }
   }
 
@@ -441,16 +619,20 @@ export class KernelRegistry {
   }
 
   #removeSession(session: Session): void {
-    const key = this.#reuseKey(session.notebookPath, session.interpreterPath, session.kernelSpecName);
-    if (this.#sessions.get(key) === session) {
-      this.#sessions.delete(key);
+    if (this.#sessions.get(session.reuseKey) === session) {
+      this.#sessions.delete(session.reuseKey);
     }
     if (this.#kernels.get(session.kernelId) === session) {
       this.#kernels.delete(session.kernelId);
     }
   }
 
-  async #reclaimIdle(): Promise<void> {
+  /**
+   * Reclaim idle kernels. Called by the timer; also callable directly so a
+   * test (or an operator) can drive reclamation deterministically instead of
+   * sleeping through the interval.
+   */
+  async reclaimIdle(): Promise<void> {
     const now = this.#now().getTime();
     for (const session of Array.from(this.#sessions.values())) {
       if (session.busy) {
@@ -459,10 +641,24 @@ export class KernelRegistry {
         // would otherwise look idle to this timer.
         continue;
       }
+      const key = session.reuseKey;
+      if (this.#runActive.has(key)) {
+        // A whole run holds the notebook even while no cell is in flight (the
+        // gap between cells): reclaiming then terminates that run.
+        continue;
+      }
       const idleMs = now - session.lastUsedAt.getTime();
       if (idleMs >= this.#idleSeconds * 1000) {
         this.#logger?.info(`reclaiming idle kernel ${session.kernelId} (idle ${Math.round(idleMs / 1000)}s)`);
-        await this.shutdown(session.notebookPath);
+        try {
+          await this.shutdown(session.notebookPath);
+        } catch (cause) {
+          // Reclamation is maintenance: it runs from a void-ed timer callback,
+          // so a rejection here had no handler and took the whole server down
+          // with exit(2) (review R2). The session stays registered and the
+          // next tick retries.
+          this.#logger?.warn(`idle reclamation of ${session.kernelId} failed; will retry: ${String(cause)}`);
+        }
       }
     }
   }
@@ -482,4 +678,14 @@ export class KernelRegistry {
       generation: session.generation,
     };
   }
+}
+
+/**
+ * `alive` only says the sidecar process is up. A host killed between two
+ * event-loop turns still has `exitCode === null` and `killed === false`, so a
+ * request would be written into a dead pipe and fail — recovery must not
+ * depend on catching that write (review R1).
+ */
+function isTransportDead(transport: KernelTransport): boolean {
+  return transport.alive === false;
 }

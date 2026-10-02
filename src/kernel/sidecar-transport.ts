@@ -35,6 +35,15 @@ export interface SidecarTransportOptions {
   readonly spawnImpl?: SpawnFn;
   readonly platform?: NodeJS.Platform;
   readonly env?: NodeJS.ProcessEnv;
+  /**
+   * Fired once when the sidecar process is gone (exit, spawn error or a stdio
+   * error). The registry uses it to drop the sessions this transport hosted,
+   * so a crashed sidecar cannot leave a notebook permanently unrunnable
+   * (review R1/R2/V4).
+   */
+  readonly onExit?: (reason: string) => void;
+  /** How long a reclaim waits for the sidecar to actually die (default 5s). */
+  readonly killGraceMs?: number;
 }
 
 interface Pending {
@@ -49,13 +58,19 @@ export class SidecarTransport implements KernelTransport {
   readonly #pending = new Map<string, Pending>();
   readonly #log: SidecarTransportOptions['onLog'];
   readonly #platform: NodeJS.Platform;
+  readonly #onExit: ((reason: string) => void) | undefined;
+  readonly #killGraceMs: number;
   #kernelDiedCallback: ((kernelId: string) => void) | null = null;
   #exited = false;
   #exitReason: string | null = null;
+  #exitNotified = false;
+  #reclaiming = false;
 
   constructor(options: SidecarTransportOptions) {
     this.#log = options.onLog;
     this.#platform = options.platform ?? process.platform;
+    this.#onExit = options.onExit;
+    this.#killGraceMs = options.killGraceMs ?? 5_000;
     const sidecarPath =
       options.sidecarPath ?? fileURLToPath(new URL('../../python/ipynb_sidecar.py', import.meta.url));
     this.#child = (options.spawnImpl ?? spawn)(
@@ -71,6 +86,13 @@ export class SidecarTransport implements KernelTransport {
     this.#child.stdout.on('data', (chunk: Buffer) => {
       this.#handleStdout(chunk);
     });
+    // Every one of the three stdio streams can fail on its own. Without an
+    // 'error' listener a stdin EPIPE/EOF escalates into an uncaughtException —
+    // which the fatal hook turns into process exit instead of a kernel_died
+    // result (review V1/A20).
+    this.#child.stdout.on('error', (cause) => this.#failTransport(`sidecar stdout error: ${String(cause)}`));
+    this.#child.stdin.on('error', (cause) => this.#failTransport(`sidecar stdin error: ${String(cause)}`));
+    this.#child.stderr.on('error', (cause) => this.#failTransport(`sidecar stderr error: ${String(cause)}`));
     this.#child.stderr.on('data', (chunk: Buffer) => {
       for (const line of chunk.toString('utf8').split('\n')) {
         const trimmed = line.replace(/\r$/, '');
@@ -80,14 +102,10 @@ export class SidecarTransport implements KernelTransport {
       }
     });
     this.#child.on('exit', (code, signal) => {
-      this.#exited = true;
-      this.#exitReason = `sidecar exited (code=${String(code)}, signal=${String(signal)})`;
-      this.#failAllPending('kernel_died', this.#exitReason);
+      this.#failTransport(`sidecar exited (code=${String(code)}, signal=${String(signal)})`);
     });
     this.#child.on('error', (cause) => {
-      this.#exited = true;
-      this.#exitReason = `sidecar spawn error: ${String(cause)}`;
-      this.#failAllPending('kernel_died', this.#exitReason);
+      this.#failTransport(`sidecar spawn error: ${String(cause)}`);
     });
   }
 
@@ -180,7 +198,7 @@ export class SidecarTransport implements KernelTransport {
         }
       }
     }
-    await this.#waitExit(5_000);
+    await this.#waitExit(this.#killGraceMs);
   }
 
   async #waitExit(timeoutMs: number): Promise<void> {
@@ -274,9 +292,21 @@ export class SidecarTransport implements KernelTransport {
       const timer = setTimeout(() => {
         this.#pending.delete(request.id);
         reject(new IpynbError('kernel_died', `sidecar request timed out after ${timeoutMs}ms (op=${op})`));
+        // A request that never answered means the sidecar is wedged (it holds
+        // no per-request cancellation). Reclaim the process tree so the next
+        // call can spawn a healthy one instead of queueing behind a corpse
+        // (review V2 — the timeout used to leave the process running).
+        this.#reclaimAfterTimeout();
       }, timeoutMs);
       this.#pending.set(request.id, { resolve, reject, timer });
       try {
+        if (this.#child.stdin.destroyed || this.#child.stdin.writableEnded) {
+          throw new Error('sidecar stdin is closed');
+        }
+        // Asynchronous write failures surface on the stream's 'error' listener
+        // installed in the constructor, which funnels them through
+        // #failTransport — a promise rejection instead of an uncaught
+        // 'error' event (review V1/A20).
         this.#child.stdin.write(`${JSON.stringify(request)}\n`);
       } catch (cause) {
         this.#pending.delete(request.id);
@@ -284,6 +314,36 @@ export class SidecarTransport implements KernelTransport {
         reject(new IpynbError('kernel_died', `cannot write to sidecar stdin: ${String(cause)}`));
       }
     });
+  }
+
+  /** One-shot teardown shared by exit/error/stdio failures; fires onExit once. */
+  #failTransport(reason: string): void {
+    if (this.#exited) {
+      return;
+    }
+    this.#exited = true;
+    this.#exitReason = reason;
+    this.#failAllPending('kernel_died', reason);
+    if (!this.#exitNotified) {
+      this.#exitNotified = true;
+      this.#onExit?.(reason);
+    }
+  }
+
+  #reclaimAfterTimeout(): void {
+    if (this.#reclaiming || this.#exited) {
+      return;
+    }
+    this.#reclaiming = true;
+    void this.#killTree()
+      .catch((cause: unknown) => {
+        this.#log?.('warn', `process-tree reclaim after a request timeout failed: ${String(cause)}`);
+      })
+      .finally(() => {
+        // #killTree waits for the child's exit event; a host that ignores the
+        // kill must still not hold the transport open (review A28).
+        this.#failTransport(this.#exitReason ?? 'sidecar did not answer and was reclaimed');
+      });
   }
 
   #failAllPending(code: 'kernel_died', reason: string): void {
