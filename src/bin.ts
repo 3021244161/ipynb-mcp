@@ -60,7 +60,13 @@ async function main(): Promise<number> {
     return 2;
   }
 
-  const registry = new KernelRegistry({ idleSeconds: config.kernelIdleSeconds, logger });
+  const registry = new KernelRegistry({
+    idleSeconds: config.kernelIdleSeconds,
+    logger,
+    // SPEC §5.3 identity: realpath (+ case folding) so one file reached through
+    // a symlink/junction is one kernel and one run lock (review v3 ROB-6).
+    canonicalPath: (target) => realpathSync(target),
+  });
   registry.start();
   const runStore = new RunStore();
 

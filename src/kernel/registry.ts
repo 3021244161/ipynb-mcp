@@ -53,6 +53,12 @@ export interface RegistryOptions {
   readonly spawnImpl?: SidecarTransportOptions['spawnImpl'];
   readonly sidecarPath?: string;
   readonly now?: () => Date;
+  /**
+   * Symlink-resolving canonicalizer for path identity (SPEC §5.3 defines the
+   * reuse key as `realpath` + case folding). Defaults to identity, which keeps
+   * unit tests hermetic; production passes `fs.realpathSync`.
+   */
+  readonly canonicalPath?: (target: string) => string;
 }
 
 export class KernelRegistry {
@@ -72,6 +78,7 @@ export class KernelRegistry {
   readonly #platform: NodeJS.Platform;
   readonly #transportFactory: (options: SidecarTransportOptions) => KernelTransport;
   readonly #now: () => Date;
+  readonly #canonicalPath: (target: string) => string;
   #timer: NodeJS.Timeout | null = null;
   #nextKernelNumber = 1;
 
@@ -80,6 +87,7 @@ export class KernelRegistry {
     this.#logger = options.logger;
     this.#platform = options.platform ?? process.platform;
     this.#now = options.now ?? (() => new Date());
+    this.#canonicalPath = options.canonicalPath ?? ((target) => target);
     this.#transportFactory =
       options.transportFactory ??
       ((transportOptions: SidecarTransportOptions) => new SidecarTransport(transportOptions));
@@ -107,15 +115,34 @@ export class KernelRegistry {
     }
   }
 
+  /**
+   * Path identity for reuse keys, run locks and lookups (SPEC §5.3):
+   * `realpath` first, then case/separator folding on win32/darwin. Without the
+   * realpath step the same file reached through a symlink/junction/`subst`
+   * (`/tmp` -> `/private/tmp` on macOS) got its own kernel and its own run
+   * lock, so two runs could interleave and only the write-back hash check
+   * noticed (review v3 ROB-6). A path that cannot be resolved yet (the file is
+   * about to be created) falls back to its own spelling.
+   */
+  #norm(notebookPath: string): string {
+    let canonical = notebookPath;
+    try {
+      canonical = this.#canonicalPath(notebookPath);
+    } catch {
+      // Unresolvable (missing/racing path): the literal spelling is all we have.
+    }
+    return normalizeForCompare(canonical, this.#platform);
+  }
+
   #reuseKey(notebookPath: string, interpreterPath: string, kernelSpecName: string): string {
-    const normalized = normalizeForCompare(notebookPath, this.#platform);
+    const normalized = this.#norm(notebookPath);
     return createHash('sha1').update(`${normalized}|${interpreterPath}|${kernelSpecName}`).digest('hex');
   }
 
   /** Get the live session for a notebook path, if any. */
   findByNotebook(notebookPath: string): KernelSessionInfo | null {
     for (const session of this.#sessions.values()) {
-      if (normalizeForCompare(session.notebookPath, this.#platform) === normalizeForCompare(notebookPath, this.#platform)) {
+      if (this.#norm(session.notebookPath) === this.#norm(notebookPath)) {
         return this.#toInfo(session);
       }
     }
@@ -123,17 +150,27 @@ export class KernelRegistry {
   }
 
   /**
-   * Is there a kernel we could actually resume on? Answered with a real
-   * kernel_status probe, because "the sidecar is up" outlives "the kernel is
-   * up" (a killed kernel lingers until the sidecar's next request) and the mode
-   * matrix must not pick `resume` for a kernel that is already gone (SPEC §4.7).
+   * Liveness for the SPEC §4.7 mode matrix, answered with a real kernel_status
+   * probe: "the sidecar is up" outlives "the kernel is up" (a killed kernel
+   * lingers until the sidecar's next request), so the session record alone
+   * would pick `resume` for a kernel that is already gone.
+   *
+   * Returns the probed kernel id as well, so the caller can hand the answer
+   * straight to `getOrCreate` instead of probing a second time (review v3
+   * ROB-14: two probes could disagree and silently drift `resume` onto a fresh
+   * kernel).
    */
-  async hasLiveKernel(notebookPath: string): Promise<boolean> {
+  async liveKernel(notebookPath: string): Promise<{ kernelId: string } | null> {
     const session = this.#findSessionByNotebook(notebookPath);
     if (session === null || isTransportDead(session.transport)) {
-      return false;
+      return null;
     }
-    return this.#probeKernel(session);
+    return (await this.#probeKernel(session)) ? { kernelId: session.kernelId } : null;
+  }
+
+  /** Convenience boolean form of {@link liveKernel}. */
+  async hasLiveKernel(notebookPath: string): Promise<boolean> {
+    return (await this.liveKernel(notebookPath)) !== null;
   }
 
   listKernels(): KernelSessionInfo[] {
@@ -147,8 +184,9 @@ export class KernelRegistry {
    * alive: true until the next exec).
    */
   async listKernelsWithStatus(): Promise<KernelSessionInfo[]> {
-    // Queried concurrently: N sessions answered serially cost up to N x 15s of
-    // transport timeouts before the model sees anything (review W8).
+    // Broadcast concurrently: the queries share one sidecar, so this removes the
+    // N-times round-trip QUEUEING delay rather than adding real parallelism
+    // (review v3 PERF-4 — the old comment claimed "N x 15s of serial timeouts").
     return Promise.all(
       Array.from(this.#sessions.values()).map(async (session) => {
         const base = this.#toInfo(session);
@@ -189,6 +227,13 @@ export class KernelRegistry {
     kernelSpecName: string;
     language: string;
     fresh?: boolean;
+    /**
+     * Liveness answer the caller already obtained (SPEC §4.7 mode selection
+     * probes once). Passing it avoids a second sidecar round-trip per run and,
+     * more importantly, the window in which the two answers could disagree and
+     * silently turn a `resume` into "run on an empty kernel" (review v3 ROB-14).
+     */
+    knownAlive?: boolean;
   }): Promise<KernelSessionInfo> {
     const key = this.#reuseKey(input.notebookPath, input.interpreterPath, input.kernelSpecName);
     const existing = this.#sessions.get(key);
@@ -204,7 +249,7 @@ export class KernelRegistry {
         this.#logger?.warn(`dropped a session whose sidecar died: ${existing.kernelId}`);
       } else if (input.fresh === true) {
         await this.shutdown(input.notebookPath);
-      } else if (await this.#probeKernel(existing)) {
+      } else if (input.knownAlive ?? (await this.#probeKernel(existing))) {
         existing.lastUsedAt = this.#now();
         return this.#toInfo(existing);
       } else {
@@ -212,8 +257,7 @@ export class KernelRegistry {
         // sidecar outlived it. Reusing the session would fail the run ~5s later
         // (the sidecar's iopub poll is what first notices) instead of rebuilding
         // here — SPEC §5.3: no live kernel means replay, not a failure.
-        this.#removeSession(existing);
-        this.#logger?.warn(`dropped a session whose kernel died: ${existing.kernelId}`);
+        await this.#discardDeadKernel(existing);
       }
     }
     const inflight = this.#starting.get(key);
@@ -238,6 +282,25 @@ export class KernelRegistry {
       this.#logger?.warn(`kernel_status probe failed for ${session.kernelId}: ${String(cause)}`);
       return true;
     }
+  }
+
+  /**
+   * Retire a kernel the probe reported as dead. Asking the sidecar to shut it
+   * down anyway keeps a wrong/unstable `alive:false` from orphaning a live
+   * process — the same "forgotten but alive" shape ROB-2 fixes (review v3
+   * ROB-13 / R19).
+   */
+  async #discardDeadKernel(session: Session): Promise<void> {
+    try {
+      await session.transport.shutdownKernel(session.kernelId);
+    } catch (cause) {
+      // Expected when the kernel really is gone; logged so a wedged sidecar is
+      // still diagnosable.
+      this.#logger?.warn(`cleanup of a kernel reported dead failed for ${session.kernelId}: ${String(cause)}`);
+    } finally {
+      this.#removeSession(session);
+    }
+    this.#logger?.warn(`dropped a session whose kernel died: ${session.kernelId}`);
   }
 
   async #startNew(
@@ -338,7 +401,7 @@ export class KernelRegistry {
    * function must be called in a finally block.
    */
   acquireRun(notebookPath: string): () => void {
-    const normalized = normalizeForCompare(notebookPath, this.#platform);
+    const normalized = this.#norm(notebookPath);
     let key = this.#runKeys.get(normalized);
     if (key === undefined) {
       const session = this.#findSessionByNotebook(notebookPath);
@@ -386,18 +449,19 @@ export class KernelRegistry {
         session.executionCount = result.executionCount;
       }
       if (result.status === 'timeout') {
-        // Timeout kills the kernel (SPEC §4.7 rule 6). The session leaves the
-        // registry FIRST: the kernel it points at is already being torn down, so
-        // leaving it visible would let the next cell reuse a dead kernel — and
-        // since the sidecar only notices the death on its next request, the
-        // caller would wait out an iopub poll before failing. The timeout
-        // result stays the primary outcome: a failed cleanup is logged, not
-        // thrown (review A30).
-        this.#removeSession(session);
+        // SPEC §4.7 rule 6: a timed-out cell kills its kernel. Shut it down
+        // FIRST — #removeSession before this call made shutdown() find no
+        // session and return immediately, so the kernel process stayed alive
+        // while the registry forgot it, and the next run started a SECOND live
+        // kernel under the same reuse key (review v3 ROB-2 / SPEC §5.3, R19).
         try {
           await this.shutdown(notebookPath);
         } catch (shutdownCause) {
+          // The timeout result is the primary outcome (review A30), but a
+          // cleanup that cannot reach the sidecar still must not leave the
+          // session pointing at a dead kernel.
           this.#logger?.warn(`post-timeout shutdown failed for ${session.kernelId}: ${String(shutdownCause)}`);
+          this.#removeSession(session);
         }
       }
       return { result, session: this.#toInfo(session) };
@@ -567,7 +631,7 @@ export class KernelRegistry {
    * the next cell (SPEC §4.7 rules 5/6).
    */
   onRunAbort(notebookPath: string, callback: () => void): () => void {
-    const normalized = normalizeForCompare(notebookPath, this.#platform);
+    const normalized = this.#norm(notebookPath);
     const sinks = this.#runAborts.get(normalized) ?? new Set<() => void>();
     sinks.add(callback);
     this.#runAborts.set(normalized, sinks);
@@ -585,7 +649,7 @@ export class KernelRegistry {
 
   /** Tell every run waiting on this notebook that its kernel terminated. */
   #notifyRunAborted(notebookPath: string): void {
-    const sinks = this.#runAborts.get(normalizeForCompare(notebookPath, this.#platform));
+    const sinks = this.#runAborts.get(this.#norm(notebookPath));
     if (sinks === undefined) {
       return;
     }
@@ -599,9 +663,9 @@ export class KernelRegistry {
   }
 
   #findSessionByNotebook(notebookPath: string): Session | null {
-    const normalized = normalizeForCompare(notebookPath, this.#platform);
+    const normalized = this.#norm(notebookPath);
     for (const session of this.#sessions.values()) {
-      if (normalizeForCompare(session.notebookPath, this.#platform) === normalized) {
+      if (this.#norm(session.notebookPath) === normalized) {
         return session;
       }
     }

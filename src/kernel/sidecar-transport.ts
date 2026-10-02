@@ -11,6 +11,7 @@ import { IpynbError } from '../core/errors.js';
 import {
   NdjsonFramer,
   ProtocolFramingError,
+  isSidecarResponse,
   parseSidecarMessage,
   type SidecarRequest,
 } from './protocol.js';
@@ -26,6 +27,30 @@ import type {
 } from './transport.js';
 
 export type SpawnFn = typeof spawn;
+
+/**
+ * The sidecar's own worst-case budget for a cell that never becomes idle
+ * (python/ipynb_sidecar.py): interrupt, wait for the interrupt to land, then
+ * wait for the shell reply. A transport margin SMALLER than this makes the
+ * transport give up first and rewrite the documented `exec_timeout` into
+ * `kernel_died` (review v3 ROB-11).
+ */
+const SIDECAR_INTERRUPT_GRACE_MS = 5_000;
+const SIDECAR_SHELL_REPLY_MS = 30_000;
+const SIDECAR_WORST_CASE_MS = SIDECAR_INTERRUPT_GRACE_MS + SIDECAR_SHELL_REPLY_MS;
+
+/** How many trailing stderr lines travel with a kernel_died error. */
+const STDERR_TAIL_LINES = 20;
+
+/**
+ * What to do with the sidecar process when a request never answers.
+ * `wait` — the sidecar is merely busy on another op or is composing a large
+ * reply; killing it would take down every kernel on this interpreter (which is
+ * exactly what a timeout of `kernel_status`/`analyze` must not do).
+ * `reclaim` — the sidecar owns the deadline for this op and still missed it, so
+ * the process tree is wedged and gets reclaimed.
+ */
+type TimeoutAction = 'wait' | 'reclaim';
 
 export interface SidecarTransportOptions {
   readonly interpreterPath: string;
@@ -60,6 +85,8 @@ export class SidecarTransport implements KernelTransport {
   readonly #platform: NodeJS.Platform;
   readonly #onExit: ((reason: string) => void) | undefined;
   readonly #killGraceMs: number;
+  /** Ring buffer of the sidecar's most recent stderr lines (review v3 ROB-10). */
+  readonly #stderrTail: string[] = [];
   #kernelDiedCallback: ((kernelId: string) => void) | null = null;
   #exited = false;
   #exitReason: string | null = null;
@@ -97,12 +124,20 @@ export class SidecarTransport implements KernelTransport {
       for (const line of chunk.toString('utf8').split('\n')) {
         const trimmed = line.replace(/\r$/, '');
         if (trimmed !== '') {
-          this.#log?.('debug', `sidecar: ${trimmed}`);
+          this.#stderrTail.push(trimmed);
+          if (this.#stderrTail.length > STDERR_TAIL_LINES) {
+            this.#stderrTail.shift();
+          }
+          // `warn`, not `debug`: an interpreter that cannot boot a kernel
+          // (broken pyzmq, missing shared library) reports it HERE and nowhere
+          // else, and the model's error carries only the exit code
+          // (review v3 ROB-10).
+          this.#log?.('warn', `sidecar: ${trimmed}`);
         }
       }
     });
     this.#child.on('exit', (code, signal) => {
-      this.#failTransport(`sidecar exited (code=${String(code)}, signal=${String(signal)})`);
+      this.#failTransport(`sidecar exited (${describeExit(code, signal)})`);
     });
     this.#child.on('error', (cause) => {
       this.#failTransport(`sidecar spawn error: ${String(cause)}`);
@@ -130,10 +165,15 @@ export class SidecarTransport implements KernelTransport {
   }
 
   async execCell(params: ExecCellParams): Promise<ExecCellResult> {
-    // Sidecar handles timeoutMs internally (interrupt + 5s grace); give it
-    // headroom before the transport-level deadline fires.
-    const transportTimeout = Math.max(params.timeoutMs + 30_000, 60_000);
-    return this.#request('exec_cell', { ...params }, transportTimeout) as unknown as Promise<ExecCellResult>;
+    // The sidecar's worst case for a cell that times out is
+    // `timeoutMs + INTERRUPT_GRACE + SHELL_REPLY_BUDGET` (it interrupts, waits
+    // for the interrupt to land, then waits for the shell reply). A margin
+    // SMALLER than that makes the transport give up first, which turns the
+    // documented `exec_timeout` into `kernel_died` at the default 300 s and
+    // tears down every kernel on this sidecar (review v3 ROB-11).
+    // INVARIANT: transportTimeout > sidecarWorstCaseMs + slack.
+    const transportTimeout = Math.max(params.timeoutMs + SIDECAR_WORST_CASE_MS + 10_000, 60_000);
+    return this.#request('exec_cell', { ...params }, transportTimeout, 'reclaim') as unknown as Promise<ExecCellResult>;
   }
 
   async interrupt(kernelId: string): Promise<void> {
@@ -241,7 +281,7 @@ export class SidecarTransport implements KernelTransport {
         this.#log?.('warn', `sidecar sent an unparseable line (${line.length} chars)`);
         continue;
       }
-      if ('id' in message && typeof message.id === 'string') {
+      if (isSidecarResponse(message)) {
         this.#dispatchResponse(message.id, message);
       } else if ('event' in message) {
         this.#dispatchEvent(message);
@@ -283,20 +323,36 @@ export class SidecarTransport implements KernelTransport {
     }
   }
 
-  #request(op: string, params: Record<string, unknown>, timeoutMs: number): Promise<Record<string, unknown>> {
+  #request(
+    op: string,
+    params: Record<string, unknown>,
+    timeoutMs: number,
+    onTimeout: TimeoutAction = 'wait',
+  ): Promise<Record<string, unknown>> {
     if (this.#exited) {
-      return Promise.reject(new IpynbError('kernel_died', this.#exitReason ?? 'sidecar is not running'));
+      return Promise.reject(new IpynbError('kernel_died', this.#exitReason ?? 'sidecar is not running', this.#failureDetail()));
     }
     const request: SidecarRequest = { id: randomUUID(), op, params };
     return new Promise<Record<string, unknown>>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.#pending.delete(request.id);
-        reject(new IpynbError('kernel_died', `sidecar request timed out after ${timeoutMs}ms (op=${op})`));
-        // A request that never answered means the sidecar is wedged (it holds
-        // no per-request cancellation). Reclaim the process tree so the next
-        // call can spawn a healthy one instead of queueing behind a corpse
-        // (review V2 — the timeout used to leave the process running).
-        this.#reclaimAfterTimeout();
+        reject(
+          new IpynbError(
+            'kernel_died',
+            `sidecar request timed out after ${timeoutMs}ms (op=${op})`,
+            this.#failureDetail(),
+          ),
+        );
+        if (onTimeout === 'reclaim') {
+          // The sidecar owns this op's deadline and missed it, so it is wedged
+          // (it holds no per-request cancellation). Reclaim the process tree so
+          // the next call spawns a healthy one (review V2). Ops whose deadline
+          // is OURS (`kernel_status`, `ping`, `analyze`) deliberately do NOT
+          // reclaim: for those a timeout can simply mean "the sidecar is busy
+          // elsewhere", and killing it would take down every kernel on this
+          // interpreter (review v3 ROB-11).
+          this.#reclaimAfterTimeout();
+        }
       }, timeoutMs);
       this.#pending.set(request.id, { resolve, reject, timer });
       try {
@@ -311,9 +367,25 @@ export class SidecarTransport implements KernelTransport {
       } catch (cause) {
         this.#pending.delete(request.id);
         clearTimeout(timer);
-        reject(new IpynbError('kernel_died', `cannot write to sidecar stdin: ${String(cause)}`));
+        reject(new IpynbError('kernel_died', `cannot write to sidecar stdin: ${String(cause)}`, this.#failureDetail()));
       }
     });
+  }
+
+  /**
+   * Diagnostics for the model when the sidecar dies or goes silent: the exit
+   * status plus the tail of its stderr is the only clue about WHY (review v3
+   * ROB-10 — the interpreter can pass `import ipykernel` and still be unable to
+   * start a kernel, and the model used to get a bare exit code).
+   */
+  #failureDetail(): { sidecar_stderr: string } | { sidecar_exit: string } | Record<string, never> {
+    if (this.#stderrTail.length > 0) {
+      return { sidecar_stderr: this.#stderrTail.join('\n') };
+    }
+    if (this.#exitReason !== null) {
+      return { sidecar_exit: this.#exitReason };
+    }
+    return {};
   }
 
   /** One-shot teardown shared by exit/error/stdio failures; fires onExit once. */
@@ -347,10 +419,11 @@ export class SidecarTransport implements KernelTransport {
   }
 
   #failAllPending(code: 'kernel_died', reason: string): void {
+    const detail = this.#failureDetail();
     for (const [id, pending] of this.#pending) {
       clearTimeout(pending.timer);
       this.#pending.delete(id);
-      pending.reject(new IpynbError(code, reason));
+      pending.reject(new IpynbError(code, reason, detail));
     }
   }
 
@@ -361,3 +434,34 @@ export class SidecarTransport implements KernelTransport {
     return 'internal';
   }
 }
+
+/**
+ * Windows reports a crash as a huge unsigned NTSTATUS (e.g. 1073741845 for
+ * 0xC0000409, the stack-buffer-overrun that a broken pyzmq produces). A raw
+ * number is unactionable for the model reading the error, which is exactly the
+ * scenario review v3 ROB-10 documents (review §0 promises self-diagnosable
+ * failures).
+ */
+function describeExit(code: number | null, signal: NodeJS.Signals | null): string {
+  const signalPart = `signal=${signal === null ? 'null' : signal}`;
+  if (code === null) {
+    return `code=null, ${signalPart}`;
+  }
+  const status = WINDOWS_STATUS_NAMES[code];
+  const hex = code < 0 || code > 0xffff ? `0x${(code >>> 0).toString(16).toUpperCase()}` : null;
+  const codePart = hex === null ? `code=${code}` : `code=${code} (${hex})`;
+  return status === undefined ? `${codePart}, ${signalPart}` : `${codePart} = ${status}, ${signalPart}`;
+}
+
+const WINDOWS_STATUS_NAMES: Readonly<Record<number, string>> = {
+  0xc0000005: 'STATUS_ACCESS_VIOLATION',
+  0xc000001d: 'STATUS_ILLEGAL_INSTRUCTION',
+  0xc0000094: 'STATUS_INTEGER_DIVIDE_BY_ZERO',
+  0xc00000fd: 'STATUS_STACK_OVERFLOW',
+  0xc0000374: 'STATUS_HEAP_CORRUPTION',
+  0xc0000409: 'STATUS_STACK_BUFFER_OVERRUN',
+  0xc0000602: 'STATUS_FAIL_FAST_EXCEPTION',
+  0xc000013a: 'STATUS_CONTROL_C_EXIT',
+  0xc0000135: 'STATUS_DLL_NOT_FOUND',
+  0xc0000142: 'STATUS_DLL_INIT_FAILED',
+};

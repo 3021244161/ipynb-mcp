@@ -6,6 +6,10 @@
 // Steps 2-4 degrade: a failed candidate is recorded and the chain continues;
 // only when ALL fail do we raise. kernelspec_mismatch warnings per §5.2.
 
+import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import path from 'node:path';
 
 import { normalizeForCompare } from '../config.js';
@@ -28,6 +32,9 @@ export interface InterpreterCache {
   get(candidatePath: string): boolean | undefined;
   set(candidatePath: string, ok: boolean): void;
 }
+
+/** Kernelspec name reported when the notebook declares none (D23 default). */
+const DEFAULT_SPEC_NAME = 'python3';
 
 export interface InterpreterDeps {
   readonly platform: NodeJS.Platform;
@@ -113,7 +120,7 @@ export async function resolveInterpreter(
     }
     return {
       interpreterPath: explicit,
-      kernelSpecName: specName ?? defaultSpecName(deps),
+      kernelSpecName: specName ?? DEFAULT_SPEC_NAME,
       language: kernelLanguage,
       warnings,
     };
@@ -166,7 +173,7 @@ export async function resolveInterpreter(
       maybeVenvMismatch(warnings, kernelJson, venvPython, deps);
       return {
         interpreterPath: venvPython,
-        kernelSpecName: specName ?? defaultSpecName(deps),
+        kernelSpecName: specName ?? DEFAULT_SPEC_NAME,
         language: 'python',
         warnings,
       };
@@ -184,7 +191,7 @@ export async function resolveInterpreter(
     if (status === 'ok') {
       return {
         interpreterPath: candidate,
-        kernelSpecName: specName ?? defaultSpecName(deps),
+        kernelSpecName: specName ?? DEFAULT_SPEC_NAME,
         language: 'python',
         warnings,
       };
@@ -242,9 +249,7 @@ function maybeVenvMismatch(
   }
 }
 
-function defaultSpecName(_deps: InterpreterDeps): string {
-  return 'python3';
-}
+
 
 /** Prefix of an interpreter: venvs put python in Scripts/ or bin/, conda
  *  environments put it directly in the environment root (SPEC §5.2). */
@@ -367,10 +372,6 @@ function resolveArgv0(argv0: string, kernelDir: string): string {
 // orchestration must not assemble interpreter deps themselves.
 // ---------------------------------------------------------------------------
 
-import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
 
 /** Node adapter for InterpreterDeps (kept in the kernel layer, which owns process spawning). */
 export function createNodeInterpreterDeps(platform: NodeJS.Platform): InterpreterDeps {
@@ -404,8 +405,36 @@ export function createNodeInterpreterDeps(platform: NodeJS.Platform): Interprete
   };
 }
 
-/** Process-wide ipykernel probe cache shared by ALL entry points (B1). */
-const sharedProbeCache = new Map<string, boolean>();
+/**
+ * Process-wide ipykernel probe cache shared by ALL entry points (B1).
+ *
+ * Entries EXPIRE (failures fast) because this cache feeds an error message that
+ * tells the user to run `pip install ipykernel`: with a permanent cache,
+ * following that advice still reported `ipykernel_missing` for the same
+ * interpreter path until the MCP server was restarted (review v3 ARCH-2).
+ */
+const PROBE_TTL_OK_MS = 30_000;
+const PROBE_TTL_FAILED_MS = 1_000;
+const sharedProbeCache = new Map<string, { ok: boolean; at: number }>();
+
+/** TTL-aware cache adapter; belongs to the kernel layer (it owns process probes). */
+const probeCache: InterpreterCache = {
+  get(candidatePath) {
+    const entry = sharedProbeCache.get(candidatePath);
+    if (entry === undefined) {
+      return undefined;
+    }
+    const ttl = entry.ok ? PROBE_TTL_OK_MS : PROBE_TTL_FAILED_MS;
+    if (Date.now() - entry.at > ttl) {
+      sharedProbeCache.delete(candidatePath);
+      return undefined;
+    }
+    return entry.ok;
+  },
+  set(candidatePath, ok) {
+    sharedProbeCache.set(candidatePath, { ok, at: Date.now() });
+  },
+};
 
 export interface ResolveForNotebookOptions {
   readonly notebookPath: string;
@@ -433,7 +462,7 @@ export async function resolveForNotebook(
       notebookPath: options.notebookPath,
       kernelSpecName: resolveInput.kernelSpecName,
       languageInfoName: resolveInput.languageInfoName,
-      cache: sharedProbeCache,
+      cache: probeCache,
     },
     createNodeInterpreterDeps(platform),
   );
