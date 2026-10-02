@@ -3,7 +3,7 @@
 // the guarded write-back. This module composes core/fs/kernel pieces; it is
 // exposed to MCP tools in step 9.
 
-import { IpynbError, createWarning, type Warning } from './core/errors.js';
+import { IpynbError, createWarning, type JsonValue, type Warning } from './core/errors.js';
 import { mapRawOutputs, type OutputItem } from './core/outputs.js';
 import { cellSource, readNotebookMetadata, type Hasher, type NotebookFile } from './core/parse.js';
 import { analyzeStale, downgradeConfidence, regexDefs, regexUses, type StaleCell } from './core/stale.js';
@@ -429,6 +429,9 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
       throw new IpynbError('exec_timeout', `cell execution timed out after ${req.timeoutSeconds}s (interrupt did not land)`, {
         cell_index: timeoutCell?.cell_index ?? null,
         completed_cells: executed.length - 1,
+        // ExecutedCell is structurally JSON-safe; the cast bridges it to the
+        // JsonValue union so failed-run status can report what actually ran.
+        executed: executed as unknown as JsonValue,
         write_back: timeoutWriteBack,
       });
     }
@@ -439,6 +442,7 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
       const code = req.abort!.reason === 'kernel_died' ? 'kernel_died' : 'cancelled';
       throw new IpynbError(code, `run aborted (${code})`, {
         executed_cells: executed.length,
+        executed: executed as unknown as JsonValue,
         write_back: abortWriteBack,
       });
     }

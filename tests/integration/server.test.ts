@@ -154,23 +154,44 @@ describe('[I13] client abort of an in-flight synchronous run', () => {
 });
 
 describe('[I14] client abort of an in-flight edit', () => {
-  it('a pre-aborted edit leaves the file untouched with no tmp leftovers', async () => {
-    const nb = await writeNb('i14.ipynb', [codeCell('c0', 'x = 1')]);
+  it('a genuinely in-flight abort leaves the file untouched with no tmp leftovers', async () => {
+    // Review D4: the old case aborted BEFORE the request started (pre-aborted),
+    // which is not "in-flight". Here the handler is entered first, then the
+    // abort lands while the write path is running. The notebook is large
+    // enough that the atomic write cannot finish within the same tick, so the
+    // abort is deterministically observed mid-flight.
+    const bigSource = `x = "${'y'.repeat(6_000_000)}"`;
+    const nb = await writeNb('i14.ipynb', [codeCell('c0', bigSource)]);
     const before = await readFile(nb);
 
-    // Cancel BEFORE the request reaches the writer: the abort signal is
-    // already set, so the atomic write bails before creating a temp file.
     const controller = new AbortController();
-    controller.abort();
-    const outcome = await handleEditThroughAbort(nb, controller.signal);
+    const pending = handleEditThroughAbort(nb, controller.signal);
+    // Abort on the next macrotask: after the handler's entry check, before or
+    // during the atomic write.
+    setTimeout(() => controller.abort(), 0);
+    const outcome = await pending;
+
     expect(outcome).toMatchObject({ isError: true });
     const firstBlock = (outcome?.content ?? [])[0];
-    expect(firstBlock && 'text' in firstBlock ? firstBlock.text : '{}').toBeTruthy();
-    expect(JSON.parse(firstBlock && 'text' in firstBlock ? firstBlock.text : '{}')['code']).toBe('cancelled');
+    const body = JSON.parse(firstBlock && 'text' in firstBlock ? firstBlock.text : '{}') as Record<string, unknown>;
+    expect(body['code']).toBe('cancelled');
 
+    // Nothing written, and no temp-file litter.
     expect(await readFile(nb)).toEqual(before);
     const leftovers = readdirSync(workspace).filter((name) => name.includes('.tmp-'));
     expect(leftovers).toEqual([]);
+  }, 120_000);
+
+  it('a pre-aborted edit is also rejected without touching the file (fast path)', async () => {
+    const nb = await writeNb('i14b.ipynb', [codeCell('c0', 'x = 1')]);
+    const before = await readFile(nb);
+    const controller = new AbortController();
+    controller.abort();
+    const outcome = await handleEditThroughAbort(nb, controller.signal);
+    const firstBlock = (outcome?.content ?? [])[0];
+    const body = JSON.parse(firstBlock && 'text' in firstBlock ? firstBlock.text : '{}') as Record<string, unknown>;
+    expect(body['code']).toBe('cancelled');
+    expect(await readFile(nb)).toEqual(before);
   }, 60_000);
 });
 
@@ -181,7 +202,15 @@ async function handleEditThroughAbort(nb: string, signal: AbortSignal) {
   const { toCallToolResult } = await import('../../src/mcp/tools/result.js');
   const { readNotebookFile } = await import('../../src/fs/notebook-file.js');
   const notebook = await readNotebookFile(nb, hasher);
-  const sourceHash = `sha256:${hasher.sha256Hex('x = 1')}`;
+  // Anchor against the notebook's ACTUAL first-cell source so the request
+  // proceeds to the write path (the abort must land there, not at the CAS).
+  const firstCell = notebook.cells[0];
+  const currentSource = firstCell === undefined
+    ? ''
+    : Array.isArray(firstCell.source)
+      ? (firstCell.source as string[]).join('')
+      : String(firstCell.source);
+  const sourceHash = `sha256:${hasher.sha256Hex(currentSource)}`;
   void notebook;
   const outcome = await handleNotebookEdit(
     {
@@ -259,12 +288,28 @@ describe('[I16] background run vs kernel restart', () => {
     const writeBack = finalBody['write_back'] as Record<string, unknown>;
     expect(writeBack['performed']).toBe(true);
 
-    // The file contains the completed cells; cells that were in flight or
-    // never started are untouched (null execution_count, empty outputs).
+    // The file contains exactly the cells that COMPLETED before the restart:
+    // a contiguous prefix 0..k-1, and every cell after them is untouched
+    // (null execution_count, no outputs). Exact set, not a range count (D4).
     const written = JSON.parse(await readFile(nb, 'utf8')) as { cells: Array<Record<string, unknown>> };
-    const completed = written.cells.filter((cell) => cell['execution_count'] !== null);
-    expect(completed.length).toBeGreaterThanOrEqual(1);
-    expect(completed.length).toBeLessThan(5);
+    const completedIndexes = written.cells
+      .map((cell, index) => ({ index, count: cell['execution_count'] }))
+      .filter((entry) => entry.count !== null)
+      .map((entry) => entry.index);
+    expect(completedIndexes.length).toBeGreaterThanOrEqual(1);
+    expect(completedIndexes.length).toBeLessThan(5);
+    // Contiguity from 0 — cells execute sequentially, so the completed set is
+    // exactly {0, 1, …, k-1}.
+    expect(completedIndexes).toEqual(
+      Array.from({ length: completedIndexes.length }, (_, i) => i),
+    );
+    const untouched = written.cells.slice(completedIndexes.length);
+    for (const cell of untouched) {
+      expect(cell['execution_count']).toBeNull();
+      expect(cell['outputs']).toEqual([]);
+    }
+    // The failed run's status carries the same executed set (review D4).
+    expect((finalBody['executed'] as unknown[]).length).toBe(completedIndexes.length);
     // Restart did not auto-run anything on the fresh kernel.
     expect(newKernelId).not.toBe('');
     const kernelStatus = await callTool('notebook_kernel', { action: 'status' });
@@ -334,6 +379,17 @@ describe('[I12] stdout purity of the real stdio server', () => {
     expect(stdoutLines.length).toBeGreaterThanOrEqual(3);
     for (const line of stdoutLines) {
       expect(() => JSON.parse(line)).not.toThrow();
+    }
+    // stderr must carry the diagnostics (review D4): the server logs its
+    // startup line there, and NO log text may leak into stdout.
+    expect(stderrText).toContain('[ipynb-mcp]');
+    for (const line of stdoutLines) {
+      expect(line).not.toContain('[ipynb-mcp]');
+    }
+    // Every stdout line is a well-formed JSON-RPC message.
+    for (const line of stdoutLines) {
+      const message = JSON.parse(line) as Record<string, unknown>;
+      expect(message['jsonrpc']).toBe('2.0');
     }
     await rm(serverWorkspace, { recursive: true, force: true });
   }, 180_000);

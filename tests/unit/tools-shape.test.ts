@@ -110,11 +110,13 @@ describe('[step9][U24] response shape across all six tools', () => {
     const editText = assertSingleTextBlock(edit);
     expect(JSON.parse(editText)['applied']).toBe(1);
 
-    // 3. notebook_run: background handle or interpreter failure — one block either way.
+    // 3. notebook_run: the config points --python at a nonexistent path, and an
+    // explicit interpreter failure is terminal (D23), so this is a
+    // deterministic tool error — not a tautological either/or (review D5).
     const run = await callTool('notebook_run', { path: nb, cell_selector: 'all', timeout_seconds: 5 });
     const runText = assertSingleTextBlock(run);
     const runBody = JSON.parse(runText) as Record<string, unknown>;
-    expect(runBody['kind'] === 'background' || runBody['code'] !== undefined).toBe(true);
+    expect(runBody['code']).toBe('interpreter_not_found');
 
     // 4. notebook_run_status: unknown run — one block.
     const status = await callTool('notebook_run_status', { run_id: 'run-999' });

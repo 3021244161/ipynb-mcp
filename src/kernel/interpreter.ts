@@ -159,6 +159,11 @@ export async function resolveInterpreter(
   if (venvPython !== null) {
     const ok = await checkIpykernel(venvPython);
     if (ok) {
+      // SPEC §5.2 trigger 3 is independent of whether the kernelspec
+      // interpreter WORKED: a resolved kernelspec whose argv[0] differs from
+      // the adjacent .venv must warn here too — this fallback path was the
+      // only place it was missing (review D4 / I17).
+      maybeVenvMismatch(warnings, kernelJson, venvPython, deps);
       return {
         interpreterPath: venvPython,
         kernelSpecName: specName ?? defaultSpecName(deps),
@@ -214,11 +219,13 @@ function pushMismatch(warnings: Warning[], message: string): void {
 
 function maybeVenvMismatch(
   warnings: Warning[],
-  kernelJson: KernelJsonInfo,
+  kernelJson: KernelJsonInfo | null,
   venvPython: string | null,
   deps: InterpreterDeps,
 ): void {
-  if (venvPython === null) {
+  // Trigger 3 requires a RESOLVED kernelspec: when it did not resolve, the
+  // missing-kernelspec trigger already covers the warning.
+  if (venvPython === null || kernelJson === null) {
     return;
   }
   const argv0 = resolveArgv0(kernelJson.argv[0] ?? '', kernelJson.dir);

@@ -16,7 +16,7 @@ import { IpynbError } from '../../src/core/errors.js';
 import { parseNotebook } from '../../src/core/parse.js';
 import { hasher } from '../../src/hash.js';
 import { KernelRegistry } from '../../src/kernel/registry.js';
-import { pythonPrefix, resolveInterpreter } from '../../src/kernel/interpreter.js';
+import { createNodeInterpreterDeps, pythonPrefix, resolveInterpreter } from '../../src/kernel/interpreter.js';
 import { SidecarTransport } from '../../src/kernel/sidecar-transport.js';
 import { runNotebook, type RunDeps, type RunRequest } from '../../src/run.js';
 import { createLogger } from '../../src/log.js';
@@ -28,7 +28,6 @@ const VENV_PY = WINDOWS ? path.join(VENV_DIR, 'Scripts', 'python.exe') : path.jo
 const BASE_PYTHON = process.env['IPYNB_TEST_PYTHON'] ?? (WINDOWS ? 'python' : 'python3');
 // An interpreter that exists but CANNOT import ipykernel (I17). If absent on
 // this machine we synthesize a stub executable instead.
-const NO_IPYKERNEL_PY = process.env['IPYNB_TEST_NO_IPYKERNEL_PYTHON'] ?? null;
 
 let workspace: string;
 let artifactRoot: string;
@@ -186,15 +185,25 @@ describe('[I2] resume does not re-run earlier cells', () => {
 
 describe('[I3] cold-start auto silently replays the prefix', () => {
   it('replays 0..4, executes only cell 5, prefix stays byte-identical', async () => {
+    // Seeded outputs make "preserved" distinguishable from "wiped" (D1), and
+    // the doc-level diff below replaces the old `void before;` no-op (D4).
+    const seeded = [
+      { outputs: [{ output_type: 'stream', name: 'stdout', text: ['KEEP-0\n'] }], execution_count: 41 },
+      { outputs: [{ output_type: 'stream', name: 'stdout', text: ['KEEP-1\n'] }], execution_count: 42 },
+      { outputs: [{ output_type: 'stream', name: 'stdout', text: ['KEEP-2\n'] }], execution_count: 43 },
+      { outputs: [{ output_type: 'stream', name: 'stdout', text: ['KEEP-3\n'] }], execution_count: 44 },
+      { outputs: [{ output_type: 'stream', name: 'stdout', text: ['KEEP-4\n'] }], execution_count: 45 },
+    ];
     const nb = await writeNb('i3.ipynb', [
-      codeCell('a = 1', 'c0'),
-      codeCell('b = 2', 'c1'),
-      codeCell('import time\ntime.sleep(3)', 'c2'),
-      codeCell('c = 4', 'c3'),
-      codeCell('d = 5', 'c4'),
+      codeCell('a = 1', 'c0', seeded[0]),
+      codeCell('b = 2', 'c1', seeded[1]),
+      codeCell('import time\ntime.sleep(3)', 'c2', seeded[2]),
+      codeCell('c = 4', 'c3', seeded[3]),
+      codeCell('d = 5', 'c4', seeded[4]),
       codeCell('print(a + b + c + d)', 'c5'),
     ]);
-    const before = await readFile(nb, 'utf8');
+    const beforeDoc = JSON.parse(await readFile(nb, 'utf8')) as Record<string, unknown>;
+    const beforeCells = beforeDoc['cells'] as Array<Record<string, unknown>>;
 
     const outcome = await runNotebook(request(nb, { cellSelector: '5', timeoutSeconds: 60 }), deps());
     expect(outcome.mode_used).toBe('replay');
@@ -202,15 +211,37 @@ describe('[I3] cold-start auto silently replays the prefix', () => {
     expect(outcome.executed.map((entry) => entry.cell_index)).toEqual([5]);
     expect(outcome.executed[0]!.status).toBe('ok');
 
-    const cells = await readCells(nb);
-    // Prefix cells: outputs and execution_count unchanged from the original.
-    for (const index of [0, 1, 2, 3, 4]) {
-      expect(cells[index]!['outputs']).toEqual([]);
-      expect(cells[index]!['execution_count']).toBeNull();
+    const afterDoc = JSON.parse(await readFile(nb, 'utf8')) as Record<string, unknown>;
+    const afterCells = afterDoc['cells'] as Array<Record<string, unknown>>;
+    // Normalise source form (writing may canonicalise string -> lines array),
+    // then require that ONLY cell 5 differs anywhere in the notebook.
+    const norm = (cell: Record<string, unknown>): string =>
+      JSON.stringify({
+        cell_type: cell['cell_type'],
+        source: Array.isArray(cell['source']) ? (cell['source'] as string[]).join('') : cell['source'],
+        outputs: cell['outputs'],
+        execution_count: cell['execution_count'],
+      });
+    const changed: number[] = [];
+    for (let i = 0; i < beforeCells.length; i += 1) {
+      if (norm(beforeCells[i]!) !== norm(afterCells[i]!)) {
+        changed.push(i);
+      }
     }
-    // Only cell 5 has fresh results.
+    expect(changed).toEqual([5]);
+
+    // Prefix cells kept their seeded outputs and execution counts intact.
+    const cells = await readCells(nb);
+    for (const index of [0, 1, 2, 3, 4]) {
+      expect(cells[index]!['outputs']).toEqual(seeded[index]!.outputs);
+      expect(cells[index]!['execution_count']).toBe(41 + index);
+    }
     expect(cells[5]!['execution_count']).toBe(1);
-    void before;
+
+    // Document-level keys are untouched.
+    expect(afterDoc['metadata']).toEqual(beforeDoc['metadata']);
+    expect(afterDoc['nbformat']).toBe(beforeDoc['nbformat']);
+    expect(afterDoc['nbformat_minor']).toBe(beforeDoc['nbformat_minor']);
   }, 180_000);
 });
 
@@ -375,70 +406,64 @@ describe('[I8] idle kernels are reclaimed', () => {
 });
 
 describe('[I17] candidate chain degradation (D23)', () => {
-  it('falls back from a broken kernelspec to .venv and warns', async () => {
+  it('falls back from a broken kernelspec to .venv and warns (real probes)', async () => {
+    // Review D4: the old version mocked the ipykernel probe away (a string
+    // comparison) and used an EMPTY FILE as the .venv interpreter — the logic
+    // under test was mocked. Here both candidates are REAL venvs:
+    //   broken  = venv WITHOUT system-site-packages -> `import ipykernel` fails
+    //   working = venv WITH    system-site-packages -> `import ipykernel` works
     const nbDir = path.join(workspace, 'i17');
     mkdirSync(nbDir, { recursive: true });
-    // kernelspec whose argv[0] exists but cannot import ipykernel.
-    const kernelsDir = path.join(nbDir, 'kernels');
-    const specDir = path.join(kernelsDir, 'brokenkernel');
+
+    const brokenDir = path.join(nbDir, 'broken-env');
+    execFileSync(BASE_PYTHON, ['-m', 'venv', brokenDir], { stdio: 'ignore', timeout: 180_000 });
+    const brokenPython = path.join(brokenDir, WINDOWS ? 'Scripts' : 'bin', WINDOWS ? 'python.exe' : 'python');
+    expect(existsSync(brokenPython)).toBe(true);
+
+    // The notebook's own .venv is a real environment that CAN import ipykernel.
+    const venvDir = path.join(nbDir, '.venv');
+    execFileSync(BASE_PYTHON, ['-m', 'venv', '--system-site-packages', venvDir], {
+      stdio: 'ignore',
+      timeout: 180_000,
+    });
+    const venvPython = path.join(venvDir, WINDOWS ? 'Scripts' : 'bin', WINDOWS ? 'python.exe' : 'python');
+    expect(existsSync(venvPython)).toBe(true);
+
+    // Jupyter root layout: <root>/kernels/<name>/kernel.json
+    const specDir = path.join(nbDir, 'kernels', 'brokenkernel');
     mkdirSync(specDir, { recursive: true });
-    const brokenPython =
-      NO_IPYKERNEL_PY !== null && existsSync(NO_IPYKERNEL_PY)
-        ? NO_IPYKERNEL_PY
-        : makeStubPython(path.join(nbDir, 'broken-python.py'));
     writeFileSync(path.join(specDir, 'kernel.json'), JSON.stringify({
       argv: [brokenPython, '-m', 'ipykernel_launcher', '-f', '{connection_file}'],
       display_name: 'Broken Kernel',
       language: 'python',
     }));
-    // .venv next to the notebook with a working interpreter.
-    const venvDir = path.join(nbDir, '.venv');
-    const venvBin = path.join(venvDir, WINDOWS ? 'Scripts' : 'bin');
-    mkdirSync(venvBin, { recursive: true });
-    writeFileSync(path.join(venvBin, WINDOWS ? 'python.exe' : 'python'), '');
-    const venvPython = path.join(venvBin, WINDOWS ? 'python.exe' : 'python');
 
-    const resolution = await resolveInterpreter(
-      {
-        explicitPython: null,
-        notebookPath: path.join(nbDir, 'nb.ipynb'),
-        kernelSpecName: 'brokenkernel',
-        languageInfoName: 'python',
-      },
-      {
-        platform: process.platform,
-        env: { ...process.env, JUPYTER_PATH: kernelsDir },
-        existsSync: (target) => existsSync(target),
-        readFile: async (target) => readFile(target, 'utf8'),
-        execFile: (command, args) =>
-          new Promise<'ok' | 'failed' | 'not-found'>((resolve) => {
-            void args;
-            // Treat the venv python as the working interpreter, everything
-            // else as failing the import check.
-            resolve(command === venvPython ? 'ok' : 'failed');
-          }),
-        resolveExecutable: async () => null,
-        homedir: () => path.join(workspace, 'home'),
-      },
-    );
+    const previousJupyterPath = process.env['JUPYTER_PATH'];
+    process.env['JUPYTER_PATH'] = nbDir;
+    let resolution;
+    try {
+      resolution = await resolveInterpreter(
+        {
+          explicitPython: null,
+          notebookPath: path.join(nbDir, 'nb.ipynb'),
+          kernelSpecName: 'brokenkernel',
+          languageInfoName: 'python',
+        },
+        createNodeInterpreterDeps(process.platform),
+      );
+    } finally {
+      if (previousJupyterPath === undefined) {
+        delete process.env['JUPYTER_PATH'];
+      } else {
+        process.env['JUPYTER_PATH'] = previousJupyterPath;
+      }
+    }
+
     expect(resolution.interpreterPath).toBe(venvPython);
     expect(resolution.warnings.map((warning) => warning.code)).toContain('kernelspec_mismatch');
-  });
+  }, 300_000);
 });
 
-/** A real executable that exists but cannot import ipykernel (a plain shell loop). */
-function makeStubPython(target: string): string {
-  const script = `import sys\nsys.exit(1)\n`;
-  writeFileSync(target, script);
-  if (WINDOWS) {
-    // A .py is not directly executable by existsSync-based candidates, but the
-    // interpreter resolver only checks existence + import success, so a .py
-    // with a failing execFile mock stands in fine for the real thing.
-    return target;
-  }
-  execFileSync('chmod', ['+x', target]);
-  return target;
-}
 
 describe('[I-replay-fresh] mode=replay rebuilds state on a NEW kernel (review A4)', () => {
   it('variables from a previous run are gone after replay', async () => {

@@ -157,13 +157,18 @@ describe('[I-smoke] sidecar transport with a real kernel', () => {
     const newSession = await registry.restart(notebookPath);
     expect(newSession).not.toBeNull();
     expect(newSession!.kernelId).not.toBe(oldSession.kernelId);
-    const after = await registry.execCell(notebookPath, {
-      code: '1+1',
-      silent: true,
-      storeOutputs: false,
-      timeoutMs: 60_000,
-    });
-    expect(after.result.status).toBe('ok');
+    // The name is the assertion (review D4): restart must NOT execute anything.
+    // A fresh kernel reports no execution count and holds none of the old
+    // state, and the session's own counter starts empty.
+    expect(newSession!.executionCount).toBeNull();
+    expect(newSession!.alive).toBe(true);
+    // Prove freshness without executing a cell: a variable from the previous
+    // kernel is gone (documented as not-runnable here because a real check
+    // would itself be an execution — the counter assertions above are the
+    // observable contract).
+    const current = (await registry.findByNotebook(notebookPath))!;
+    expect(current.kernelId).toBe(newSession!.kernelId);
+    expect(current.executionCount).toBeNull();
   });
 
   it('rejects concurrent executions on the same kernel with kernel_busy (I10)', async () => {
