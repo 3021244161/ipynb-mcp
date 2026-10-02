@@ -26,6 +26,16 @@ describe('[U13][A10] cell_selector grammar (SPEC §4.7)', () => {
     expect(String((err.detail as Record<string, unknown>)['cell_selector'])).toBe('1-2-3');
   });
 
+  it("[W10] rejects '-1' instead of reading it as the range 0-1", () => {
+    // Number('') === 0 made '-1' select cells 0 AND 1: running cells the
+    // caller never asked for is the same failure class as '1-2-3'.
+    const err = expectInvalid('-1');
+    expect(String((err.detail as Record<string, unknown>)['cell_selector'])).toBe('-1');
+    expectInvalid('0-');
+    expectInvalid('-');
+    expectInvalid('1--2');
+  });
+
   it('rejects garbage characters, empty pieces and non-integers', () => {
     expectInvalid('abc');
     expectInvalid('1,,2');

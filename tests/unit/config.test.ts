@@ -209,6 +209,34 @@ describe('[step1][A16] empty environment values mean "not set"', () => {
   });
 });
 
+describe('[step1][W6] empty CLI values mean "not set" too (A16 fixed only the env half)', () => {
+  it('--exec-timeout-seconds= keeps the default instead of becoming 0', () => {
+    const result = parseConfig(['--exec-timeout-seconds='], BASE_ENV, { fallbackRoot: 'C:/work' });
+    expect(result.errors).toEqual([]);
+    expect(result.config?.execTimeoutSeconds).toBe(300);
+  });
+
+  it('--kernel-idle-seconds= keeps the default instead of becoming 0', () => {
+    const result = parseConfig(['--kernel-idle-seconds='], BASE_ENV, { fallbackRoot: 'C:/work' });
+    expect(result.config?.kernelIdleSeconds).toBe(3600);
+  });
+
+  it('--python "" stays auto-resolution instead of an empty interpreter', () => {
+    const result = parseConfig(['--python', ''], BASE_ENV, { fallbackRoot: 'C:/work' });
+    expect(result.config?.python).toBeNull();
+  });
+
+  it('an empty CLI value does not shadow the environment variable', () => {
+    const result = parseConfig(['--backup-keep='], { ...BASE_ENV, IPYNB_BACKUP_KEEP: '3' }, { fallbackRoot: 'C:/work' });
+    expect(result.config?.backupKeep).toBe(3);
+  });
+
+  it('a whitespace-only value counts as empty as well', () => {
+    const result = parseConfig(['--inline-text-chars', '   '], BASE_ENV, { fallbackRoot: 'C:/work' });
+    expect(result.config?.inlineTextChars).toBe(20000);
+  });
+});
+
 describe('[step1][A14] a relative --artifact-dir resolves to an absolute path', () => {
   it('returns an absolute artifactDir for a relative CLI value', () => {
     const result = parseConfig(['--artifact-dir', './artifacts'], BASE_ENV, { fallbackRoot: 'C:/work' });

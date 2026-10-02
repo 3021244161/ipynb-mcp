@@ -32,6 +32,36 @@ function interpreter(): string {
   return BASE_PYTHON;
 }
 
+/**
+ * Can this machine actually run a kernel? Starts one on a throwaway transport
+ * and tears it down again. Cached: the probe costs a process spawn, and every
+ * case in this file that needs a kernel needs the same answer.
+ */
+let kernelProbe: Promise<{ ok: boolean; reason: string }> | null = null;
+
+function probeKernelStartup(): Promise<{ ok: boolean; reason: string }> {
+  kernelProbe ??= (async () => {
+    if (!PYTHON_AVAILABLE) {
+      return { ok: false, reason: 'no Python interpreter on this machine' };
+    }
+    const transport = new SidecarTransport({ interpreterPath: interpreter(), onLog: () => undefined });
+    try {
+      await transport.startKernel({
+        kernelId: 'probe-kernel',
+        interpreterPath: interpreter(),
+        kernelSpecName: 'python3',
+        language: 'python',
+      });
+      return { ok: true, reason: 'kernel started' };
+    } catch (cause) {
+      return { ok: false, reason: String(cause) };
+    } finally {
+      await transport.shutdownAll().catch(() => undefined);
+    }
+  })();
+  return kernelProbe;
+}
+
 describe('[U18][D2] the symtable analyzer maps real source to defs/uses', () => {
   it.skipIf(!PYTHON_AVAILABLE)('tuple unpacking lands in module-level defs (regex cannot)', async () => {
     const transport = new SidecarTransport({ interpreterPath: interpreter(), onLog: () => undefined });
@@ -75,11 +105,22 @@ describe('[U18][D2] the symtable analyzer maps real source to defs/uses', () => 
 });
 
 describe('[U20][D2] non-Python kernels report method skipped', () => {
-  it.skipIf(!PYTHON_AVAILABLE)('stale_analysis.method is "skipped" and stale_cells stays empty', async () => {
+  it('stale_analysis.method is "skipped" and stale_cells stays empty', async (context) => {
     const { execFileSync } = await import('node:child_process');
     if (!existsSync(VENV_PY)) {
       execFileSync(BASE_PYTHON, ['-m', 'venv', '--system-site-packages', VENV_DIR], { stdio: 'ignore', timeout: 120_000 });
     }
+    // This case needs a kernel that actually BOOTS: it drives runNotebook end
+    // to end. `PYTHON_AVAILABLE` only proves an interpreter exists — a Python
+    // without ipykernel (CI's unit job) would fail here instead of skipping,
+    // and a broken pyzmq/ipykernel pair would too. Probe the real capability
+    // once and record the reason instead of pretending the case ran.
+    const kernelReady = await probeKernelStartup();
+    if (!kernelReady.ok) {
+      context.skip(`no interpreter that can start a kernel here: ${kernelReady.reason}`);
+      return;
+    }
+
     const { KernelRegistry } = await import('../../src/kernel/registry.js');
     const { runNotebook } = await import('../../src/run.js');
     const { mkdtemp, mkdir, rm, writeFile } = await import('node:fs/promises');

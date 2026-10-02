@@ -33,6 +33,34 @@ let workspace: string;
 let artifactRoot: string;
 let registry: KernelRegistry;
 let previousJupyterPath: string | undefined;
+/**
+ * Interpreter the transport-level cases drive directly. Chosen by trying to
+ * start a kernel, because a test venv can be importable yet unusable (this
+ * machine's `.venv-test` inherits pyzmq 26.2.0 from its conda base and kills
+ * the sidecar on start). Cases that go through runNotebook resolve their own
+ * interpreter via the SPEC §5.2 candidate chain and are unaffected.
+ */
+let sidecarInterpreter = VENV_PY;
+
+async function canStartKernel(candidate: string): Promise<boolean> {
+  if (!existsSync(candidate)) {
+    return false;
+  }
+  const probe = new SidecarTransport({ interpreterPath: candidate, onLog: () => undefined });
+  try {
+    await probe.startKernel({
+      kernelId: 'probe-kernel',
+      interpreterPath: candidate,
+      kernelSpecName: 'python3',
+      language: 'python',
+    });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    await probe.shutdownAll().catch(() => undefined);
+  }
+}
 
 beforeAll(async () => {
   if (!existsSync(VENV_PY)) {
@@ -40,6 +68,9 @@ beforeAll(async () => {
       stdio: 'inherit',
       timeout: 120_000,
     });
+  }
+  if (!(await canStartKernel(VENV_PY)) && (await canStartKernel(BASE_PYTHON))) {
+    sidecarInterpreter = BASE_PYTHON;
   }
   workspace = await mkdtemp(path.join(tmpdir(), 'ipynb-mcp-run-'));
   artifactRoot = path.join(workspace, 'artifacts');
@@ -372,11 +403,11 @@ describe('[I6] write_outputs=false leaves the file untouched', () => {
 
 describe('[I7] sidecar death fails in-flight work; next run replays', () => {
   it('in-flight exec fails with kernel_died after a kill', async () => {
-    const transport = new SidecarTransport({ interpreterPath: VENV_PY, onLog: () => undefined });
+    const transport = new SidecarTransport({ interpreterPath: sidecarInterpreter, onLog: () => undefined });
     await transport.ping();
     const started = await transport.startKernel({
       kernelId: 'kernel-i7',
-      interpreterPath: VENV_PY,
+      interpreterPath: sidecarInterpreter,
       kernelSpecName: 'python3',
       language: 'python',
     });
@@ -393,6 +424,47 @@ describe('[I7] sidecar death fails in-flight work; next run replays', () => {
     await expect(inflight).rejects.toMatchObject({ code: 'kernel_died' });
     expect(transport.alive).toBe(false);
   }, 120_000);
+
+  it('a later run replays instead of failing with kernel_died (review R1)', async () => {
+    // The old case stopped at "the in-flight exec fails": it never ran a second
+    // time, so a registry stuck on a dead session went unnoticed. Here the
+    // kernel is killed while NO cell is running and the registry is not told
+    // about it — exactly the state that used to make the next run throw
+    // kernel_died forever (the dead-SIDECAR variant is covered deterministically
+    // by tests/unit/kernel-registry.test.ts).
+    const nb = await writeNb('i7-recovery.ipynb', [
+      codeCell('print("before")', 'c0'),
+      codeCell('print("after")', 'c1'),
+    ]);
+
+    const first = await runNotebook(request(nb, { cellSelector: 'all' }), deps());
+    expect(first.executed[1]!.status).toBe('ok');
+    const live = registry.findByNotebook(nb);
+    expect(live).not.toBeNull();
+
+    // Kill the kernel process tree the way an OOM kill or a user would.
+    const { execFileSync } = await import('node:child_process');
+    const kernelPid = live!.pid ?? 0;
+    expect(kernelPid).toBeGreaterThan(0);
+    if (process.platform === 'win32') {
+      execFileSync('taskkill', ['/T', '/F', '/PID', String(kernelPid)], { stdio: 'ignore' });
+    } else {
+      process.kill(kernelPid, 'SIGKILL');
+    }
+    // Wait (bounded) for the sidecar to report the death; if it does not, the
+    // session is still there and the NEXT run must recover anyway — the whole
+    // point of R1 is that a stale dead session must not be a dead end.
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline && registry.findByNotebook(nb) !== null) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+
+    // The next run is a cold start: replay the prefix, execute cell 1.
+    const second = await runNotebook(request(nb, { cellSelector: '1' }), deps());
+    expect(second.mode_used).toBe('replay');
+    expect(second.replayed_cell_indexes).toEqual([0]);
+    expect(second.executed[0]!.status).toBe('ok');
+  }, 180_000);
 });
 
 describe('[I8] idle kernels are reclaimed', () => {
@@ -516,14 +588,21 @@ describe('[I-replay-fresh] mode=replay rebuilds state on a NEW kernel (review A4
 
 describe('[I10] concurrent notebook_run on the same kernel raises kernel_busy (review A6)', () => {
   it('a second run-level call is rejected while the first is in flight', async () => {
+    // Overlap case. The RUN-LEVEL half of this guard (a second call refused
+    // while no exec is in flight at all — the gap between two cells) cannot be
+    // driven deterministically through this API, so it is asserted directly in
+    // tests/unit/kernel-registry.test.ts [W5]: "kernel_busy still fires after
+    // restart replaces the session object", where the fake transport makes the
+    // gap explicit. Both halves exist in the implementation (registry
+    // #runActive is checked before the session's own busy flag matters).
     const nb = await writeNb('i10.ipynb', [
       codeCell('import time\ntime.sleep(3)', 'c0'),
       codeCell('y = 1', 'c1'),
     ]);
     const first = runNotebook(request(nb, { cellSelector: 'all', timeoutSeconds: 60 }), deps());
-    // Wait until the first run's kernel is live and the 3s cell is in flight
+    // Wait until the first run's kernel is live and its 3s cell is in flight
     // (polling beats a fixed sleep: kernel startup varies with machine load).
-    for (let i = 0; i < 60; i += 1) {
+    for (let i = 0; i < 100; i += 1) {
       const live = registry.findByNotebook(nb);
       if (live !== null && live.alive) {
         break;
@@ -552,4 +631,116 @@ describe('[A11] selector error codes split by failure kind (SPEC §4.7/§7)', ()
       runNotebook(request(nb, { cellSelector: '1' }), deps()),
     ).rejects.toMatchObject({ code: 'invalid_targets' });
   });
+});
+
+describe('[R3] a kernel that dies mid-run still writes back the completed cells', () => {
+  it('reports kernel_died with write_back.performed and the finished cell on disk', async () => {
+    const nb = await writeNb('r3-kernel-died.ipynb', [
+      codeCell('print("first")', 'c0'),
+      codeCell('import sys\nprint("second")\nsys.stdout.flush()\nimport time\ntime.sleep(60)', 'c1'),
+    ]);
+
+    const running = runNotebook(request(nb, { cellSelector: 'all', timeoutSeconds: 120 }), deps());
+    // Wait for cell 1 to be in flight, then kill the kernel the way an OOM
+    // kill or an external taskkill would (no MCP call involved, so no run
+    // layer had a chance to set an abort reason).
+    let killed = false;
+    for (let i = 0; i < 200; i += 1) {
+      const live = registry.findByNotebook(nb);
+      if (live !== null && live.executionCount !== null && live.executionCount >= 1) {
+        const { execFileSync } = await import('node:child_process');
+        const pid = live.pid ?? 0;
+        if (process.platform === 'win32') {
+          execFileSync('taskkill', ['/T', '/F', '/PID', String(pid)], { stdio: 'ignore' });
+        } else {
+          process.kill(pid, 'SIGKILL');
+        }
+        killed = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(killed).toBe(true);
+
+    let caught: unknown;
+    try {
+      await running;
+    } catch (cause) {
+      caught = cause;
+    }
+    expect(caught).toBeInstanceOf(IpynbError);
+    const err = caught as IpynbError;
+    expect(err.code).toBe('kernel_died');
+    const detail = err.detail as Record<string, unknown>;
+    // SPEC §4.8 rule 3: completed cells are written back, and the terminal
+    // state reports it.
+    expect(detail['write_back']).toMatchObject({ performed: true });
+    const executed = detail['executed'] as Array<Record<string, unknown>>;
+    expect(executed.map((entry) => entry['cell_index'])).toEqual([0]);
+
+    const cells = await readCells(nb);
+    expect(cells[0]!['execution_count']).toBe(1);
+    expect(JSON.stringify(cells[0]!['outputs'])).toContain('first');
+    // The in-flight cell's half-finished output never lands (SPEC §4.8 rule 2).
+    expect(cells[1]!['execution_count']).toBeNull();
+    expect(cells[1]!['outputs']).toEqual([]);
+  }, 180_000);
+});
+
+describe('[W3] a failed write-back never replaces the primary error code', () => {
+  it('still reports exec_timeout when the notebook changed under the run', async () => {
+    const nb = await writeNb('w3-timeout.ipynb', [
+      codeCell('print("done")', 'c0'),
+      // Ignores SIGINT so the run ends in the timeout path (not a cancel).
+      codeCell(
+        'import signal\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\nimport time\nwhile True: time.sleep(0.1)',
+        'c1',
+      ),
+    ]);
+
+    // Change the file while the run is executing: the write-back's optimistic
+    // lock then fails with file_changed, which used to be thrown INSTEAD of
+    // exec_timeout, hiding the real outcome from the model.
+    const clobber = setTimeout(() => {
+      const cells = [
+        { cell_type: 'code', id: 'c0', metadata: {}, source: 'print("done")', outputs: [], execution_count: null },
+        {
+          cell_type: 'code',
+          id: 'c1',
+          metadata: {},
+          source: 'import signal\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\nimport time\nwhile True: time.sleep(0.1)',
+          outputs: [],
+          execution_count: null,
+        },
+      ];
+      void import('node:fs/promises').then((fs) =>
+        fs.writeFile(
+          nb,
+          JSON.stringify({
+            nbformat: 4,
+            nbformat_minor: 5,
+            metadata: { kernelspec: { name: 'python3' }, language_info: { name: 'python' }, touched: 'yes' },
+            cells,
+          }),
+        ),
+      );
+    }, 2_500);
+
+    let caught: unknown;
+    try {
+      await runNotebook(request(nb, { cellSelector: 'all', timeoutSeconds: 3 }), deps());
+    } catch (cause) {
+      caught = cause;
+    } finally {
+      clearTimeout(clobber);
+    }
+    expect(caught).toBeInstanceOf(IpynbError);
+    const err = caught as IpynbError;
+    expect(err.code).toBe('exec_timeout');
+    const writeBack = (err.detail as Record<string, unknown>)['write_back'] as Record<string, unknown>;
+    // The failure is reported, not hidden ... 
+    expect(writeBack['performed']).toBe(false);
+    // ... and says why.
+    expect(String(writeBack['reason'])).toContain('file_changed');
+  }, 120_000);
 });

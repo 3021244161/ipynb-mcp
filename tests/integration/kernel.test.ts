@@ -28,6 +28,35 @@ const BASE_PYTHON = process.env['IPYNB_TEST_PYTHON'] ?? (WINDOWS ? 'python' : 'p
 let workspace: string;
 let notebookPath: string;
 let registry: KernelRegistry;
+/**
+ * Interpreter this file actually drives. Resolving it is a CANDIDATE CHAIN, not
+ * "the venv or bust": a test venv can be importable yet unusable (this
+ * machine's `.venv-test` inherits pyzmq 26.2.0 from its conda base, which kills
+ * the sidecar with 0xC0000409 the moment a kernel starts). Eight cases failing
+ * for an environment reason hides real regressions. The base interpreter still
+ * exercises exactly the same product code.
+ */
+let interpreter = VENV_PY;
+
+async function canStartKernel(candidate: string): Promise<boolean> {
+  if (!existsSync(candidate)) {
+    return false;
+  }
+  const probe = new SidecarTransport({ interpreterPath: candidate, onLog: () => undefined });
+  try {
+    await probe.startKernel({
+      kernelId: 'probe-kernel',
+      interpreterPath: candidate,
+      kernelSpecName: 'python3',
+      language: 'python',
+    });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    await probe.shutdownAll().catch(() => undefined);
+  }
+}
 
 beforeAll(async () => {
   if (!existsSync(VENV_PY)) {
@@ -35,6 +64,14 @@ beforeAll(async () => {
       stdio: 'inherit',
       timeout: 120_000,
     });
+  }
+  // Prefer the dedicated venv; fall back to the base interpreter when it cannot
+  // actually host a kernel, and say which one is in use.
+  if (!(await canStartKernel(VENV_PY)) && (await canStartKernel(BASE_PYTHON))) {
+    interpreter = BASE_PYTHON;
+    process.stderr.write(
+      `[kernel.test] ${VENV_PY} cannot start a kernel here; falling back to ${BASE_PYTHON}\n`,
+    );
   }
   workspace = await mkdtemp(path.join(tmpdir(), 'ipynb-mcp-kernel-'));
   notebookPath = path.join(workspace, 'nb.ipynb');
@@ -71,7 +108,7 @@ function processExists(pid: number | null): boolean {
 
 describe('[I-smoke] sidecar transport with a real kernel', () => {
   it('pings and reports versions', async () => {
-    const transport = new SidecarTransport({ interpreterPath: VENV_PY, onLog: () => undefined });
+    const transport = new SidecarTransport({ interpreterPath: interpreter, onLog: () => undefined });
     const pong = await transport.ping();
     expect(pong.pythonVersion).toMatch(/^\d+\.\d+/);
     expect(pong.jupyterClientVersion).toMatch(/^\d+/);
@@ -83,7 +120,7 @@ describe('[I-smoke] sidecar transport with a real kernel', () => {
   it('starts a kernel, executes cells and maps outputs (I1 core behavior)', async () => {
     const session = await registry.getOrCreate({
       notebookPath,
-      interpreterPath: VENV_PY,
+      interpreterPath: interpreter,
       kernelSpecName: 'python3',
       language: 'python',
     });
@@ -195,19 +232,19 @@ describe('[I11] no orphan sidecar/kernel processes after shutdown', () => {
     // Self-contained (review D6): this case spawns the processes it checks, so
     // running it alone (vitest -t '[I11]') cannot degrade into an empty loop
     // that passes vacuously. It also asserts the checked set is non-empty.
-    const transport = new SidecarTransport({ interpreterPath: VENV_PY, onLog: () => undefined });
+    const transport = new SidecarTransport({ interpreterPath: interpreter, onLog: () => undefined });
     const ownSidecarPid = transport.pid ?? -1;
     expect(ownSidecarPid).toBeGreaterThan(0);
     await transport.startKernel({
       kernelId: 'i11-kernel',
-      interpreterPath: VENV_PY,
+      interpreterPath: interpreter,
       kernelSpecName: 'python3',
       language: 'python',
     });
 
     const session = await registry.getOrCreate({
       notebookPath,
-      interpreterPath: VENV_PY,
+      interpreterPath: interpreter,
       kernelSpecName: 'python3',
       language: 'python',
     });
@@ -234,7 +271,7 @@ describe('[A12] a kernel killed mid-run fails fast with kernel_died', () => {
   it('reports kernel_died within the iopub poll interval, not the full timeout', async () => {
     const session = await registry.getOrCreate({
       notebookPath,
-      interpreterPath: VENV_PY,
+      interpreterPath: interpreter,
       kernelSpecName: 'python3',
       language: 'python',
     });

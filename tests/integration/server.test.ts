@@ -51,23 +51,9 @@ beforeAll(async () => {
   registry = new KernelRegistry({ idleSeconds: 3600, logger: createLogger('error') });
   registry.start();
   runStore = new RunStore();
-  const config: IpynbConfig = {
-    root: workspace,
-    allowOutsideRoot: false,
-    readOnly: false,
-    images: 'auto',
-    python: null,
-    kernelIdleSeconds: 3600,
-    execTimeoutSeconds: 300,
-    backgroundThresholdSeconds: 30,
-    backupKeep: 10,
-    artifactDir: path.join(workspace, 'artifacts'),
-    inlineTextChars: 20000,
-    previewLines: 12,
-    maxImagesPerCall: 20,
-    maxImageBytes: 20971520,
-    logLevel: 'error',
-  };
+  // A short exec timeout keeps the notebook_run cases quick; the background
+  // decision still holds (30s x 5 cells > 30s threshold x 10).
+  const config: IpynbConfig = configFor(workspace, 30);
   const server = createServer({
     config,
     fence: new PathFence(workspace, false, process.platform),
@@ -108,6 +94,50 @@ async function writeNb(name: string, cells: Array<Record<string, unknown>>): Pro
 
 function codeCell(id: string, source: string): Record<string, unknown> {
   return { cell_type: 'code', id, metadata: {}, source, outputs: [], execution_count: null };
+}
+
+/**
+ * A cell carrying PRE-EXISTING outputs. Fixtures used to hardcode
+ * `outputs: []`, which made "the run did not touch this cell" true by
+ * construction and therefore blind to the A1 class of data loss (review T3).
+ */
+function seededCell(
+  id: string,
+  source: string,
+  seed: { outputs?: unknown[]; execution_count?: number | null },
+): Record<string, unknown> {
+  return {
+    cell_type: 'code',
+    id,
+    metadata: {},
+    source,
+    outputs: seed.outputs ?? [],
+    execution_count: seed.execution_count ?? null,
+  };
+}
+
+function streamOutput(text: string): Record<string, unknown> {
+  return { output_type: 'stream', name: 'stdout', text: [text] };
+}
+
+function configFor(root: string, execTimeoutSeconds = 300): IpynbConfig {
+  return {
+    root,
+    allowOutsideRoot: false,
+    readOnly: false,
+    images: 'auto',
+    python: null,
+    kernelIdleSeconds: 3600,
+    execTimeoutSeconds,
+    backgroundThresholdSeconds: 30,
+    backupKeep: 10,
+    artifactDir: path.join(root, 'artifacts'),
+    inlineTextChars: 20000,
+    previewLines: 12,
+    maxImagesPerCall: 20,
+    maxImageBytes: 20971520,
+    logLevel: 'error',
+  };
 }
 
 async function callTool(name: string, args: Record<string, unknown>): Promise<{
@@ -154,7 +184,12 @@ describe('[I13] client abort of an in-flight synchronous run', () => {
       const body = JSON.parse(String(result.content[0]?.text ?? '{}')) as Record<string, unknown>;
       expect(body['code']).toBe('cancelled');
     } else {
-      expect(String(failure)).toBeTruthy();
+      // An assertion, not `expect(String(failure)).toBeTruthy()` — that form
+      // passed for literally any throwable, including a TypeError (review T3).
+      // The SDK surfaces an aborted request as its own MCP error, so the
+      // message is checked for an abort/cancel shape rather than one wording.
+      expect(failure).toBeInstanceOf(Error);
+      expect(String((failure as Error).message)).toMatch(/abort|cancel/i);
     }
 
     // The kernel got interrupted well before the 30s sleep finished: the
@@ -224,12 +259,7 @@ async function handleEditThroughAbort(nb: string, signal: AbortSignal) {
   void notebook;
   const outcome = await handleNotebookEdit(
     {
-      config: {
-        root: workspace, allowOutsideRoot: false, readOnly: false, images: 'auto', python: null,
-        kernelIdleSeconds: 3600, execTimeoutSeconds: 300, backgroundThresholdSeconds: 30,
-        backupKeep: 10, artifactDir: path.join(workspace, 'artifacts'), inlineTextChars: 20000,
-        previewLines: 12, maxImagesPerCall: 20, maxImageBytes: 20971520, logLevel: 'error',
-      },
+      config: configFor(workspace),
       fence: new PathFence(workspace, false, process.platform),
       registry,
       runStore,
@@ -249,19 +279,27 @@ async function handleEditThroughAbort(nb: string, signal: AbortSignal) {
 
 describe('[I16] background run vs kernel restart', () => {
   it('fails the run immediately, writes completed cells, keeps status queryable', async () => {
+    // Cells 2..4 carry SEEDED outputs, so "the run never touched them" is a
+    // real claim instead of the empty fixture's tautology (review T3): a
+    // clear_outputs_before that pre-cleared the whole target set, or a write
+    // back that dropped untouched cells, now turns this case red.
     const nb = await writeNb('i16.ipynb', [
       codeCell('c0', 'a = 1'),
       codeCell('c1', 'b = 2'),
-      codeCell('c2', 'import time\ntime.sleep(1)\nc = 3'),
-      codeCell('c3', 'import time\ntime.sleep(1)\nd = 4'),
-      codeCell('c4', 'e = 5'),
+      seededCell('c2', 'import time\ntime.sleep(1)\nc = 3', {
+        outputs: [streamOutput('STALE-C2\n')],
+        execution_count: 71,
+      }),
+      seededCell('c3', 'import time\ntime.sleep(1)\nd = 4', {
+        outputs: [streamOutput('STALE-C3\n')],
+        execution_count: 72,
+      }),
+      seededCell('c4', 'e = 5', { outputs: [streamOutput('STALE-C4\n')], execution_count: 73 }),
     ]);
-    // Background requires clearing the conservative estimate (D-015):
-    // 300s x 5 cells = 1500 > 30s threshold x 10 -> background.
-    const start = await callTool('notebook_run', {
+    const started = await callTool('notebook_run', {
       path: nb, cell_selector: 'all', timeout_seconds: 300,
     });
-    const startBody = JSON.parse(String(start.content[0]?.text ?? '{}')) as Record<string, unknown>;
+    const startBody = JSON.parse(String(started.content[0]?.text ?? '{}')) as Record<string, unknown>;
     expect(startBody['kind']).toBe('background');
     const runId = String(startBody['run_id']);
 
@@ -287,7 +325,9 @@ describe('[I16] background run vs kernel restart', () => {
     // window) and immediately terminal.
     const statusAfterRestart = await callTool('notebook_run_status', { run_id: runId });
     const statusBody = JSON.parse(String(statusAfterRestart.content[0]?.text ?? '{}')) as Record<string, unknown>;
-    expect(['failed', 'completed', 'cancelled']).toContain(statusBody['state']);
+    // D4 excluded 'completed' here: a restart during an in-flight run cannot
+    // legitimately end in success (review T3).
+    expect(['failed', 'cancelled']).toContain(statusBody['state']);
 
     // Give the background task time to observe the abort and write back.
     await new Promise((resolve) => setTimeout(resolve, 6_000));
@@ -300,12 +340,12 @@ describe('[I16] background run vs kernel restart', () => {
     expect(writeBack['performed']).toBe(true);
 
     // The file contains exactly the cells that COMPLETED before the restart:
-    // a contiguous prefix 0..k-1, and every cell after them is untouched
-    // (null execution_count, no outputs). Exact set, not a range count (D4).
+    // a contiguous prefix 0..k-1, and every cell after them keeps its SEEDED
+    // outputs and execution_count (SPEC §4.7 rule 3, §4.8 rule 2).
     const written = JSON.parse(await readFile(nb, 'utf8')) as { cells: Array<Record<string, unknown>> };
     const completedIndexes = written.cells
       .map((cell, index) => ({ index, count: cell['execution_count'] }))
-      .filter((entry) => entry.count !== null)
+      .filter((entry) => entry.count !== null && Number(entry.count) < 70)
       .map((entry) => entry.index);
     expect(completedIndexes.length).toBeGreaterThanOrEqual(1);
     expect(completedIndexes.length).toBeLessThan(5);
@@ -314,10 +354,10 @@ describe('[I16] background run vs kernel restart', () => {
     expect(completedIndexes).toEqual(
       Array.from({ length: completedIndexes.length }, (_, i) => i),
     );
-    const untouched = written.cells.slice(completedIndexes.length);
-    for (const cell of untouched) {
-      expect(cell['execution_count']).toBeNull();
-      expect(cell['outputs']).toEqual([]);
+    const seeds = [null, null, 71, 72, 73];
+    for (let index = completedIndexes.length; index < written.cells.length; index += 1) {
+      expect(written.cells[index]!['execution_count']).toBe(seeds[index]);
+      expect(JSON.stringify(written.cells[index]!['outputs'])).toContain(`STALE-C${index}`);
     }
     // The failed run's status carries the same executed set (review D4).
     expect((finalBody['executed'] as unknown[]).length).toBe(completedIndexes.length);
