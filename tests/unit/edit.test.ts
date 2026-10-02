@@ -23,7 +23,7 @@ function notebookJson(cells: Array<Record<string, unknown>>, minor = 5): string 
   return JSON.stringify({
     nbformat: 4,
     nbformat_minor: minor,
-    metadata: { kernelspec: { name: 'python3' } },
+    metadata: { kernelspec: { name: 'python3', display_name: 'Python 3' } },
     cells,
   });
 }
@@ -249,7 +249,7 @@ describe('[step4][U8] dry-run semantics (tool layer skips the write)', () => {
 });
 
 describe('[step4][U9] set_cell_type to markdown', () => {
-  it('deletes outputs and nulls execution_count', () => {
+  it('deletes outputs AND execution_count (nbformat forbids both on markdown)', () => {
     const notebook = parseNotebook(
       new TextEncoder().encode(notebookJson([
         {
@@ -269,7 +269,13 @@ describe('[step4][U9] set_cell_type to markdown', () => {
     const cell = notebook.cells[0]!;
     expect(cell.cell_type).toBe('markdown');
     expect(cell.outputs).toBeUndefined();
-    expect(cell.execution_count).toBeNull();
+    // `null` is NOT an acceptable value here: nbformat's schema forbids the key
+    // on markdown cells entirely, and serializeNotebook only fills it for code
+    // cells, so a nulled key stayed in the user's file forever (review v4
+    // FID-3 — nbformat.validate rejects "Additional properties are not
+    // allowed"). SPEC §4.5 write rule 4 says "deleted", and this now matches.
+    expect(cell.execution_count).toBeUndefined();
+    expect('execution_count' in cell).toBe(false);
     expect(cellSource(cell)).toBe('print(1)'); // source content untouched
     expect(result.applied).toBe(1);
   });

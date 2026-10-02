@@ -86,7 +86,7 @@ async function writeNb(name: string, cells: Array<Record<string, unknown>>): Pro
   await writeFile(target, JSON.stringify({
     nbformat: 4,
     nbformat_minor: 5,
-    metadata: { kernelspec: { name: 'python3' }, language_info: { name: 'python' } },
+    metadata: { kernelspec: { name: 'python3', display_name: 'Python 3' }, language_info: { name: 'python' } },
     cells,
   }));
   return target;

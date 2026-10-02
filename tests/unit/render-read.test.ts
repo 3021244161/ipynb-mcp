@@ -43,7 +43,7 @@ function bigNotebookJson(): string {
   return JSON.stringify({
     nbformat: 4,
     nbformat_minor: 5,
-    metadata: { kernelspec: { name: 'python3' }, language_info: { name: 'python', version: '3.11.9' } },
+    metadata: { kernelspec: { name: 'python3', display_name: 'Python 3' }, language_info: { name: 'python', version: '3.11.9' } },
     cells,
   });
 }
@@ -116,7 +116,7 @@ function imageCells(perCell: readonly number[]): string {
   return JSON.stringify({
     nbformat: 4,
     nbformat_minor: 5,
-    metadata: { kernelspec: { name: 'python3' }, language_info: { name: 'python' } },
+    metadata: { kernelspec: { name: 'python3', display_name: 'Python 3' }, language_info: { name: 'python' } },
     cells: perCell.map((count, cellIndex) =>
       cell(cellIndex, Array.from({ length: count }, (_, i) => pngOutput(cellIndex * 100 + i))),
     ),

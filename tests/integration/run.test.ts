@@ -19,6 +19,10 @@ import { KernelRegistry } from '../../src/kernel/registry.js';
 import { createNodeInterpreterDeps, pythonPrefix, resolveInterpreter } from '../../src/kernel/interpreter.js';
 import { SidecarTransport } from '../../src/kernel/sidecar-transport.js';
 import { runNotebook, type RunDeps, type RunRequest } from '../../src/run.js';
+import { handleNotebookEdit } from '../../src/mcp/tools/edit.js';
+import { RunStore } from '../../src/mcp/run-store.js';
+import { PathFence } from '../../src/fs/fence.js';
+import { nbformatAvailable, validateNotebook } from './nbformat-validator.js';
 import { createLogger } from '../../src/log.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -41,6 +45,8 @@ let previousJupyterPath: string | undefined;
  * interpreter via the SPEC §5.2 candidate chain and are unaffected.
  */
 let sidecarInterpreter = VENV_PY;
+/** Whether the chosen interpreter can validate with the real nbformat. */
+let NBFORMAT_AVAILABLE = false;
 
 async function canStartKernel(candidate: string): Promise<boolean> {
   if (!existsSync(candidate)) {
@@ -79,6 +85,7 @@ beforeAll(async () => {
     }
     sidecarInterpreter = BASE_PYTHON;
   }
+  NBFORMAT_AVAILABLE = nbformatAvailable(VENV_PY);
   workspace = await mkdtemp(path.join(tmpdir(), 'ipynb-mcp-run-'));
   artifactRoot = path.join(workspace, 'artifacts');
   registry = new KernelRegistry({ idleSeconds: 3600, logger: createLogger('debug') });
@@ -129,6 +136,20 @@ function config(): IpynbConfig {
   };
 }
 
+/** Tool context for cases that drive a tool handler directly (FID-3). */
+function depsContext(): Parameters<typeof handleNotebookEdit>[0] {
+  return {
+    config: config(),
+    fence: new PathFence(workspace, false, process.platform),
+    registry,
+    runStore: new RunStore(),
+    hasher,
+    logger: createLogger('error'),
+    realpath: (target) => realpathSync(target),
+    platform: process.platform,
+  };
+}
+
 function deps(): RunDeps {
   return {
     registry,
@@ -166,7 +187,14 @@ async function writeNb(name: string, cells: Array<Record<string, unknown>>): Pro
   await writeFile(target, JSON.stringify({
     nbformat: 4,
     nbformat_minor: 5,
-    metadata: { kernelspec: { name: 'python3' }, language_info: { name: 'python' } },
+    metadata: {
+      // nbformat requires display_name on a kernelspec. These fixtures omitted
+      // it, and the real validator added by FID-1's fix rejected every one of
+      // them on its first run — i.e. the whole suite had been validating
+      // against files nbformat considers invalid.
+      kernelspec: { name: 'python3', display_name: 'Python 3', language: 'python' },
+      language_info: { name: 'python' },
+    },
     cells,
   }));
   return target;
@@ -725,7 +753,7 @@ describe('[W3] a failed write-back never replaces the primary error code', () =>
           JSON.stringify({
             nbformat: 4,
             nbformat_minor: 5,
-            metadata: { kernelspec: { name: 'python3' }, language_info: { name: 'python' }, touched: 'yes' },
+            metadata: { kernelspec: { name: 'python3', display_name: 'Python 3' }, language_info: { name: 'python' }, touched: 'yes' },
             cells,
           }),
         ),
@@ -795,5 +823,74 @@ describe('[ROB-8] a cancel that lands AFTER the last cell still reports what it 
     expect(detail['write_back']).toMatchObject({ performed: true });
     const cells = await readCells(nb);
     expect(cells[0]!['execution_count']).toBe(1);
+  }, 120_000);
+});
+
+describe('[FID-1] the file the run writes is valid nbformat', () => {
+  it('passes the real nbformat validator, and the tool can read its own outputs back', async () => {
+    // The bug this pins: `result.result.rawOutputs` (the sidecar's private
+    // shape: `outputType`, camelCase) was assigned straight to `cell.outputs`.
+    // Every executed cell produced a file nbformat rejects, the outputs could
+    // not be read back, and the run still reported `write_back.performed: true`
+    // with no warning — three review rounds missed it because every assertion
+    // spoke the same dialect the writer spoke. An external validator does not
+    // (review v4 FID-1).
+    const nb = await writeNb('fid1-valid.ipynb', [
+      codeCell('print("stream-output")\n7 * 6', 'c0'),
+    ]);
+
+    const outcome = await runNotebook(request(nb, { cellSelector: 'all' }), deps());
+    expect(outcome.write_back.performed).toBe(true);
+    const executed = outcome.executed[0]!;
+    expect(executed.status).toBe('ok');
+    // The run must actually have produced outputs, otherwise this case would
+    // pass vacuously on a writer that emits nothing.
+    expect(executed.outputs.length).toBeGreaterThanOrEqual(2);
+
+    const onDisk = JSON.parse(await readFile(nb, 'utf8')) as { cells: Array<Record<string, unknown>> };
+    const outputs = onDisk.cells[0]!['outputs'] as Array<Record<string, unknown>>;
+    expect(outputs.length).toBeGreaterThanOrEqual(2);
+    for (const output of outputs) {
+      expect(output['output_type'], 'the private protocol key leaked into the file').toBeDefined();
+      expect(output['outputType']).toBeUndefined();
+    }
+    // nbformat requires execution_count ON execute_result specifically: a bare
+    // `outputType` -> `output_type` rename would still fail here.
+    const executeResult = outputs.find((output) => output['output_type'] === 'execute_result');
+    expect(executeResult, 'print + expression should yield an execute_result').toBeDefined();
+    expect('execution_count' in executeResult!).toBe(true);
+
+    if (NBFORMAT_AVAILABLE) {
+      const validation = validateNotebook(nb, VENV_PY);
+      expect(validation.ok, `nbformat.validate rejected the written file:\n${validation.message}`).toBe(true);
+    }
+
+    // Round-trip: the tool must be able to read what it wrote. Before the fix
+    // it reported "no outputs" for a cell it had just filled.
+    const readBack = await runNotebook(request(nb, { cellSelector: 'all', mode: 'resume' }), deps());
+    expect(readBack.executed[0]!.outputs.length).toBeGreaterThanOrEqual(2);
+  }, 180_000);
+
+  it('[FID-3] code -> markdown leaves a document the validator accepts', async () => {
+    const nb = await writeNb('fid3-markdown.ipynb', [
+      codeCell('print("before")', 'c0'),
+    ]);
+    await runNotebook(request(nb, { cellSelector: 'all' }), deps());
+
+    // Convert the executed cell to markdown through the real tool path.
+    const edit = await handleNotebookEdit(depsContext(), {
+      path: nb,
+      ops: [{ op: 'set_cell_type', cell_index: 0, cell_type: 'markdown', expected_text: 'print("before")' }],
+    });
+    expect('error' in edit).toBe(false);
+
+    const onDisk = JSON.parse(await readFile(nb, 'utf8')) as { cells: Array<Record<string, unknown>> };
+    expect('execution_count' in onDisk.cells[0]!).toBe(false);
+    expect('outputs' in onDisk.cells[0]!).toBe(false);
+
+    if (NBFORMAT_AVAILABLE) {
+      const validation = validateNotebook(nb, VENV_PY);
+      expect(validation.ok, `nbformat.validate rejected the converted file:\n${validation.message}`).toBe(true);
+    }
   }, 120_000);
 });

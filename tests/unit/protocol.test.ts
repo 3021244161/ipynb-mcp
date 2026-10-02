@@ -86,6 +86,35 @@ describe('[step7][U22] NDJSON framing', () => {
     expect(lines).toHaveLength(reps);
   });
 
+  it('[NEW-3] one 64 MiB line in small chunks costs linear time, not quadratic', () => {
+    // The review measured the residue of the v3 fix: 64 MiB arriving as 16 KiB
+    // chunks still took ~2.2 s because every chunk rescanned the whole
+    // newline-free prefix. A wall-clock assertion alone would be flaky, so this
+    // pins the ALGORITHM by counting how many bytes the scanner inspects: a
+    // quadratic scan re-reads the prefix, and the count would be ~chunks/2
+    // times the line length. Linear means roughly one pass.
+    const cap = 64 * 1024 * 1024;
+    const chunkSize = 16 * 1024;
+    const chunks = cap / chunkSize;
+    const framer = new NdjsonFramer();
+    let inspected = 0;
+    const observed = Buffer.alloc(cap, 0x61) as Buffer & { indexOf: (v: number, from?: number) => number };
+    const original = Buffer.prototype.indexOf;
+    Object.defineProperty(observed, 'indexOf', {
+      value: (value: number, from?: number) => {
+        const start = from ?? 0;
+        inspected += observed.length - start;
+        return original.call(observed, value, start);
+      },
+    });
+    for (let index = 0; index < chunks; index += 1) {
+      framer.push(observed.subarray(index * chunkSize, (index + 1) * chunkSize));
+    }
+    expect(framer.pendingBytes).toBe(cap);
+    // One pass over all bytes: the point of the cursor. Quadratic would be ~500x.
+    expect(inspected).toBeLessThanOrEqual(cap * 1.1);
+  });
+
   it('parseSidecarMessage returns null for garbage and non-objects', () => {
     expect(parseSidecarMessage('not json')).toBeNull();
     expect(parseSidecarMessage('42')).toBeNull();

@@ -86,7 +86,7 @@ beforeAll(async () => {
   await writeFile(notebookPath, JSON.stringify({
     nbformat: 4,
     nbformat_minor: 5,
-    metadata: { kernelspec: { name: 'python3' } },
+    metadata: { kernelspec: { name: 'python3', display_name: 'Python 3' } },
     cells: [],
   }));
   registry = new KernelRegistry({

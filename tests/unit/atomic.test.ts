@@ -169,4 +169,65 @@ describe('[step2] atomicWriteFile', () => {
     expect(['a', 'b']).toContain(content);
     expect(await tmpFiles()).toEqual([]);
   });
+
+  it('[W1] a TRANSIENT sharing violation on rename is retried, not reported as locked', async () => {
+    // Windows reports the same EBUSY/EPERM/EACCES for "another process holds
+    // this file" and for a momentary collision between two renames of one
+    // target. Treating the second as the first handed the model
+    // `notebook_locked` — the one error it is told to stop and ask the user
+    // about — while nothing held a lock. This test failed intermittently in
+    // practice before the retry existed.
+    const target = path.join(dir, 'transient.ipynb');
+    const realRename = (await import('node:fs/promises')).rename;
+    let attempts = 0;
+    const slept: number[] = [];
+    const deps: AtomicWriteDeps = {
+      open: (t, flags, mode) => fsOpen(t, flags, mode) as Promise<FileHandleLike>,
+      rename: async (from, to) => {
+        attempts += 1;
+        if (attempts <= 3) {
+          throw errorWithCode('EPERM');
+        }
+        await realRename(from, to);
+      },
+      unlink: (t) => import('node:fs/promises').then((m) => m.unlink(t)),
+      fsyncDir: async () => undefined,
+      stat: async () => null,
+      readdir: async () => [],
+      now: () => new Date(),
+      // Injected so the retry window is exercised without real waiting (R11).
+      sleep: async (ms) => {
+        slept.push(ms);
+      },
+    };
+    await atomicWriteFile(target, 'retried', { deps, platform: 'win32' });
+    expect(await readFile(target, 'utf8')).toBe('retried');
+    expect(attempts).toBe(4);
+    expect(slept).toEqual([10, 20, 40]);
+    expect(await tmpFiles()).toEqual([]);
+  });
+
+  it('[W1] a PERSISTENT lock still becomes notebook_locked (the retry is bounded)', async () => {
+    const target = path.join(dir, 'persistent.ipynb');
+    let attempts = 0;
+    const deps: AtomicWriteDeps = {
+      open: (t, flags, mode) => fsOpen(t, flags, mode) as Promise<FileHandleLike>,
+      rename: async () => {
+        attempts += 1;
+        throw errorWithCode('EBUSY');
+      },
+      unlink: (t) => import('node:fs/promises').then((m) => m.unlink(t)),
+      fsyncDir: async () => undefined,
+      stat: async () => null,
+      readdir: async () => [],
+      now: () => new Date(),
+      sleep: async () => undefined,
+    };
+    const failure = await atomicWriteFile(target, 'never', { deps, platform: 'win32' }).catch((c: unknown) => c);
+    expect(failure).toBeInstanceOf(IpynbError);
+    expect((failure as IpynbError).code).toBe('notebook_locked');
+    // Bounded: the full delay schedule plus the failing attempt, no more.
+    expect(attempts).toBe(9);
+    expect(await tmpFiles()).toEqual([]);
+  });
 });

@@ -91,7 +91,7 @@ describe('[step9][U24] response shape across all six tools', () => {
     await writeFile(nb, JSON.stringify({
       nbformat: 4,
       nbformat_minor: 5,
-      metadata: { kernelspec: { name: 'python3' }, language_info: { name: 'python' } },
+      metadata: { kernelspec: { name: 'python3', display_name: 'Python 3' }, language_info: { name: 'python' } },
       cells: [{ cell_type: 'code', id: 'c0', metadata: {}, source: 'x = 1', outputs: [], execution_count: null }],
     }));
 
@@ -272,7 +272,7 @@ describe('[step9][U27] schema-level violations raise invalid_arguments', () => {
     expect(String(tooManyBody['detail']['field'])).toBe('cell_indexes');
   }, 60_000);
 
-  it('[SEC-1] an unknown argument is rejected instead of silently defaulted', async () => {
+  it('[SEC-1] an unknown argument is rejected by the TOOL layer with invalid_arguments', async () => {
     const nb = path.join(workspace, 'sec1.ipynb');
     await writeFile(nb, JSON.stringify({
       nbformat: 4,
@@ -285,24 +285,39 @@ describe('[step9][U27] schema-level violations raise invalid_arguments', () => {
     // deliberately different). Sending it here used to read the whole notebook
     // with no error at all, because the SDK validated with a NON-strict object
     // and dropped the key before the handler could ever see it (review v3
-    // SEC-1). The tool schemas are strict now, so the request fails; the exact
-    // failure shape belongs to the SDK, which is why this asserts "rejected
-    // with an invalid-argument style message" rather than one code
-    // (see DEVIATIONS D-024).
+    // SEC-1).
+    //
+    // The v3 fix made the SCHEMA strict, which made the request fail — but with
+    // the SDK's protocol error, and it left the tool-layer whitelist
+    // unreachable: reverting `rejectUnknownArguments` entirely kept the suite
+    // green, i.e. the check that SPEC §4.1.12 actually names was dead code
+    // (review v4 NEW-1). The schemas now pass unknown keys through, so this
+    // asserts the code path that matters, with the code the SPEC names.
     const wrongArg = await callTool('notebook_read', { path: nb, cell_selector: '0' });
     const raw = String((wrongArg.content ?? [])[0]?.['text'] ?? '');
     expect(wrongArg.isError).toBe(true);
-    expect(raw).toMatch(/invalid|unrecognized|additional/i);
+    const body = JSON.parse(raw) as Record<string, unknown>;
+    expect(body['code']).toBe('invalid_arguments');
+    expect(String((body['detail'] as Record<string, unknown>)['field'])).toBe('cell_selector');
     // It must NOT have silently read the notebook it was asked not to read.
     expect(raw).not.toContain('cell_count');
 
-    // Every tool's advertised JSON Schema now matches the enforcement: the old
-    // mismatch was "additionalProperties:false advertised, key silently
-    // stripped in practice".
-    const tools = await client.listTools();
-    for (const tool of tools.tools) {
-      const schema = tool.inputSchema as { additionalProperties?: boolean };
-      expect(schema.additionalProperties, `${tool.name} is not strict`).toBe(false);
+    // Mutation guard for the wiring itself: the tool layer is the ONLY layer
+    // that can produce this detail, so if it stops being called this fails
+    // rather than passing on the SDK's rejection.
+    for (const [tool, args] of [
+      ['notebook_read', { path: nb, bogus: 1 }],
+      ['notebook_edit', { path: nb, ops: [{ op: 'clear_outputs', cell_index: 0 }], bogus: 1 }],
+      ['notebook_run', { path: nb, mode: 'full', bogus: 1 }],
+      ['notebook_run_status', { run_id: 'run-1', bogus: 1 }],
+      ['notebook_run_cancel', { run_id: 'run-1', bogus: 1 }],
+      ['notebook_kernel', { action: 'status', bogus: 1 }],
+    ] as const) {
+      const result = await callTool(tool, args as Record<string, unknown>);
+      const resultBody = JSON.parse(String((result.content ?? [])[0]?.['text'] ?? '')) as Record<string, unknown>;
+      expect(result.isError, `${tool} accepted an unknown argument`).toBe(true);
+      expect(resultBody['code'], `${tool} did not use invalid_arguments`).toBe('invalid_arguments');
+      expect(String((resultBody['detail'] as Record<string, unknown>)['reason'])).toContain('unknown argument');
     }
   }, 60_000);
 

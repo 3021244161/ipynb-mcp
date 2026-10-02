@@ -84,7 +84,10 @@ async function writeNb(name: string, cells: Array<Record<string, unknown>>): Pro
   await writeFile(target, JSON.stringify({
     nbformat: 4,
     nbformat_minor: 5,
-    metadata: { kernelspec: { name: 'python3' }, language_info: { name: 'python' } },
+    metadata: {
+      kernelspec: { name: 'python3', display_name: 'Python 3', language: 'python' },
+      language_info: { name: 'python' },
+    },
     cells,
   }));
   return target;
@@ -117,7 +120,11 @@ describe('[U19b] no false positive for function-local variables', () => {
     const nb = await writeNb('u19b.ipynb', [
       codeCell('tmp = 99', 'c3'),
       codeCell('def g():\n    tmp = 2\n    return tmp', 'c4', [
-        { output_type: 'execute_result', data: { 'text/plain': ['<function g>'] }, metadata: {} },
+        // nbformat requires execution_count on execute_result, and the
+        // structural self-check now enforces it: this seed used to omit the
+        // key, so every fixture like it described a file nbformat rejects
+        // (found by the FID-1 validator, kept honest by the gate).
+        { output_type: 'execute_result', data: { 'text/plain': ['<function g>'] }, metadata: {}, execution_count: 1 },
       ]),
     ]);
     const outcome = await runNotebook({
@@ -169,10 +176,10 @@ describe('[U19] replay dependencies surface as low confidence', () => {
       codeCell('df = 1', 'c0'),
       codeCell('mid = 2', 'c1'),
       codeCell('model = df + mid', 'c5', [
-        { output_type: 'execute_result', data: { 'text/plain': ['3'] }, metadata: {} },
+        { output_type: 'execute_result', data: { 'text/plain': ['3'] }, metadata: {}, execution_count: 1 },
       ]),
       codeCell('report = df', 'c7', [
-        { output_type: 'execute_result', data: { 'text/plain': ['1'] }, metadata: {} },
+        { output_type: 'execute_result', data: { 'text/plain': ['1'] }, metadata: {}, execution_count: 1 },
       ]),
     ]);
     const outcome = await runNotebook({

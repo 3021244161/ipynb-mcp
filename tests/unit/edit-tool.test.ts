@@ -63,7 +63,7 @@ async function writeNb(name: string, cells: Array<Record<string, unknown>>): Pro
   await writeFile(target, JSON.stringify({
     nbformat: 4,
     nbformat_minor: 5,
-    metadata: { kernelspec: { name: 'python3' }, language_info: { name: 'python' } },
+    metadata: { kernelspec: { name: 'python3', display_name: 'Python 3' }, language_info: { name: 'python' } },
     cells,
   }));
   return target;
@@ -171,7 +171,7 @@ describe('[U8][D3] dry_run computes everything and writes nothing', () => {
 });
 
 describe('[U9][D3] set_cell_type to markdown through the tool layer', () => {
-  it('deletes outputs and nulls execution_count in the written file', async () => {
+  it('leaves neither outputs nor execution_count in the written file', async () => {
     const nb = await writeNb('u9-tool.ipynb', [
       {
         cell_type: 'code', id: 'c0', metadata: {}, source: 'print(1)',
@@ -185,11 +185,44 @@ describe('[U9][D3] set_cell_type to markdown through the tool layer', () => {
     });
     expect(isError).toBeUndefined();
     const written = JSON.parse(await readFile(nb, 'utf8')) as {
-      cells: Array<{ cell_type: string; outputs?: unknown; execution_count?: unknown }>;
+      cells: Array<Record<string, unknown>>;
     };
-    expect(written.cells[0]!.cell_type).toBe('markdown');
-    expect(written.cells[0]!.outputs).toBeUndefined();
-    expect(written.cells[0]!.execution_count).toBeNull();
+    expect(written.cells[0]!['cell_type']).toBe('markdown');
+    expect(written.cells[0]!['outputs']).toBeUndefined();
+    // Not `null`: the key must be ABSENT (review v4 FID-3). The structural
+    // self-check would now reject the file anyway, which is the point.
+    expect('execution_count' in written.cells[0]!).toBe(false);
+  });
+
+  it('[FID-4] the structural gate refuses a hand-built invalid document', async () => {
+    // The gate is what makes FID-1/FID-3 impossible to write again, so it gets
+    // its own assertion at the layer that writes files: if a future change
+    // produces protocol-shaped outputs or markdown residue, the write must fail
+    // with selfcheck_failed instead of landing.
+    const { findStructuralProblem, parseNotebook } = await import('../../src/core/parse.js');
+    const protocolShaped = parseNotebook(new TextEncoder().encode(JSON.stringify({
+      nbformat: 4,
+      nbformat_minor: 5,
+      metadata: {},
+      cells: [{
+        cell_type: 'code', id: 'c0', metadata: {}, source: 'x = 1', execution_count: 1,
+        outputs: [{ outputType: 'stream', name: 'stdout', text: '1\n' }],
+      }],
+    })), hasher);
+    expect(findStructuralProblem(protocolShaped.doc)).toMatchObject({
+      rule: 'output_type_missing',
+      saw: 'outputType',
+    });
+
+    const markdownResidue = parseNotebook(new TextEncoder().encode(JSON.stringify({
+      nbformat: 4,
+      nbformat_minor: 5,
+      metadata: {},
+      cells: [{ cell_type: 'markdown', id: 'm0', metadata: {}, source: '# hi', execution_count: null }],
+    })), hasher);
+    expect(findStructuralProblem(markdownResidue.doc)).toMatchObject({
+      rule: 'non_code_cell_has_execution_count',
+    });
   });
 });
 

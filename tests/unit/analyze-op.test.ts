@@ -178,7 +178,7 @@ describe('[U20][D2] non-Python kernels report method skipped', () => {
     await writeFile(nb, JSON.stringify({
       nbformat: 4,
       nbformat_minor: 5,
-      metadata: { kernelspec: { name: 'fake-r' }, language_info: { name: 'r' } },
+      metadata: { kernelspec: { name: 'fake-r', display_name: 'Python 3' }, language_info: { name: 'r' } },
       cells: [
         { cell_type: 'code', id: 'c0', metadata: {}, source: 'x <- 1', outputs: [], execution_count: null },
         { cell_type: 'code', id: 'c1', metadata: {}, source: 'y <- x', outputs: [{ output_type: 'stream', name: 'stdout', text: 'old\n' }], execution_count: 3 },

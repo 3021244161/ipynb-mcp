@@ -20,11 +20,12 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.test.json",
-    "lint": "oxlint src tests && node scripts/check-format.mjs",
+    "lint": "oxlint src tests && node scripts/check-format.mjs && node scripts/check-indent.mjs",
     "test": "vitest run",
     "test:integration": "vitest run --config vitest.integration.config.ts",
-    "prepack": "pnpm build",
-    "prepublishOnly": "pnpm typecheck && pnpm lint && pnpm test"
+    "smoke": "node scripts/e2e-smoke.mjs",
+    "prepack": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm run typecheck && npm run lint && npm test"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "~1.31.0",
