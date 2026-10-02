@@ -28,12 +28,31 @@ describe('[step1] Logger (stderr-only, D16/R14)', () => {
     expect(lines[0]).toMatch(/^\[ipynb-mcp\] \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z debug d$/);
   });
 
-  it('never writes to stdout', () => {
-    const { lines } = capture();
-    // The default sink writes to process.stderr; assert the logger contract here by
-    // ensuring our test sink is the only output channel used.
-    const logger = createLogger('error', (line) => lines.push(line));
-    logger.error('boom');
-    expect(lines).toEqual([expect.stringContaining('error boom')]);
+  it('never writes to stdout: the DEFAULT sink targets stderr, not stdout', () => {
+    // Review D5: the old version asserted nothing about stdout and never ran
+    // the default sink. Capture-only interception (no call-through: a bare
+    // function call loses the stream `this` and throws on _writableState),
+    // restore in finally, then assert which stream received the bytes.
+    const originalStdoutWrite = process.stdout.write;
+    const originalStderrWrite = process.stderr.write;
+    const stdoutChunks: string[] = [];
+    const stderrChunks: string[] = [];
+    process.stdout.write = ((chunk: unknown) => {
+      stdoutChunks.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write;
+    process.stderr.write = ((chunk: unknown) => {
+      stderrChunks.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      const logger = createLogger('error');
+      logger.error('default-sink-check');
+    } finally {
+      process.stdout.write = originalStdoutWrite;
+      process.stderr.write = originalStderrWrite;
+    }
+    expect(stdoutChunks).toEqual([]);
+    expect(stderrChunks.join('')).toContain('default-sink-check');
   });
 });

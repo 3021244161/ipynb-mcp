@@ -335,7 +335,7 @@ def op_analyze(params: dict) -> dict:
         cell_defs, cell_uses = _extract_symbols(table)
         defs.append(cell_defs)
         uses.append(cell_uses)
-    return {"ok": len(failed) == 0, "failed_cell_indexes": failed, "defs": defs, "uses": uses}
+    return {"ok": len(failed) == 0, "failedCellIndexes": failed, "defs": defs, "uses": uses}
 
 
 def _extract_symbols(table) -> tuple[list[str], list[str]]:

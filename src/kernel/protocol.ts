@@ -44,20 +44,29 @@ export class NdjsonFramer {
   /** Feed a chunk; returns all complete lines (without trailing newline). */
   push(chunk: Buffer): string[] {
     this.#buffer = this.#buffer.length === 0 ? chunk : Buffer.concat([this.#buffer, chunk]);
-    if (this.#buffer.length > MAX_LINE_BYTES) {
-      throw new ProtocolFramingError(
-        `sidecar line exceeds ${MAX_LINE_BYTES} bytes (protocol error)`,
-      );
-    }
     const lines: string[] = [];
     let newlineIndex = this.#buffer.indexOf(0x0a);
     while (newlineIndex >= 0) {
       const line = this.#buffer.subarray(0, newlineIndex);
+      if (line.length > MAX_LINE_BYTES) {
+        // SPEC §5.8 caps a SINGLE line: check complete lines here so a chunk
+        // holding many small lines never trips the cap (review A21).
+        throw new ProtocolFramingError(
+          `sidecar line exceeds ${MAX_LINE_BYTES} bytes (protocol error)`,
+        );
+      }
       this.#buffer = this.#buffer.subarray(newlineIndex + 1);
       // Tolerate \r\n: strip a trailing CR.
       const text = line.toString('utf8');
       lines.push(text.endsWith('\r') ? text.slice(0, -1) : text);
       newlineIndex = this.#buffer.indexOf(0x0a);
+    }
+    // Only the unterminated remainder counts toward the cap: it is the only
+    // thing that can still grow into an over-long single line.
+    if (this.#buffer.length > MAX_LINE_BYTES) {
+      throw new ProtocolFramingError(
+        `sidecar line exceeds ${MAX_LINE_BYTES} bytes (protocol error)`,
+      );
     }
     return lines;
   }
