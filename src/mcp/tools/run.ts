@@ -72,11 +72,16 @@ export async function handleNotebookRun(
     }
     // Client cancellation interrupts the in-flight cell immediately (SPEC §4.6.2).
     if (hooks?.signal !== undefined && !hooks.signal.aborted) {
-      hooks.signal.addEventListener('abort', () => {
-        void ctx.registry.interrupt(absolutePath).catch((cause: unknown) => {
-          ctx.logger.warn(`client-cancel interrupt failed for ${absolutePath}: ${String(cause)}`);
-        });
-      });
+      hooks.signal.addEventListener(
+        'abort',
+        () => {
+          void ctx.registry.interrupt(absolutePath).catch((cause: unknown) => {
+            ctx.logger.warn(`client-cancel interrupt failed for ${absolutePath}: ${String(cause)}`);
+          });
+        },
+        // The listener must not outlive the run it belongs to (review W8).
+        { once: true },
+      );
     }
 
     // D14's literal rule compares the timeout UPPER BOUND against the

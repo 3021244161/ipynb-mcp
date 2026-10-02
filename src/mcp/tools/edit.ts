@@ -17,7 +17,7 @@ import {
 } from '../context.js';
 import { runTool, type ToolOutcome } from './result.js';
 
-function isAbortCause(cause: unknown, signal: AbortSignal | undefined): boolean {
+export function isAbortCause(cause: unknown, signal: AbortSignal | undefined): boolean {
   if (signal === undefined) {
     return false;
   }

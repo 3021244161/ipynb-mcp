@@ -174,6 +174,13 @@ function parseCliArgs(argv: readonly string[]): { values: Map<string, string | b
       inlineValue = next;
       i += 1;
     }
+    // `--opt=` and `--opt ""` mean "not set", exactly like an empty env value:
+    // treating the empty string as a value made `--exec-timeout-seconds=` a
+    // 0-second timeout and `--python ""` an explicit empty interpreter
+    // (review A16 only fixed the env half; W6 covers the CLI half).
+    if (inlineValue.trim() === '') {
+      continue;
+    }
     values.set(key, inlineValue);
   }
   return { values, errors };
@@ -298,7 +305,10 @@ export function parseConfig(
   // Validate enum / number values in resolution order (CLI, env, default).
   for (const [key, spec] of Object.entries(OPTION_SPECS)) {
     const value = resolved[key];
-    if (typeof value !== 'string' || value === '') {
+    if (typeof value !== 'string' || value.trim() === '') {
+      // Nothing empty can reach here any more (both the CLI and the env path
+      // treat an empty value as "not set"), so this is purely a backstop: a
+      // whitespace-only value must never fall through to Number('') === 0.
       continue;
     }
     if (spec.kind === 'enum') {

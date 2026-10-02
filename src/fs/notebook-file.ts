@@ -3,6 +3,7 @@
 // Notebook semantics live in core/parse; this module only moves bytes.
 
 import { copyFile, readFile, readdir, unlink } from 'node:fs/promises';
+import path from 'node:path';
 
 import { IpynbError } from '../core/errors.js';
 import {
@@ -12,6 +13,7 @@ import {
   type Hasher,
   type NotebookFile,
 } from '../core/parse.js';
+import { normalizeForCompare } from '../config.js';
 import { atomicWriteFile, isLockError } from './atomic.js';
 import { createBackup } from './backup.js';
 
@@ -25,10 +27,30 @@ export async function readNotebookFile(absolutePath: string, hasher: Hasher): Pr
         path: absolutePath,
       });
     }
-    throw cause;
+    // A file held open exclusively (Windows dwShareMode=0, an editor's lock)
+    // fails the READ first, long before the backup/rename paths that already
+    // map EBUSY/EPERM/EACCES. Without this, the model saw `internal` for a
+    // condition the tool is supposed to name (SPEC §10.2 I15, review W1).
+    throw translateLockError(cause, absolutePath);
   }
   return parseNotebook(bytes, hasher);
 }
+
+function translateLockError(cause: unknown, absolutePath: string): unknown {
+  if (isLockError(cause)) {
+    return new IpynbError('notebook_locked', `notebook file is locked by another process: ${absolutePath}`, {
+      path: absolutePath,
+    });
+  }
+  return cause;
+}
+
+/**
+ * Map a filesystem failure on a notebook read to the documented error code.
+ * Exported for tests: the real lock requires an OS-level exclusive handle,
+ * which only the Windows integration case (I15) can create.
+ */
+export { translateLockError };
 
 export interface WriteOptions {
   readonly hasher: Hasher;
@@ -56,18 +78,31 @@ export interface WriteResult {
  * edits could both pass the recheck and the later rename silently dropped
  * the earlier one. Serialising the whole recheck->serialize->backup->rename
  * window per absolute path closes that TOCTOU within this process.
+ *
+ * Keys are normalised so `C:\NB.ipynb` and `c:/nb.ipynb` share one lock on
+ * case-insensitive platforms (review W7).
  */
 const writeLocks = new Map<string, Promise<unknown>>();
 
+function lockKey(absolutePath: string): string {
+  return normalizeForCompare(path.resolve(absolutePath), process.platform);
+}
+
 async function withPathLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
-  const prev = writeLocks.get(key) ?? Promise.resolve();
+  const normalizedKey = lockKey(key);
+  const prev = writeLocks.get(normalizedKey) ?? Promise.resolve();
   const next = prev.then(fn, fn);
-  writeLocks.set(key, next.catch(() => undefined));
+  // Store the REJECTION-SWALLOWED promise: the cleanup comparison must see the
+  // same object that was stored. Building a fresh `.catch()` inside the
+  // comparison made the delete branch dead code, so every path kept a settled
+  // promise forever (review W7).
+  const tail = next.catch(() => undefined);
+  writeLocks.set(normalizedKey, tail);
   try {
     return await next;
   } finally {
-    if (writeLocks.get(key) === next.catch(() => undefined)) {
-      writeLocks.delete(key);
+    if (writeLocks.get(normalizedKey) === tail) {
+      writeLocks.delete(normalizedKey);
     }
   }
 }
@@ -78,6 +113,15 @@ export async function writeNotebookFile(
   options: WriteOptions,
 ): Promise<WriteResult> {
   return withPathLock(absolutePath, () => writeNotebookFileUnlocked(notebook, absolutePath, options));
+}
+
+/**
+ * Number of paths still holding a write lock. Exported for tests: a lock leak
+ * is invisible in behaviour (only memory), so the cleanup branch needs its own
+ * assertion (review W7).
+ */
+export function pendingWriteLockCount(): number {
+  return writeLocks.size;
 }
 
 async function writeNotebookFileUnlocked(
@@ -97,7 +141,7 @@ async function writeNotebookFileUnlocked(
         path: absolutePath,
       });
     }
-    throw cause;
+    throw translateLockError(cause, absolutePath);
   }
   const currentHash = `sha256:${options.hasher.sha256Hex(currentBytes)}`;
   const expected = options.expectedContentHash ?? notebook.contentHash;

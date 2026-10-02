@@ -48,7 +48,6 @@ export async function renderReadResult(input: RenderReadInput): Promise<RenderRe
   // (SPEC §4.3), not reset per cell (review A5).
   let imageCursor = 0;
   let limitWarned = false;
-
   const cellsPayload: Array<Record<string, unknown>> = [];
   for (const index of selectedIndexes) {
     const cell = input.notebook.cells[index];
@@ -87,18 +86,16 @@ export async function renderReadResult(input: RenderReadInput): Promise<RenderRe
         hasher: input.hasher,
       });
       const returnImages = shouldReturnImages(input.imagesPolicy, input.includeOutputs === 'full');
-      const budgeted = returnImages ? Math.min(imageBudget, input.maxImagesPerCall) : 0;
-      if (returnImages && budgeted < mapped.extractedImages.length && !limitWarned) {
-        limitWarned = true;
-        warnings.push(createWarning(
-          'image_limit',
-          `image count exceeds max_images_per_call (${input.maxImagesPerCall}); extra images are not returned`,
-        ));
-      }
+      // applyImagePolicy treats maxImages as an ABSOLUTE call-wide cap and
+      // indexStart as this batch's offset into the call's image blocks. Passing
+      // the remaining budget against an absolute cursor compared two different
+      // coordinate systems: cell 1 using 9 of 20 left budget 11, so cell 2's
+      // images were dropped from index 11 on and image_limit was reported for
+      // images that fit (review W4).
       const policyResult = await applyImagePolicy(
         mapped.items,
         mapped.extractedImages,
-        { returnImages, maxImages: budgeted, indexStart: imageCursor },
+        { returnImages, maxImages: input.maxImagesPerCall, indexStart: imageCursor },
         {
           artifactRoot: input.artifactDir,
           notebookAbsPath: input.path,
