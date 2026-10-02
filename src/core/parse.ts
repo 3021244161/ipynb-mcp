@@ -147,3 +147,29 @@ export function selfCheckNotebook(serialized: string, hasher: Hasher): NotebookF
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
+
+/** Notebook metadata projection (D15/B4): single source for the three
+ *  consumers (run orchestration, kernel tool, read rendering). */
+export interface NotebookMetadataInfo {
+  readonly kernelName: string | null;
+  readonly languageName: string | null;
+  readonly languageVersion: string | null;
+}
+
+export function readNotebookMetadata(doc: NotebookDoc): NotebookMetadataInfo {
+  const metadata = doc.metadata as Record<string, unknown>;
+  const kernelspec = metadata['kernelspec'];
+  const languageInfo = metadata['language_info'];
+  const pick = (record: unknown, field: string): string | null => {
+    if (typeof record !== 'object' || record === null) {
+      return null;
+    }
+    const value = (record as Record<string, unknown>)[field];
+    return typeof value === 'string' && value !== '' ? value : null;
+  };
+  return {
+    kernelName: pick(kernelspec, 'name'),
+    languageName: pick(languageInfo, 'name'),
+    languageVersion: pick(languageInfo, 'version'),
+  };
+}

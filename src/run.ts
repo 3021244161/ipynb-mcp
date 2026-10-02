@@ -3,20 +3,15 @@
 // the guarded write-back. This module composes core/fs/kernel pieces; it is
 // exposed to MCP tools in step 9.
 
-import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
-
 import { IpynbError, createWarning, type Warning } from './core/errors.js';
 import { mapRawOutputs, type OutputItem } from './core/outputs.js';
-import { cellSource, type Hasher, type NotebookFile } from './core/parse.js';
+import { cellSource, readNotebookMetadata, type Hasher, type NotebookFile } from './core/parse.js';
 import { analyzeStale, downgradeConfidence, regexDefs, regexUses, type StaleCell } from './core/stale.js';
 import type { IpynbConfig } from './config.js';
 import { applyImagePolicy, shouldReturnImages, type ImagesPolicy } from './fs/artifact.js';
 import { readNotebookFile, writeNotebookFile } from './fs/notebook-file.js';
 import type { KernelRegistry } from './kernel/registry.js';
-import { resolveInterpreter } from './kernel/interpreter.js';
+import { resolveForNotebook } from './kernel/interpreter.js';
 import type { Logger } from './log.js';
 
 export type RunMode = 'auto' | 'resume' | 'replay' | 'full';
@@ -178,28 +173,12 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
     }
   }
 
-  // Interpreter + kernelspec resolution (D23).
-  const metadata = notebook.doc.metadata as Record<string, unknown>;
-  const kernelspec = metadata['kernelspec'];
-  const kernelSpecName =
-    typeof kernelspec === 'object' && kernelspec !== null
-      ? String((kernelspec as Record<string, unknown>)['name'] ?? '') || null
-      : null;
-  const languageInfo = metadata['language_info'];
-  const languageInfoName =
-    typeof languageInfo === 'object' && languageInfo !== null
-      ? String((languageInfo as Record<string, unknown>)['name'] ?? '') || null
-      : null;
-
-  const resolution = await resolveInterpreter(
-    {
-      explicitPython: deps.config.python,
-      notebookPath: req.path,
-      kernelSpecName,
-      languageInfoName,
-      cache: interpreterCheckCacheAdapter(),
-    },
-    interpreterDeps(deps),
+  // Interpreter + kernelspec resolution (D23) via the shared single entry:
+  // runNotebook and notebook_kernel share the ipykernel probe cache (B1).
+  const notebookMeta = readNotebookMetadata(notebook.doc);
+  const resolution = await resolveForNotebook(
+    { notebookPath: req.path, explicitPython: deps.config.python, platform },
+    { kernelSpecName: notebookMeta.kernelName, languageInfoName: notebookMeta.languageName },
   );
   for (const warning of resolution.warnings) {
     if (!warnings.some((existing) => existing.code === warning.code)) {
@@ -615,56 +594,4 @@ function mappedTruncated(executed: readonly ExecutedCell[]): boolean {
   return executed.some((entry) =>
     entry.outputs.some((output) => output.kind === 'stream' && output.truncated),
   );
-}
-
-/** Process-wide ipykernel check cache (a 5s python -c import per candidate is
- *  too expensive to repeat on every call); memoizes a pure environment probe
- *  per SPEC §5.2 "cached per interpreter path". */
-const interpreterCheckCache = new Map<string, boolean>();
-
-function interpreterCheckCacheAdapter(): {
-  get(candidatePath: string): boolean | undefined;
-  set(candidatePath: string, ok: boolean): void;
-} {
-  return {
-    get: (candidatePath) => interpreterCheckCache.get(candidatePath),
-    set: (candidatePath, ok) => {
-      interpreterCheckCache.set(candidatePath, ok);
-    },
-  };
-}
-
-function interpreterDeps(deps: RunDeps): Parameters<typeof resolveInterpreter>[1] {
-  const platform = deps.platform ?? process.platform;
-  return {
-    platform,
-    env: process.env,
-    existsSync: (target) => existsSync(target),
-    readFile: async (target) => readFile(target, 'utf8'),
-    execFile: (command, args, timeoutMs) =>
-      new Promise<'ok' | 'failed' | 'not-found'>((resolve) => {
-        execFile(command, args, { timeout: timeoutMs, windowsHide: true }, (error) => {
-          if (error === null) {
-            resolve('ok');
-            return;
-          }
-          resolve((error as NodeJS.ErrnoException).code === 'ENOENT' ? 'not-found' : 'failed');
-        });
-      }),
-    resolveExecutable: (command, timeoutMs) =>
-      new Promise<string | null>((resolve) => {
-        execFile(command, ['-c', 'import sys; print(sys.executable)'], {
-          timeout: timeoutMs,
-          windowsHide: true,
-        }, (error, stdout) => {
-          if (error !== null) {
-            resolve(null);
-            return;
-          }
-          const resolved = stdout.trim().split('\n')[0] ?? '';
-          resolve(resolved === '' ? null : resolved);
-        });
-      }),
-    homedir: () => homedir(),
-  };
 }

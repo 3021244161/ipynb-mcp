@@ -349,3 +349,80 @@ function resolveArgv0(argv0: string, kernelDir: string): string {
   }
   return path.resolve(kernelDir, argv0);
 }
+
+// ---------------------------------------------------------------------------
+// Single entry point for callers (B1): the mcp tool layer and run
+// orchestration must not assemble interpreter deps themselves.
+// ---------------------------------------------------------------------------
+
+import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+
+/** Node adapter for InterpreterDeps (kept in the kernel layer, which owns process spawning). */
+export function createNodeInterpreterDeps(platform: NodeJS.Platform): InterpreterDeps {
+  return {
+    platform,
+    env: process.env,
+    existsSync: (target) => existsSync(target),
+    readFile: async (target) => readFile(target, 'utf8'),
+    execFile: (command, args, timeoutMs) =>
+      new Promise((resolve) => {
+        execFile(command, args, { timeout: timeoutMs, windowsHide: true }, (error) => {
+          if (error === null) {
+            resolve('ok');
+          } else {
+            resolve((error as NodeJS.ErrnoException).code === 'ENOENT' ? 'not-found' : 'failed');
+          }
+        });
+      }),
+    resolveExecutable: (command, timeoutMs) =>
+      new Promise((resolve) => {
+        execFile(command, ['-c', 'import sys; print(sys.executable)'], { timeout: timeoutMs, windowsHide: true }, (error, stdout) => {
+          if (error !== null) {
+            resolve(null);
+            return;
+          }
+          const resolved = stdout.trim().split('\n')[0] ?? '';
+          resolve(resolved === '' ? null : resolved);
+        });
+      }),
+    homedir: () => homedir(),
+  };
+}
+
+/** Process-wide ipykernel probe cache shared by ALL entry points (B1). */
+const sharedProbeCache = new Map<string, boolean>();
+
+export interface ResolveForNotebookOptions {
+  readonly notebookPath: string;
+  readonly explicitPython: string | null;
+  readonly platform?: NodeJS.Platform;
+}
+
+/**
+ * Resolve the interpreter for a notebook from its metadata (SPEC §5.2/D23).
+ * Both runNotebook and the notebook_kernel tool go through this single
+ * entry — the .venv candidate needs the notebook's own directory, so the
+ * path is required, not cosmetic.
+ */
+export async function resolveForNotebook(
+  options: ResolveForNotebookOptions,
+  resolveInput: {
+    readonly kernelSpecName: string | null;
+    readonly languageInfoName: string | null;
+  },
+): Promise<InterpreterResolution> {
+  const platform = options.platform ?? process.platform;
+  return resolveInterpreter(
+    {
+      explicitPython: options.explicitPython,
+      notebookPath: options.notebookPath,
+      kernelSpecName: resolveInput.kernelSpecName,
+      languageInfoName: resolveInput.languageInfoName,
+      cache: sharedProbeCache,
+    },
+    createNodeInterpreterDeps(platform),
+  );
+}

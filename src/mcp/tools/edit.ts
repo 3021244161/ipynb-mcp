@@ -1,12 +1,12 @@
 // notebook_edit tool (SPEC §4.5): fence -> read -> apply ops on the model ->
 // markdown gate -> backup -> atomic write. Failing ops never touch the file.
 
-import { existsSync } from 'node:fs';
 import path from 'node:path';
 
 import { applyEditOps, type MarkdownIssue } from '../../core/edit.js';
 import { IpynbError, type JsonValue, type Warning } from '../../core/errors.js';
 import { checkMarkdown } from '../../core/markdown.js';
+import { markdownTargetExists } from '../../fs/markdown-targets.js';
 import { readNotebookFile, writeNotebookFile } from '../../fs/notebook-file.js';
 import {
   optionalBoolean,
@@ -51,9 +51,11 @@ export async function handleNotebookEdit(
       });
     }
 
-    const notebookDir = path.dirname(absolutePath);
+    // The existsSync injection lives on the fs side (B1); core/markdown
+    // resolves relative targets against the notebook's directory itself.
+    const notebookDirForMarkdown = path.dirname(absolutePath);
     const checkMarkdownFn = (source: string): MarkdownIssue[] =>
-      checkMarkdown(source, notebookDir, (target) => existsSync(target));
+      checkMarkdown(source, notebookDirForMarkdown, markdownTargetExists);
 
     const editResult = applyEditOps(notebook, ops, {
       hasher: ctx.hasher,

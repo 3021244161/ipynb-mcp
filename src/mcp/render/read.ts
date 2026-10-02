@@ -5,7 +5,7 @@
 
 import { createWarning, type Warning } from '../../core/errors.js';
 import { mapRawOutputs, type OutputItem, type RawOutput } from '../../core/outputs.js';
-import { cellSource, type NotebookFile } from '../../core/parse.js';
+import { cellSource, readNotebookMetadata, type NotebookFile } from '../../core/parse.js';
 import { applyImagePolicy, shouldReturnImages, type ImagesPolicy } from '../../fs/artifact.js';
 
 const SUMMARY_PREVIEW_CHARS = 160;
@@ -37,21 +37,7 @@ export async function renderReadResult(input: RenderReadInput): Promise<RenderRe
   const imageBlocks: Array<{ data: string; media_type: 'image/png' | 'image/jpeg' }> = [];
 
   const doc = input.notebook.doc;
-  const metadata = doc.metadata as Record<string, unknown>;
-  const kernelspec = metadata['kernelspec'];
-  const languageInfo = metadata['language_info'];
-  const kernelName =
-    typeof kernelspec === 'object' && kernelspec !== null
-      ? String((kernelspec as Record<string, unknown>)['name'] ?? '') || null
-      : null;
-  const languageName =
-    typeof languageInfo === 'object' && languageInfo !== null
-      ? String((languageInfo as Record<string, unknown>)['name'] ?? '') || null
-      : null;
-  const languageVersion =
-    typeof languageInfo === 'object' && languageInfo !== null
-      ? String((languageInfo as Record<string, unknown>)['version'] ?? '') || null
-      : null;
+  const { kernelName, languageName, languageVersion } = readNotebookMetadata(doc);
 
   const selectedIndexes =
     input.cellIndexes !== undefined ? [...input.cellIndexes].sort((a, b) => a - b) : input.notebook.cells.map((_, i) => i);

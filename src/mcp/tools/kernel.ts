@@ -2,14 +2,10 @@
 // restart per notebook. Shutting down or restarting a kernel that carries a
 // running run fails that run with kernel_died immediately (SPEC §4.8).
 
-import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
-
 import { IpynbError, type JsonValue } from '../../core/errors.js';
+import { readNotebookMetadata } from '../../core/parse.js';
 import { readNotebookFile } from '../../fs/notebook-file.js';
-import { resolveInterpreter } from '../../kernel/interpreter.js';
+import { resolveForNotebook } from '../../kernel/interpreter.js';
 import type { KernelSessionInfo } from '../../kernel/registry.js';
 import { requireNonEmptyString, type ToolContext } from '../context.js';
 import { runTool, type ToolOutcome } from './result.js';
@@ -74,52 +70,12 @@ export async function handleNotebookKernel(
 
     if (action === 'start') {
       const notebook = await readNotebookFile(absolutePath, ctx.hasher);
-      const metadata = notebook.doc.metadata as Record<string, unknown>;
-      const kernelspec = metadata['kernelspec'];
-      const kernelSpecName =
-        typeof kernelspec === 'object' && kernelspec !== null
-          ? String((kernelspec as Record<string, unknown>)['name'] ?? '') || null
-          : null;
-      const languageInfo = metadata['language_info'];
-      const languageInfoName =
-        typeof languageInfo === 'object' && languageInfo !== null
-          ? String((languageInfo as Record<string, unknown>)['name'] ?? '') || null
-          : null;
-      const resolution = await resolveInterpreter(
-        {
-          explicitPython: ctx.config.python,
-          notebookPath: absolutePath,
-          kernelSpecName,
-          languageInfoName,
-        },
-        {
-          platform: ctx.platform,
-          env: process.env,
-          existsSync: (target) => existsSync(target),
-          readFile: async (target) => readFile(target, 'utf8'),
-          execFile: (command, args, timeoutMs) =>
-            new Promise((resolve) => {
-              execFile(command, args, { timeout: timeoutMs, windowsHide: true }, (error) => {
-                if (error === null) {
-                  resolve('ok');
-                } else {
-                  resolve((error as NodeJS.ErrnoException).code === 'ENOENT' ? 'not-found' : 'failed');
-                }
-              });
-            }),
-          resolveExecutable: (command, timeoutMs) =>
-            new Promise((resolve) => {
-              execFile(command, ['-c', 'import sys; print(sys.executable)'], { timeout: timeoutMs, windowsHide: true }, (error, stdout) => {
-                if (error !== null) {
-                  resolve(null);
-                  return;
-                }
-                const resolved = stdout.trim().split('\n')[0] ?? '';
-                resolve(resolved === '' ? null : resolved);
-              });
-            }),
-          homedir: () => homedir(),
-        },
+      // Single shared entry with runNotebook (B1): same candidate chain, same
+      // ipykernel probe cache — the tool layer assembles no deps itself.
+      const meta = readNotebookMetadata(notebook.doc);
+      const resolution = await resolveForNotebook(
+        { notebookPath: absolutePath, explicitPython: ctx.config.python, platform: ctx.platform },
+        { kernelSpecName: meta.kernelName, languageInfoName: meta.languageName },
       );
       const session = await ctx.registry.getOrCreate({
         notebookPath: absolutePath,
