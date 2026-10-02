@@ -58,6 +58,9 @@ export async function renderReadResult(input: RenderReadInput): Promise<RenderRe
 
   const imageBudgetTotal = input.maxImagesPerCall;
   let imageBudget = imageBudgetTotal;
+  // Running cursor so image_index stays unique across the whole call
+  // (SPEC §4.3), not reset per cell (review A5).
+  let imageCursor = 0;
   let limitWarned = false;
 
   const cellsPayload: Array<Record<string, unknown>> = [];
@@ -109,7 +112,7 @@ export async function renderReadResult(input: RenderReadInput): Promise<RenderRe
       const policyResult = await applyImagePolicy(
         mapped.items,
         mapped.extractedImages,
-        { returnImages, maxImages: budgeted },
+        { returnImages, maxImages: budgeted, indexStart: imageCursor },
         {
           artifactRoot: input.artifactDir,
           notebookAbsPath: input.path,
@@ -127,6 +130,7 @@ export async function renderReadResult(input: RenderReadInput): Promise<RenderRe
         }
         warnings.push(warning);
       }
+      imageCursor += policyResult.materialized.length;
       imageBudget -= policyResult.materialized.length;
       if (returnImages) {
         for (const materialized of policyResult.materialized) {

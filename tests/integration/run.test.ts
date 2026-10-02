@@ -439,3 +439,66 @@ function makeStubPython(target: string): string {
   execFileSync('chmod', ['+x', target]);
   return target;
 }
+
+describe('[I-replay-fresh] mode=replay rebuilds state on a NEW kernel (review A4)', () => {
+  it('variables from a previous run are gone after replay', async () => {
+    const nb = await writeNb('replay-fresh.ipynb', [
+      codeCell('persisted_var = 42', 'c0'),
+      codeCell('print(persisted_var)', 'c1'),
+    ]);
+    // First run establishes persisted_var in a live kernel.
+    const first = await runNotebook(request(nb, { cellSelector: 'all' }), deps());
+    expect(first.mode_used).toBe('full');
+    expect(first.executed[1]!.status).toBe('ok');
+
+    // An explicit replay must start a FRESH kernel: the silent prefix reruns,
+    // so persisted_var exists again — but prove freshness by deleting the
+    // variable, then replaying only cell 1 without re-running cell 0.
+    const del = await runNotebook(request(nb, { cellSelector: 'all' }), deps());
+    void del;
+    await registry.execCell(nb, {
+      code: 'del persisted_var',
+      silent: true,
+      storeOutputs: false,
+      timeoutMs: 60_000,
+    });
+    // Kernel now lacks persisted_var. replay rebuilds it via the prefix,
+    // so cell 1 must print 42 — but on a reused (dirty) kernel without the
+    // prefix the cell would fail. To distinguish fresh-vs-reused we instead
+    // check the kernel_id changed from the previous session.
+    const before = (await registry.findByNotebook(nb))!.kernelId;
+    const replayed = await runNotebook(request(nb, { cellSelector: '1', mode: 'replay' }), deps());
+    const after = (await registry.findByNotebook(nb))!.kernelId;
+    expect(replayed.mode_used).toBe('replay');
+    expect(replayed.replayed_cell_indexes).toEqual([0]);
+    expect(after).not.toBe(before);
+    expect(replayed.executed[0]!.status).toBe('ok');
+    // And the target cell saw the rebuilt state.
+    const stream = replayed.executed[0]!.outputs[0]!;
+    expect(stream).toMatchObject({ kind: 'stream', text: '42\n' });
+  }, 180_000);
+});
+
+describe('[I10] concurrent notebook_run on the same kernel raises kernel_busy (review A6)', () => {
+  it('a second run-level call is rejected while the first is in flight', async () => {
+    const nb = await writeNb('i10.ipynb', [
+      codeCell('import time\ntime.sleep(3)', 'c0'),
+      codeCell('y = 1', 'c1'),
+    ]);
+    const first = runNotebook(request(nb, { cellSelector: 'all', timeoutSeconds: 60 }), deps());
+    // Wait until the first run's kernel is live and the 3s cell is in flight
+    // (polling beats a fixed sleep: kernel startup varies with machine load).
+    for (let i = 0; i < 60; i += 1) {
+      const live = registry.findByNotebook(nb);
+      if (live !== null && live.alive) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    await expect(
+      runNotebook(request(nb, { cellSelector: '1', mode: 'resume', timeoutSeconds: 60 }), deps()),
+    ).rejects.toMatchObject({ code: 'kernel_busy' });
+    const outcome = await first;
+    expect(outcome.executed).toHaveLength(2);
+  }, 180_000);
+});

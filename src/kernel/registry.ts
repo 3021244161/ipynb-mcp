@@ -37,6 +37,8 @@ interface Session {
   pid: number | null;
   generation: number;
   busy: boolean;
+  /** Run-level lock: a whole notebook_run holds it for its duration (I10). */
+  runActive: boolean;
   lastSeenContentHash: string | null;
   readonly transport: KernelTransport;
 }
@@ -55,6 +57,7 @@ export class KernelRegistry {
   readonly #sessions = new Map<string, Session>(); // reuseKey -> session
   readonly #kernels = new Map<string, Session>(); // kernelId -> session
   readonly #transports = new Map<string, KernelTransport>(); // interpreter -> transport
+  readonly #starting = new Map<string, Promise<KernelSessionInfo>>(); // reuseKey -> in-flight start
   readonly #idleSeconds: number;
   readonly #logger?: Logger;
   readonly #platform: NodeJS.Platform;
@@ -116,23 +119,47 @@ export class KernelRegistry {
 
   /**
    * Return a live kernel for the notebook, starting one when the reuse key
-   * has no live session. Concurrent starts for the same key share the promise.
+   * has no live session. Concurrent starts for the same key share the
+   * in-flight promise (SPEC §5.3: one live kernel per key, no orphans).
+   * `fresh: true` shuts down any existing session first — used by replay
+   * mode, which must rebuild state on a NEW kernel (SPEC §4.7 matrix).
    */
   async getOrCreate(input: {
     notebookPath: string;
     interpreterPath: string;
     kernelSpecName: string;
     language: string;
+    fresh?: boolean;
   }): Promise<KernelSessionInfo> {
     const key = this.#reuseKey(input.notebookPath, input.interpreterPath, input.kernelSpecName);
     const existing = this.#sessions.get(key);
-    if (existing !== undefined && existing.transport.alive) {
+    if (existing !== undefined && existing.transport.alive && input.fresh !== true) {
       existing.lastUsedAt = this.#now();
       return this.#toInfo(existing);
     }
     if (existing !== undefined) {
-      this.#removeSession(existing);
+      await this.shutdown(input.notebookPath);
     }
+    const inflight = this.#starting.get(key);
+    if (inflight !== undefined) {
+      return inflight;
+    }
+    const promise = this.#startNew(key, input).finally(() => {
+      this.#starting.delete(key);
+    });
+    this.#starting.set(key, promise);
+    return promise;
+  }
+
+  async #startNew(
+    key: string,
+    input: {
+      notebookPath: string;
+      interpreterPath: string;
+      kernelSpecName: string;
+      language: string;
+    },
+  ): Promise<KernelSessionInfo> {
     const kernelId = `kernel-${this.#nextKernelNumber}`;
     this.#nextKernelNumber += 1;
 
@@ -158,6 +185,7 @@ export class KernelRegistry {
       pid: result.pid,
       generation: 0,
       busy: false,
+      runActive: false,
       lastSeenContentHash: null,
       transport,
     };
@@ -204,6 +232,25 @@ export class KernelRegistry {
     });
     this.#transports.set(interpreterPath, transport);
     return transport;
+  }
+
+  /**
+   * Acquire the run-level lock for a notebook (SPEC §10.2 I10): a second
+   * concurrent notebook_run on the same kernel raises kernel_busy instead of
+   * interleaving its cells with the first run's. The returned release
+   * function must be called in a finally block.
+   */
+  acquireRun(notebookPath: string): () => void {
+    const session = this.#requireSession(notebookPath, 'kernel_not_available');
+    if (session.runActive) {
+      throw new IpynbError('kernel_busy', `a run is already in flight on kernel ${session.kernelId}`, {
+        kernel_id: session.kernelId,
+      });
+    }
+    session.runActive = true;
+    return () => {
+      session.runActive = false;
+    };
   }
 
   /** Execute a cell on the notebook's kernel; kernel_busy when one is in flight. */

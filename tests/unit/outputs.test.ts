@@ -329,3 +329,27 @@ describe('[step6] decode failures surface as image with warning', () => {
     }
   });
 });
+
+describe('[step6][A5] image_index stays unique across cells in one call', () => {
+  it('two cells with one image each get indexes 0 and 1 (SPEC §4.3)', async () => {
+    let cursor = 0;
+    const cellIndexes = [0, 1];
+    const allIndexes: number[] = [];
+    for (const cellIndex of cellIndexes) {
+      const { items, extractedImages } = mapOutputs([pngOutput(2, 2)]);
+      const result = await applyImagePolicy(
+        items,
+        extractedImages,
+        { returnImages: true, maxImages: 20, indexStart: cursor },
+        { artifactRoot, notebookAbsPath: notebookPath, cellIndex, platform: 'win32', realpath: (p) => p },
+      );
+      cursor += result.materialized.length;
+      for (const item of result.items) {
+        if (item.kind === 'image') {
+          allIndexes.push(item.image_index ?? -1);
+        }
+      }
+    }
+    expect(allIndexes).toEqual([0, 1]);
+  });
+});

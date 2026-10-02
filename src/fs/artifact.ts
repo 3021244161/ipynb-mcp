@@ -20,6 +20,12 @@ export interface ImagePolicyDecision {
   /** Whether image blocks will be returned in this call at all. */
   readonly returnImages: boolean;
   readonly maxImages: number;
+  /**
+   * 0-based position of this batch's first image within the WHOLE call's
+   * image blocks (SPEC §4.3: image_index is unique across the call, not per
+   * cell — read/run loop over cells and must pass a running cursor).
+   */
+  readonly indexStart?: number;
 }
 
 export interface MaterializeContext {
@@ -67,7 +73,7 @@ export async function applyImagePolicy(
     .digest('hex')
     .slice(0, 16);
 
-  let imageIndex = 0;
+  let imageIndex = decision.indexStart ?? 0;
   let limitWarned = false;
   for (const image of extractedImages) {
     if (image.decodeFailed) {
