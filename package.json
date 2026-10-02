@@ -19,10 +19,12 @@
   "packageManager": "pnpm@11.7.0",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.test.json",
+    "typecheck": "tsc --noEmit -p tsconfig.test.json",
     "lint": "oxlint src tests",
     "test": "vitest run",
-    "test:integration": "vitest run --config vitest.integration.config.ts"
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "prepack": "pnpm build",
+    "prepublishOnly": "pnpm typecheck && pnpm lint && pnpm test"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "~1.31.0",

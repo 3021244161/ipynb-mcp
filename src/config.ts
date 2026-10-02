@@ -115,6 +115,12 @@ function parseCliArgs(argv: readonly string[]): { values: Map<string, string | b
   const errors: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i] ?? '';
+    // USAGE advertises "-h, --help": accept the short alias before the
+    // "--"-only check rejects it (review C6a).
+    if (arg === '-h') {
+      values.set('help', true);
+      continue;
+    }
     if (!arg.startsWith('--')) {
       errors.push(`unexpected argument: ${arg}`);
       continue;
@@ -352,7 +358,9 @@ function isFilesystemRoot(normalizedPath: string, platform: NodeJS.Platform): bo
   if (platform === 'win32') {
     return /^[a-z]:$/.test(normalizedPath);
   }
-  return normalizedPath === '';
+  // POSIX: '/' normalises to itself (not ''), so both spellings must count
+  // (review C6b — `--root /` used to fence the whole filesystem).
+  return normalizedPath === '' || normalizedPath === '/';
 }
 
 export interface StartupFsDeps {

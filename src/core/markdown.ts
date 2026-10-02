@@ -131,21 +131,31 @@ export function checkMarkdown(
   }
 
   // --- pass 5: tables (column mismatch, warning) ------------------------------
+  // A markdown table requires a delimiter row (| --- |) right after the
+  // header: pipe-carrying PROSE lines are not tables, and column counts are
+  // only checked once a delimiter row confirms the block (review C6e).
   let tableStart: number | null = null;
   let tablePipes = -1;
-  const flushTable = (endLine: number): void => {
-    if (tableStart !== null && endLine < 0) {
-      return;
-    }
-    tableStart = null;
-    tablePipes = -1;
-  };
+  let awaitingDelimiter = false;
+  const isDelimiterRow = (text: string): boolean => /^[|:\s-]+$/.test(text) && text.includes('-');
   for (const { text, line } of outside) {
     if (text.includes('|')) {
       const pipes = countChar(text, '|');
+      if (awaitingDelimiter) {
+        if (isDelimiterRow(text)) {
+          awaitingDelimiter = false; // confirmed table block; check from here on
+        } else {
+          // Not a table after all: reset and treat this line as a fresh candidate.
+          tableStart = null;
+          tablePipes = -1;
+          awaitingDelimiter = false;
+        }
+        continue;
+      }
       if (tableStart === null) {
         tableStart = line;
         tablePipes = pipes;
+        awaitingDelimiter = true;
       } else if (pipes !== tablePipes) {
         issues.push({
           severity: 'warning',
@@ -155,10 +165,11 @@ export function checkMarkdown(
         });
       }
     } else {
-      flushTable(line);
+      tableStart = null;
+      tablePipes = -1;
+      awaitingDelimiter = false;
     }
   }
-  flushTable(-1);
 
   issues.sort((a, b) => a.line - b.line);
   return issues;

@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 // Entry point (SPEC §3.2, §5.1): parse args, validate startup state
 // (exit code 2 on failure), wire the stdio transport, guarantee
 // shutdown_all on stdin close / SIGINT / SIGTERM (no orphan kernels, R19).

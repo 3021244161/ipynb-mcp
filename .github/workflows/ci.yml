@@ -27,6 +27,9 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm lint
       - run: pnpm test
+      # R15/SPEC §8 rule 1: every green run must also prove the packable
+      # artifact builds (review C1 — a publishable-empty-package gap).
+      - run: pnpm build
 
   integration:
     name: integration (${{ matrix.os }}, py ${{ matrix.python }})

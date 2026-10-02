@@ -180,3 +180,20 @@ describe('[step5][U4] markdown gate via edit ops', () => {
     expect(result.applied).toBe(1);
   });
 });
+
+describe('[step5][C6e] pipe-carrying prose is not a table', () => {
+  it('sentences with pipes do not trigger table-column-mismatch', () => {
+    const prose = 'We can use a | b or c | d in the shell\nand also x | y here too';
+    expect(rules(check(prose))).toEqual([]);
+  });
+
+  it('a real table with delimiter row still reports mismatches', () => {
+    const table = '| a | b |\n| --- | --- |\n| 1 |';
+    expect(rules(check(table))).toContain('table-column-mismatch');
+  });
+
+  it('a consistent table with delimiter row stays clean', () => {
+    const table = '| a | b |\n| --- | --- |\n| 1 | 2 |';
+    expect(rules(check(table))).toEqual([]);
+  });
+});

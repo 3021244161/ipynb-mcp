@@ -8,6 +8,8 @@
 
 import path from 'node:path';
 
+import { normalizeForCompare } from '../config.js';
+
 import { IpynbError, createWarning, type JsonValue, type Warning } from '../core/errors.js';
 
 export interface InterpreterCandidate {
@@ -85,7 +87,7 @@ export async function resolveInterpreter(
     if (cached !== undefined) {
       return cached;
     }
-    const status = await deps.execFile(candidate, ['-c', 'import ipykernel'], 15_000);
+    const status = await deps.execFile(candidate, ['-c', 'import ipykernel'], 5_000);
     const ok = status === 'ok';
     input.cache?.set(candidate, ok);
     return ok;
@@ -173,7 +175,7 @@ export async function resolveInterpreter(
   // ---- candidate 4: PATH python3 -> python --------------------------------
   const pathCandidates = deps.platform === 'win32' ? ['python'] : ['python3', 'python'];
   for (const candidate of pathCandidates) {
-    const status = await deps.execFile(candidate, ['-c', 'import ipykernel'], 15_000);
+    const status = await deps.execFile(candidate, ['-c', 'import ipykernel'], 5_000);
     if (status === 'ok') {
       return {
         interpreterPath: candidate,
@@ -220,9 +222,12 @@ function maybeVenvMismatch(
     return;
   }
   const argv0 = resolveArgv0(kernelJson.argv[0] ?? '', kernelJson.dir);
-  const same = path.resolve(argv0).toLowerCase() === path.resolve(venvPython).toLowerCase();
+  // Case-fold ONLY on win32/darwin: a blanket toLowerCase() made two
+  // genuinely different Linux paths compare equal (review C6d).
+  const same =
+    normalizeForCompare(path.resolve(argv0), deps.platform) ===
+    normalizeForCompare(path.resolve(venvPython), deps.platform);
   if (!same) {
-    void deps;
     pushMismatch(
       warnings,
       `notebook directory has a virtualenv whose interpreter differs from the kernelspec argv[0] (${argv0}); pass --python to override if this is wrong`,

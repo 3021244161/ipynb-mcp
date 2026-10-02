@@ -586,6 +586,7 @@ async function writeBackCompleted(
     // abort handling (SPEC §4.8 rule 3 — completed cells are written back
     // when a run dies), so an already-aborted signal must not block it.
     platform,
+    onCleanupError: (message) => deps.logger?.warn(message),
   });
   return { performed: true, backup_path: partialWrite.backupPath };
 }

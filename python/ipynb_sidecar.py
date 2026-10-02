@@ -46,15 +46,16 @@ class KernelEntry:
     def shutdown(self) -> None:
         try:
             self.client.stop_channels()
-        except Exception:
-            pass
+        except Exception as exc:
+            send_log("warn", f"stop_channels failed for {self.kernel_id}: {exc}")
         try:
             self.km.shutdown_kernel(now=False)
-        except Exception:
+        except Exception as exc:
+            send_log("warn", f"graceful shutdown failed for {self.kernel_id}: {exc}")
             try:
                 self.km.shutdown_kernel(now=True)
-            except Exception:
-                pass
+            except Exception as exc2:
+                send_log("warn", f"forced shutdown failed for {self.kernel_id}: {exc2}")
 
 
 KERNELS: dict[str, KernelEntry] = {}

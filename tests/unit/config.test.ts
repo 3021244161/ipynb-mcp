@@ -217,3 +217,29 @@ describe('[step1][A14] a relative --artifact-dir resolves to an absolute path', 
     expect(artifactDir.endsWith('artifacts')).toBe(true);
   });
 });
+
+describe('[step1][C6a] -h is an accepted help alias', () => {
+  it('parses -h the same as --help', () => {
+    expect(parseConfig(['-h'], BASE_ENV).helpRequested).toBe(true);
+    expect(parseConfig(['--help'], BASE_ENV).helpRequested).toBe(true);
+  });
+});
+
+describe('[step1][C6b] POSIX filesystem roots are rejected at startup', () => {
+  it('isFilesystemRoot accepts "/" on linux (rejected later by startup validation)', async () => {
+    const { validateStartupFiles } = await import('../../src/config.js');
+    const errors = validateStartupFiles(
+      { ...parseConfig([], BASE_ENV, { fallbackRoot: '/' }).config!, artifactDir: '/tmp/artifacts' },
+      {
+        existsSync: (target: string) => target === '/',
+        statSync: () => ({ isDirectory: () => true }),
+        realpathSync: (target: string) => target,
+        mkdirSync: () => undefined,
+        homedir: () => '/home/tester',
+      },
+      'linux',
+    );
+    expect(errors.length).toBeGreaterThan(0);
+    expect(errors[0]).toContain('filesystem root');
+  });
+});

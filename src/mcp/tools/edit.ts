@@ -79,6 +79,8 @@ export async function handleNotebookEdit(
           expectedContentHash,
           signal: options?.signal,
           platform: ctx.platform,
+          // Cleanup/diagnostics go through the logger, not raw stderr (C6g).
+          onCleanupError: (message) => ctx.logger.warn(message),
         });
       } catch (cause) {
         if (isAbortCause(cause, options?.signal)) {
