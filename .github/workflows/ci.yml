@@ -16,9 +16,11 @@ jobs:
         node: [22, 24]
     steps:
       - uses: actions/checkout@v4
+      # No `version:` input on purpose: package.json declares
+      # `packageManager: pnpm@11.7.0`, and action-setup v4 hard-fails with
+      # "Multiple versions of pnpm specified" when both are present and unequal
+      # -- which stopped every job at the install step (review v3 DEP-6).
       - uses: pnpm/action-setup@v4
-        with:
-          version: 11
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
@@ -45,9 +47,8 @@ jobs:
         python: ['3.10', '3.12']
     steps:
       - uses: actions/checkout@v4
+      # Same reason as the unit job: the version comes from packageManager.
       - uses: pnpm/action-setup@v4
-        with:
-          version: 11
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -66,7 +67,10 @@ jobs:
       - run: pnpm test
         env:
           IPYNB_TEST_PYTHON: python
-      # setup-python's interpreter becomes the venv base for the test env.
+      # TST-1: a fallback to a non-venv interpreter means the environment (or
+      # our own spawn/path logic) is broken; in CI that must be a failure, not a
+      # silently greener suite.
       - run: pnpm test:integration
         env:
           IPYNB_TEST_PYTHON: python
+          IPYNB_TEST_REQUIRE_VENV: '1'

@@ -1,18 +1,73 @@
 # 代码审查整改状态（review fix status）
 
-> **来源**：`docs/review/ipynb-mcp-code-review.md`（第一轮）与 `docs/review/ipynb-mcp-code-review-v2.md`（第二轮）
+> **来源**：`docs/review/ipynb-mcp-code-review.md`（第一轮）、`…-v2.md`（第二轮）、`…-v3.md`（第三轮）
 > **权威**：`SPEC.md` + `AGENTS.md`。整改只做「实现与被 SPEC 判定不符」的部分；
 > SPEC 自身的缺陷按 AGENTS §0 记入 `DEVIATIONS.md` 后按 SPEC 继续。
+>
+> 各轮的逐条闭环记录见本文件末尾的「第三轮」「第二轮」「第一轮」三节；**门禁数字以本节为准**。
 >
 > **本文档的 ✅ 只代表"代码里存在该实现 + 有对应的可复现验证"。**
 > 第一轮曾出现 3 处"标 ✅ 但代码里不存在"的虚报（第二轮 V1–V3），本表因此按此标准重写，
 > 并在每一行给出验证位置（用例名或文件）。
 >
-> **本轮门禁实测**（2026-10-02，提交 `aff0396`）：`pnpm typecheck` 0 错 / `pnpm lint` 0 警（57 文件 99 规则）/
-> 单测 **214（213 passed + 1 skipped）** / 集成 **38/38**（5 文件全绿）/ `npm pack --dry-run` 132 文件。
-> 唯一 skip 是 U20（本机无法起 kernel，已记录原因）。集成用到的解释器见 `COMPATIBILITY.md`。
+> **门禁实测（第三轮整改后）**：`pnpm typecheck` 0 错 / `pnpm lint` 0 警（57 文件 99 规则 + `scripts/check-format.mjs`）/
+> 单测 **223（222 passed + 1 skipped）** / 集成 **39/39**（5 文件全绿）/ `npm pack --dry-run` 133 文件 / 全树 LF。
+> 唯一 skip 是 U20（本机无法起 kernel，已记录原因并区分"环境不足"与"start_kernel 回归"）。集成用到的解释器见 `COMPATIBILITY.md`。
 
 ---
+
+## 〇、第三轮（`ipynb-mcp-code-review-v3.md`，本轮）
+
+> 该报告对 v2 的闭环核查结论是"四道门禁全部真实通过、逐字吻合"（本项目第一次），
+> 同时给出 5 条 🟠 与若干 🟡/🟢。逐条状态：
+
+### 0.1 🟠 项
+
+| # | 结论 | 修复要点 | 验证 |
+|---|---|---|---|
+| **ROB-8** | ✅ | 四条收口：① 写回窗口内的取消改走与中途取消**同一条终态路径**（`abortedRunError`），detail 带 `executed`/`write_back`；② abort 判定改用**合并后**的 signal；③ `kernel_not_available` 与 `kernel_died` 同等对待；④ 目标 cell 前校验承载它的 session 未被换掉（仅 `resume`） | 集成 `[ROB-8]`（取消落在写回窗口，断言 `write_back.performed` + 盘上 `execution_count`，**已做变异验证**：改回旧实现即变红）；[R3]/I16 回归 | 
+| **ROB-2** | ✅ | 超时路径改为**先 `shutdown()` 后摘 session**（原顺序让 `shutdown` 查不到 session 直接返回 → 关闭从未发生、kernel 泄漏） | 用例 `[ROB-2]` ×2（断言 `shutdownKernel` 恰被调用一次 + 无残留 session + 下次是 `kernel-2`；**已做变异验证**） |
+| **ROB-11** | ✅ | `exec_cell` 余量改为 `timeoutMs + sidecar 最坏耗时 + 10s`；"超时回收进程树"限定为只对 `exec_cell`（`kernel_status`/`ping`/`analyze` 超时不再连坐其他 notebook） | D-027 登记 + 常量按 sidecar 预算命名；现有 I5/I18/W3（依赖 `exec_timeout` 语义）全绿 |
+| **DEP-1** | ✅ | sidecar 把 connection file **钉在 OS 临时目录**并在三个出口删除 | D-023 登记；实测：改造后新起的 kernel 在仓库根与 `%TEMP%` 均无残留（旧行为会各留一份） |
+| **QUAL-8** | ✅ | `notebook_run_cancel` 立即置终态 + 不再 sleep；`interrupt` 失败只记 warn | `src/mcp/tools/run-status.ts`；终态语义与 §4.8 的响应枚举一致 |
+| **ARCH-1** | ✅ | nbformat 输出形状下沉到 `core/outputs.ts` 的 `rawOutputsOfCell`（`hasStableCellIds` 一并下沉）；顺带修掉**数组形式 `data` 值被静默丢弃** | `grep` 确认 `src/mcp/*` 不再解析输出形状；U15/U16/U17/U21/U21b 回归 |
+
+### 0.2 🟡 项
+
+| # | 结论 | 修复要点 |
+|---|---|---|
+| **ROB-6** | ✅ | 复用键/run 锁/路径查找统一 `realpath` + 折叠（`canonicalPath` 可注入，生产注入 `realpathSync`）；用例 `[ROB-6]` ×2 |
+| **ROB-5** | ✅ | `cell_indexes` 去重 + 限长 1000（工具层拒绝，保持 `invalid_arguments`）；用例 `[ROB-5]`（200 次重复 → 只渲染 1 个 cell；1001 项 → 拒绝） |
+| **ROB-13 / ROB-14** | ✅ | 探活说死了也**先尝试关闭**再摘除；`liveKernel` 一次探测的结果传给 `getOrCreate`（`knownAlive`），不再二次探测；用例 `[ROB-13]`/`[ROB-14]` |
+| **ROB-10** | ✅ | sidecar stderr 进入环形缓冲（20 行）并随 `kernel_died` 的 detail 返回；stderr 转发从 debug 提升为 warn；退出码带 `STATUS_*` 符号名；D-030 登记"候选链只在解析期降级" |
+| **ROB-12** | ✅ | 按 D-031 如实登记：异常退出后不再按 pid 补刀（子进程已退出，pid 复用有误杀风险；实测无孤儿） |
+| **QUAL-1** | ✅ | 修掉两处缩进错乱；新增零依赖 `scripts/check-format.mjs`（tab / 行尾空白）并接进 `pnpm lint`。未加 prettier：新增依赖需先问人类（AGENTS §11），且检查故意不做可疑的"块嵌套启发式" |
+| **QUAL-2** | ✅ | 删除 7 处死导出/重复实现；`sidecar-transport` 改用 `isSidecarResponse`；`isAbortCause` 收敛为一份（run.ts 用 `isAbortError` 引用它） |
+| **QUAL-3** | ✅ | 删除 `read.ts` 的死变量 `imageBudget`；`tsconfig` 打开 `noUnusedLocals`/`noUnusedParameters`（随即发现并清掉 2 处未用参数） |
+| **QUAL-6** | ✅ | `atomic.ts` 的三处 warn 文案去掉硬编码 `[ipynb-mcp] warn` 前缀，前缀由兜底 sink 负责（消除了双前缀双级别） |
+| **QUAL-7** | ✅ | 删掉恒真的 `else if (… || true)` 分支；`lastTouchedCell`（每次 op 重复 `locate()` 的线性查找）随死分支一起删除；`truncateText` 不再对同一源码算两遍；`defaultSpecName(_deps)` 改为常量 |
+| **QUAL-10** | ✅ | 修掉 5 处与代码不符/已失效的注释（`run.ts` 头、`edit.ts` "step 5"、nbformat 形状声明、`lastTouchedCell`、registry 并发说法） |
+| **SEC-1** | ✅ | 六个工具 schema 改为 **strict**：未知参数名不再被静默剥离（原状：对外声明 `additionalProperties:false`，实际静默丢弃）。代价（协议错误而非工具错误）按 D-024 登记；用例 `[SEC-1]` |
+| **SEC-2** | ✅ | `runTool` 不再把 stack 放进模型可见的 `detail`（改为 `error: name: message`），stack 经 logger 落 stderr；用例见 U24 系列 |
+| **PERF-1** | ✅ | NDJSON 分帧改分块累积：64 MiB 单行实测 **9333 ms → 1884 ms**（旧实现用 `git stash` 回放同机对比） |
+| **PERF-2** | ✅ | 图片按 base64 长度下界在解码前拒绝（省解码 + SHA-256）；`outputs.test.ts` 的边界例全绿 |
+| **PERF-3** | ✅ | `analyzeStale` 改一次线性扫描（原为每 cell 回扫 + 嵌套 `includes`）；`run.ts` 的 code-index 映射改 Map；`stale.test.ts` 11 例全绿 |
+| **ARCH-2** | ✅ | 解释器探测缓存加 TTL（成功 30s / 失败 1s）：按提示安装 ipykernel 后无需重启服务；D-022 登记 `kernel/interpreter.ts` |
+| **ARCH-3** | ✅ | 写锁键用调用方的 `options.platform`，不再读进程全局 |
+| **ARCH-5** | ✅ | `AGENTS.md` §4 的树按 `git ls-files src` 重写（补 `run.ts`/`hash.ts`/`kernel/interpreter.ts`/`fs/notebook-file.ts`/`mcp/context.ts` 等），并注明以实际结构为准 |
+| **ARCH-6** | ⚠️ 部分 | 本轮做了**风险消除**的部分：两条终态路径合并为 `abortedRunError`/`failedRunError`（ROB-8 的根因）；`runNotebook` 的其余拆分（`executeCells`/`materializeRunImages`/`computeStaleReport`）未做——属纯结构重构，AGENTS §10 禁止"顺手重构"，且当前无行为风险点 |
+| **ARCH-4/ARCH-7** | ⬜ | 未做，理由见 §三「剩余事项」：`applyEditOps`/`runNotebook` 的进一步拆分与 `shouldReturnImages` 的层次迁移都属重构，随下一次接口变更批次一起做 |
+| **DEP-2/DEP-3/DEP-6** | ✅ | `server.ts` 版本号对齐 `package.json`；`prepack` 改 `tsc -p tsconfig.json`；CI 去掉与 `packageManager` 冲突的 `version: 11` |
+| **DEP-1（文档计数）** | ✅ | COMPATIBILITY 与本文件的计数改为实测值（并注明"按文件给数字"的原因） |
+| **TST-1/TST-5/TST-6/TST-7** | ✅ | 见 CHANGELOG「Tests」段：解释器回退在 CI 上直接失败、U20 区分"环境不足"与"回归"、I9 改为可证伪断言、I12 覆盖 edit+run、`[TST-7]` 补读路径映射（**已做变异验证**） |
+| **TST-2/TST-3/TST-4** | ✅ | 已在 v2 轮完成（本报告确认）；本轮未回退 |
+| **H-2/H-3/H-5/H-6/H-7** | ✅ | `.gitattributes` 生效（0 CRLF / 0 mixed）；`scripts/` 入库；`__pycache__`、`tmp*.json` 等已 ignore；`docs/review/` 三份报告入库 |
+| **DOC-1 ~ DOC-6** | ✅ | 新增 D-022~D-031（含 D-028 的"取消信号取舍"与 D-024 的"未知参数"取舍）；README 补四条已知限制；本文件重写门禁数字 |
+
+### 0.3 v3 报告对 v2 的核查异议
+
+- **V3/A31 被标"修法有副作用"**：其副作用（写回窗口内取消丢失 detail）已按 ROB-8 修好，两条写回的信号取舍按 D-028 登记。
+- **V4/A23 被标"部分"**：按 D-031 如实登记为"不再按 pid 补刀"，理由与实测（无孤儿）写在条目里，不再声称字面实现。
 
 ## 一、第二轮（`ipynb-mcp-code-review-v2.md`，评级 C：需返工）
 
@@ -90,7 +145,8 @@
 | # | 事项 | 归属 |
 |---|---|---|
 | 1 | **E1–E9 手工端到端**（DoD 最后一项）：清单见 `docs/E2E-CHECKLIST.md`，需真实 MCP 客户端 | **boss** |
-| 2 | **CI 首次真跑**：仓库无 `git remote`，`ci.yml` 的 12 个矩阵组合从未执行；已知两处需修（unit job 不装 ipykernel 而 U20 要真 kernel——本轮已改为显式 skip，但 CI 的分工仍建议调整：integration job 也应跑 `pnpm test`） | **boss / 下一轮** |
-| 3 | **本机 venv 的 pyzmq 26.2.0 缺口**：`tests/integration/kernel.test.ts` 在本机失败（详见 `COMPATIBILITY.md`） | 环境 |
+| 2 | **CI 首次真跑**：仓库无 `git remote`，`ci.yml` 的 12 个矩阵组合从未执行。本轮已修掉两处**必然失败**的配置（pnpm 版本双重声明；integration job 未跑单测），并加了 `IPYNB_TEST_REQUIRE_VENV=1` 防止解释器回退掩盖环境问题——但结论仍以真实 runner 为准 | **boss** |
+| 3 | **本机 venv 的 pyzmq 26.2.0 缺口**：该解释器起不了 kernel（详见 `COMPATIBILITY.md`）。集成文件已能自动探测并回退，**未修改任何解释器环境**（R5） | 环境 |
 | 4 | npm 发布与 `dsh-ipynb-mcp` bundle 发布（OPEN_QUESTIONS Q5/Q6）：按默认先不发布 | **boss** |
-| 5 | SPEC v3.1 建议修订：D14 判定式量纲、R6 豁免措辞（含 artifact 默认根）、§5.8 上限公式/分帧、§5.8 的 `failedCellIndexes` 字段名、D-004 交叉引用 | 人类 / 下一轮 |
+| 5 | **结构重构类建议未做**（AGENTS §10 禁止"顺手重构"，且当前无行为风险点）：ARCH-4（`applyEditOps` 219 行）、ARCH-6 剩余部分（`executeCells`/`materializeRunImages`/`computeStaleReport` 抽取）、ARCH-7（`shouldReturnImages` 迁到 `core/outputs.ts`）。建议与下一次接口变更同批做 | 下一轮 |
+| 6 | SPEC v3.1 建议修订：D14 判定式量纲、R6 豁免措辞（含 artifact 默认根与 sidecar connection file）、§5.8 上限公式/分帧与 `failedCellIndexes` 字段名、§4.1.12 与 §4.6.3 的"未知参数"分工（D-024）、§5.2 的运行期降级语义（D-030） | 人类 / 下一轮 |

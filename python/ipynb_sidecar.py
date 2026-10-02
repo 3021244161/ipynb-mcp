@@ -146,10 +146,12 @@ def op_start_kernel(params: dict) -> dict:
     # to the CURRENT WORKING DIRECTORY when the interpreter's temp dir is
     # unusable — and the cwd is the user's notebook project when an MCP client
     # launches us via npx (review v3 DEP-1). The file carries the kernel's HMAC
-    # key, so where it lives matters.
+    # key, so where it lives matters. The kernelId comes from Node, but it is
+    # sanitized anyway: it ends up in a path.
+    safe_kernel_id = "".join(ch for ch in kernel_id if ch.isalnum() or ch in "-_") or "kernel"
     try:
         km.connection_file = os.path.join(
-            tempfile.gettempdir(), f"ipynb-mcp-{kernel_id}-{os.getpid()}.json"
+            tempfile.gettempdir(), f"ipynb-mcp-{safe_kernel_id}-{os.getpid()}.json"
         )
     except Exception as exc:  # pragma: no cover - tempdir resolution failure
         send_log("warn", f"could not pin the connection file location: {exc}")
@@ -178,8 +180,16 @@ def op_start_kernel(params: dict) -> dict:
     try:
         entry.client.wait_for_ready(timeout=60)
     except Exception as exc:
+        # shutdown() unlinks the connection file too. Without this, every
+        # FAILED start (the common case on a machine whose pyzmq is broken)
+        # left a key-bearing file behind — the probes in this repository's own
+        # test suite had accumulated 16 of them (D-023).
         entry.shutdown()
         raise RuntimeError(f"kernel did not become ready: {exc}") from exc
+    except BaseException:
+        # A crash between start_kernel and readiness must not leak either.
+        entry.remove_connection_file()
+        raise
     with KERNELS_LOCK:
         KERNELS[kernel_id] = entry
     return {"pid": entry.pid(), "kernelSpecName": kernel_spec_name, "language": language}

@@ -85,13 +85,22 @@ pnpm build            # 产出 lib/（发布用）
 
 ## 4. 仓库结构与模块铁律
 
+> **本树以 `src/` 的实际结构为准**（`git ls-files src` 可核对），与 `SPEC.md` §8 的清单有出入之处见
+> `docs/DEVIATIONS.md` D-007~D-011、D-022。
+
 ```
-src/bin.ts            参数解析、启动 stdio server、进程信号
-src/server.ts         MCP server 组装
-src/mcp/              tools/*（6 个工具）· render/*（文本投影）· run-store.ts（异步句柄）· progress.ts
-src/core/             model · parse · edit · outputs · markdown · stale · errors   ← 纯逻辑
-src/fs/               fence · atomic · backup · artifact · lock                    ← 唯一做文件 I/O 的地方
-src/kernel/           registry · transport（接口）· sidecar-transport · protocol   ← 进程与协议
+src/bin.ts                 参数解析、启动 stdio server、进程信号、退出路径
+src/server.ts              MCP server 组装（6 个工具、严格参数 schema、read-only 守卫）
+src/run.ts                 执行编排：选择器、模式矩阵、逐 cell 执行、写回、终态  ← 唯一跨层组装点（D-010）
+src/config.ts              配置解析与启动期校验（退出码 2）
+src/log.ts                 stderr 日志（R14）
+src/hash.ts                core 哈希能力的 Node 适配器（让 core 完全不 import node:*）
+src/mcp/                   context.ts（ToolContext + 值级校验）· run-store.ts（异步句柄）
+  mcp/tools/               read · edit · run · run-status · kernel · result（D24 唯一出口）
+  mcp/render/              read.ts（文本投影；nbformat 输出形状在 core，见 ARCH-1）
+src/core/                  parse · edit · outputs · markdown · stale · errors        ← 纯逻辑
+src/fs/                    fence · atomic · backup · artifact · notebook-file · markdown-targets
+src/kernel/                registry · interpreter · transport（接口）· sidecar-transport · protocol
 python/ipynb_sidecar.py
 tests/{unit,integration}
 ```
@@ -100,13 +109,13 @@ tests/{unit,integration}
 
 | 模块 | 禁止 |
 |---|---|
-| `src/core/*` | **禁止** import `node:*` 或任何 I/O；禁止时钟/随机数影响返回语义（R11） |
-| `src/fs/*` | 禁止解析 notebook 语义 |
+| `src/core/*` | **禁止** import `node:*` 或任何 I/O；禁止时钟/随机数影响返回语义（R11）；nbformat 的形状转换只能发生在这里（`parse`/`outputs`） |
+| `src/fs/*` | 禁止解析 notebook 语义（字节与 errno 是它的职责面） |
 | `src/kernel/*` | 禁止解析 notebook 结构 |
 | `src/mcp/*` | 禁止直接碰 `node:fs`；禁止解析 notebook 语义 |
-| `python/*.py` | **禁止读写任何文件**；只接收 `{code}` / `{sources}`，永不接收文件路径（R13） |
+| `python/*.py` | **禁止读写用户文件**；只接收 `{code}` / `{sources}`，永不接收用户文件路径（R13）。唯一例外是它自己 kernel 的 connection file（位置被钉在 OS 临时目录并负责清理，D-023） |
 
-可变状态只允许存在于 `src/kernel/registry.ts` 的单一 `KernelRegistry` 与 `src/mcp/run-store.ts` 的 run 表。
+可变状态只允许存在于 `src/kernel/registry.ts` 的单一 `KernelRegistry` 与 `src/mcp/run-store.ts` 的 run 表（外加 `src/kernel/interpreter.ts` 的带 TTL 探测缓存）。
 
 ---
 

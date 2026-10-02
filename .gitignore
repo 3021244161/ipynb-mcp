@@ -19,6 +19,10 @@ Thumbs.db
 .venv-test/
 tests/.venv*/
 
+# sidecar 的 Python 字节码缓存（被拉起时生成）
+__pycache__/
+*.pyc
+
 # 打包产物（README 让人类跑 `npm pack`，会在根目录产出 tgz）
 *.tgz
 
@@ -27,9 +31,11 @@ tests/.venv*/
 *.tmp-*
 *.bak
 
-# 真实 ipykernel 的 connection file（jupyter_client 默认落在 cwd 的 tmp*.json）
-# 集成测试偶发把工作目录留在仓库根时会出现，属测试痕迹而非源码
+# 真实 ipykernel 的 connection file。服务已把它钉在 OS 临时目录（D-023），
+# 这两条是兜底：jupyter_client 在临时目录不可用时仍会退回 cwd，而 cwd 在
+# `npx` 启动时就是用户的 notebook 项目目录
 tmp*.json
+ipynb-mcp-*.json
 
 # 一次性补丁脚本（历史遗留形状：patch-tmp.py，见审查 H1）
 patch-tmp*
