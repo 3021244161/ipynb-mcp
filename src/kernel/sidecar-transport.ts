@@ -30,14 +30,20 @@ export type SpawnFn = typeof spawn;
 
 /**
  * The sidecar's own worst-case budget for a cell that never becomes idle
- * (python/ipynb_sidecar.py): interrupt, wait for the interrupt to land, then
- * wait for the shell reply. A transport margin SMALLER than this makes the
- * transport give up first and rewrite the documented `exec_timeout` into
- * `kernel_died` (review v3 ROB-11).
+ * (python/ipynb_sidecar.py): interrupt, then wait for the interrupt to land.
+ * A transport margin SMALLER than this makes the transport give up first and
+ * rewrite the documented `exec_timeout` into `kernel_died` (review v3 ROB-11).
+ *
+ * There is deliberately no shell-reply term. The sidecar used to wait up to
+ * 30 s for `execute_reply` after a timeout, which is dead time by construction:
+ * the kernel is still running the cell, so the reply cannot arrive. That made
+ * the "worst case" the NORMAL case — a 3 s timeout cost 38 s on Windows, where
+ * `interrupt_kernel()` needs a console the MCP server does not have (review v4
+ * FID-6). The sidecar now returns the timeout immediately, so this budget is
+ * what actually bounds it; keep the two in sync when either side changes.
  */
 const SIDECAR_INTERRUPT_GRACE_MS = 5_000;
-const SIDECAR_SHELL_REPLY_MS = 30_000;
-const SIDECAR_WORST_CASE_MS = SIDECAR_INTERRUPT_GRACE_MS + SIDECAR_SHELL_REPLY_MS;
+const SIDECAR_WORST_CASE_MS = SIDECAR_INTERRUPT_GRACE_MS;
 
 /** How many trailing stderr lines travel with a kernel_died error. */
 const STDERR_TAIL_LINES = 20;
@@ -301,12 +307,23 @@ export class SidecarTransport implements KernelTransport {
       pending.resolve(message.result ?? {});
     } else {
       const error = message.error ?? { code: 'internal', message: 'unknown sidecar error' };
+      // A sidecar-reported failure that happens BECAUSE the child is gone
+      // (`start_kernel` is the common one) used to arrive with no detail at all:
+      // the model saw "sidecar: <message>" and had to guess whether the
+      // interpreter was missing, unusable or crashed (review v4 ROB-10 ✗).
+      // Attaching the exit facts only while the transport is DOWN keeps normal
+      // domain errors (`unknown kernel`) free of unrelated noise.
+      const detail: Record<string, string> = {};
+      if (!this.alive) {
+        if (error.detail !== undefined) {
+          detail['detail'] = error.detail;
+        }
+        Object.assign(detail, this.#failureDetail());
+      } else if (error.detail !== undefined) {
+        detail['detail'] = error.detail;
+      }
       pending.reject(
-        new IpynbError(
-          this.#mapSidecarCode(error.code),
-          `sidecar: ${error.message}`,
-          error.detail === undefined ? {} : { detail: error.detail },
-        ),
+        new IpynbError(this.#mapSidecarCode(error.code), `sidecar: ${error.message}`, detail),
       );
     }
   }
@@ -378,14 +395,20 @@ export class SidecarTransport implements KernelTransport {
    * ROB-10 — the interpreter can pass `import ipykernel` and still be unable to
    * start a kernel, and the model used to get a bare exit code).
    */
-  #failureDetail(): { sidecar_stderr: string } | { sidecar_exit: string } | Record<string, never> {
-    if (this.#stderrTail.length > 0) {
-      return { sidecar_stderr: this.#stderrTail.join('\n') };
-    }
+  #failureDetail(): Record<string, string> {
+    // BOTH halves travel together. Returning the stderr tail INSTEAD of the
+    // exit reason (the v3 shape) meant the symbolized Windows status code was
+    // computed and then discarded exactly when it mattered most — the pyzmq
+    // abort writes to stderr, so `sidecar_stderr` always won and the reviewer
+    // measured "symbolization 0% effective" (review v4 ROB-10).
+    const detail: Record<string, string> = {};
     if (this.#exitReason !== null) {
-      return { sidecar_exit: this.#exitReason };
+      detail['sidecar_exit'] = this.#exitReason;
     }
-    return {};
+    if (this.#stderrTail.length > 0) {
+      detail['sidecar_stderr'] = this.#stderrTail.join('\n');
+    }
+    return detail;
   }
 
   /** One-shot teardown shared by exit/error/stdio failures; fires onExit once. */

@@ -2,6 +2,14 @@
 // the target -> fsync the directory on POSIX. EBUSY/EPERM/EACCES on rename
 // means another process holds the file (user has it open in Jupyter/VS Code)
 // and maps to `notebook_locked`, never `internal`.
+//
+// Those same errnos are ALSO what Windows reports for a TRANSIENT sharing
+// violation between two renames onto the same target, so the rename is retried
+// for a short window before concluding "locked". Without the retry, two
+// concurrent writes to one notebook failed non-deterministically (observed as a
+// flaky `atomicWriteFile` unit test) and the model was told `notebook_locked`
+// while no process held a lock — the one error a model is told to stop and ask
+// the user about. A genuinely locked file keeps failing for the whole window.
 
 import { randomUUID } from 'node:crypto';
 import { open, readdir, rename, stat, unlink } from 'node:fs/promises';
@@ -17,7 +25,13 @@ export interface AtomicWriteDeps {
   stat(target: string): Promise<{ mode: number; mtimeMs: number } | null>;
   readdir(dir: string): Promise<string[]>;
   now(): Date;
+  /** Test seam: time source for the rename retry loop (R11 keeps it injected). */
+  sleep?(ms: number): Promise<void>;
 }
+
+/** How long a rename keeps retrying while Windows reports a sharing violation. */
+const RENAME_RETRY_WINDOW_MS = 750;
+const RENAME_RETRY_DELAYS_MS = [10, 20, 40, 80, 120, 160, 160, 160];
 
 export interface FileHandleLike {
   writeFile(data: string, encoding: 'utf8'): Promise<void>;
@@ -119,7 +133,7 @@ export async function atomicWriteFile(
     }
     throwIfAborted(options.signal);
     try {
-      await deps.rename(tmpPath, absolutePath);
+      await renameWithLockRetry(deps, tmpPath, absolutePath);
       renamed = true;
     } catch (cause) {
       if (isLockError(cause)) {
@@ -186,6 +200,32 @@ export function isLockError(cause: unknown): boolean {
         (cause as NodeJS.ErrnoException).code === 'EPERM' ||
         (cause as NodeJS.ErrnoException).code === 'EACCES'))
   );
+}
+
+/**
+ * Rename, retrying while the OS reports "busy/permission" — see the header.
+ * Exported for the unit test that pins the retry (a genuine lock must still
+ * surface as `notebook_locked`, only later).
+ */
+export async function renameWithLockRetry(
+  deps: AtomicWriteDeps,
+  from: string,
+  to: string,
+): Promise<void> {
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const deadline = Date.now() + RENAME_RETRY_WINDOW_MS;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await deps.rename(from, to);
+      return;
+    } catch (cause) {
+      const delay = RENAME_RETRY_DELAYS_MS[attempt];
+      if (!isLockError(cause) || delay === undefined || Date.now() >= deadline) {
+        throw cause;
+      }
+      await sleep(delay);
+    }
+  }
 }
 
 function isNotFound(cause: unknown): boolean {

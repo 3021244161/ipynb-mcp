@@ -27,6 +27,13 @@ export const RUN_ARGUMENTS = [
   'create_backup',
 ] as const;
 
+/**
+ * Longest accepted `cell_selector`. The parse errors echo the selector, so an
+ * unbounded string lets the caller size the response (SPEC §4.1.12's concern,
+ * applied to a string argument). 4096 is far above any real selector.
+ */
+export const MAX_SELECTOR_LENGTH = 4096;
+
 export const notebookRunDescription =
   "Execute notebook cells. mode='resume' runs only the target cells in the live kernel; 'replay' silently rebuilds state from cell 0 first; 'full' re-runs everything.";
 
@@ -53,6 +60,19 @@ export async function handleNotebookRun(
         throw new IpynbError('invalid_arguments', "invalid argument 'cell_selector': must be a string selector", {
           field: 'cell_selector',
         });
+      }
+      // SPEC §4.1.12 puts a length bound on array arguments because the response
+      // otherwise scales with the input. A selector is the same attack surface
+      // through a string: the parse error echoes the selector back, so a 10 MB
+      // selector produced a 10 MB error detail. The bound is generous next to any
+      // real selector ("0-4,7,9" is 8 characters) and is reported without
+      // echoing the value, so the failure cannot be amplified (review v4 NEW-3).
+      if (value.length > MAX_SELECTOR_LENGTH) {
+        throw new IpynbError(
+          'invalid_arguments',
+          `invalid argument 'cell_selector': selector is ${value.length} characters, the limit is ${MAX_SELECTOR_LENGTH}`,
+          { field: 'cell_selector', length: value.length, max: MAX_SELECTOR_LENGTH },
+        );
       }
       return value;
     })();

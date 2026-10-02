@@ -25,18 +25,23 @@ type Extra = RequestHandlerExtra<ServerRequest, ServerNotification>;
 
 /**
  * The SDK validates the declared shape with a NON-strict zod object, so an
- * unknown key is silently stripped before the handler runs — the advertised
- * JSON Schema even says `additionalProperties: false` while the runtime drops
- * the key instead of rejecting it (measured, review v3 SEC-1). Handing the SDK
- * a strict object restores the rejection; the zod version in use (v3) then
- * throws a plain `Error` from the handler path, so the failure arrives as a
- * protocol `invalid params` rather than an `invalid_arguments` tool result.
- * That trade is deliberate: a caller that misspells `cell_selector` gets an
- * error instead of a silent full-notebook read. SPEC §4.1.12's value-level
- * rule is unaffected — the tool layer still validates values and bounds.
+ * unknown key was silently stripped before the handler ran — the advertised
+ * JSON Schema even said `additionalProperties: false` while the runtime dropped
+ * the key instead of rejecting it (measured, review v3 SEC-1). A caller that
+ * misspelled `cell_selector` therefore read the WHOLE notebook with no error.
+ *
+ * `.passthrough()` keeps unknown keys alive so the tool layer can reject them
+ * with `invalid_arguments`, which is what SPEC §4.1.12 asks for. It also keeps
+ * the rejection REACHABLE: with a strict schema the SDK refuses first, and the
+ * tool-layer whitelist becomes dead code that no test can prove is wired
+ * (review v4 NEW-1 measured exactly that). The advertised schema still says
+ * `additionalProperties: false`, because the passthrough schema's inferred JSON
+ * Schema has always reported that — a literal reading of the schema and the
+ * runtime behaviour now agree on the outcome (rejected), which is what the
+ * caller observes.
  */
-function strict<T extends Record<string, z.ZodTypeAny>>(fields: T): z.ZodObject<T, 'strict'> {
-  return z.object(fields).strict();
+function strict<T extends Record<string, z.ZodTypeAny>>(fields: T) {
+  return z.object(fields).passthrough();
 }
 
 export function createServer(ctx: ToolContext): McpServer {
@@ -85,6 +90,8 @@ export function createServer(ctx: ToolContext): McpServer {
     'notebook_read',
     {
       description: notebookReadDescription,
+      // The tool layer enforces the argument whitelist (see the helper above);
+      // the SDK side deliberately passes unknown keys through.
       inputSchema: strict({
         path: z.string().describe('Notebook path (absolute, or relative to the server root)'),
         cell_indexes: z
@@ -117,6 +124,8 @@ export function createServer(ctx: ToolContext): McpServer {
     'notebook_edit',
     {
       description: notebookEditDescription,
+      // The tool layer enforces the argument whitelist (see the helper above);
+      // the SDK side deliberately passes unknown keys through.
       inputSchema: strict({
         path: z.string().describe('Notebook path'),
         ops: z
@@ -137,14 +146,23 @@ export function createServer(ctx: ToolContext): McpServer {
     'notebook_run',
     {
       description: notebookRunDescription,
+      // The tool layer enforces the argument whitelist (see the helper above);
+      // the SDK side deliberately passes unknown keys through.
       inputSchema: strict({
         path: z.string().describe('Notebook path'),
         cell_selector: z
           .string()
           .optional()
           .describe("Which code cells to run: 'all' (default), '3', '0-4', or a comma list like '0-4,7,9'. This is a string selector — do not pass an array."),
-        mode: z.string().optional().describe("Execution mode: 'auto' (default) | 'resume' | 'replay' | 'full'"),
-        timeout_seconds: z.number().optional().describe('Per-cell timeout in seconds (1..86400; default from server config)'),
+        // Declaring the accepted set documents it to the model instead of
+        // leaving it to prose, and `.int()` is not decoration: the tool layer
+        // validates 1..86400, which a fractional value like 0.5 passed while
+        // being meaningless as a timeout (review v4 NEW-2).
+        mode: z
+          .enum(['auto', 'resume', 'replay', 'full'])
+          .optional()
+          .describe("Execution mode: 'auto' (default) | 'resume' | 'replay' | 'full'"),
+        timeout_seconds: z.number().int().optional().describe('Per-cell timeout in seconds (1..86400; default from server config)'),
         write_outputs: z.boolean().optional().describe('Write fresh outputs back to the .ipynb. Default true'),
         clear_outputs_before: z.boolean().optional().describe("Clear target cells' outputs before running. Default true"),
         expected_content_hash: z.string().optional().describe('Optional optimistic-lock hash'),
@@ -161,6 +179,8 @@ export function createServer(ctx: ToolContext): McpServer {
     'notebook_run_status',
     {
       description: notebookRunStatusDescription,
+      // The tool layer enforces the argument whitelist (see the helper above);
+      // the SDK side deliberately passes unknown keys through.
       inputSchema: strict({
         run_id: z.string().describe('Run id returned by notebook_run'),
       }),
@@ -175,6 +195,8 @@ export function createServer(ctx: ToolContext): McpServer {
     'notebook_run_cancel',
     {
       description: notebookRunCancelDescription,
+      // The tool layer enforces the argument whitelist (see the helper above);
+      // the SDK side deliberately passes unknown keys through.
       inputSchema: strict({
         run_id: z.string().describe('Run id returned by notebook_run'),
       }),
@@ -189,6 +211,8 @@ export function createServer(ctx: ToolContext): McpServer {
     'notebook_kernel',
     {
       description: notebookKernelDescription,
+      // The tool layer enforces the argument whitelist (see the helper above);
+      // the SDK side deliberately passes unknown keys through.
       inputSchema: strict({
         action: z.string().describe("One of 'status' | 'start' | 'shutdown' | 'restart'"),
         path: z.string().optional().describe('Notebook path; required for start/shutdown/restart, ignored for status'),

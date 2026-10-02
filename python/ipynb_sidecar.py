@@ -150,9 +150,17 @@ def op_start_kernel(params: dict) -> dict:
     # sanitized anyway: it ends up in a path.
     safe_kernel_id = "".join(ch for ch in kernel_id if ch.isalnum() or ch in "-_") or "kernel"
     try:
-        km.connection_file = os.path.join(
-            tempfile.gettempdir(), f"ipynb-mcp-{safe_kernel_id}-{os.getpid()}.json"
+        # `mkstemp` creates the file atomically with mode 0600 and a name that
+        # cannot collide or be pre-created by another local user. os.path.join
+        # alone would leave a window in which a predictable name in a shared
+        # /tmp is someone else's file (review v4 SEC-TOCTOU). jupyter_client
+        # overwrites the contents, so an empty placeholder is fine.
+        fd, connection_path = tempfile.mkstemp(
+            prefix=f"ipynb-mcp-{safe_kernel_id}-{os.getpid()}-", suffix=".json"
         )
+        os.close(fd)
+        os.chmod(connection_path, 0o600)
+        km.connection_file = connection_path
     except Exception as exc:  # pragma: no cover - tempdir resolution failure
         send_log("warn", f"could not pin the connection file location: {exc}")
     if language == "python":
@@ -248,6 +256,13 @@ def op_exec_cell(params: dict) -> dict:
                     if not entry.km.is_alive():
                         send_kernel_died(kernel_id)
                         raise KernelDiedError(f"kernel died during execution: {exc}") from exc
+                # 5 s of grace for the interrupt to take effect. On Windows this
+                # is the WHOLE budget: ipykernel's interrupt needs a console
+                # event that a stdio MCP server does not have, so a slept cell
+                # ignores it and the deadline below returns "timeout" (review v4
+                # FID-6). Both outcomes are documented in README's known
+                # limitations — the shutdown that follows the timeout is what
+                # actually reclaims the CPU (SPEC §4.7 rule 6, D-025).
                 interrupt_deadline = now + 5.0
                 continue
             if interrupt_deadline is not None and now >= interrupt_deadline:
@@ -291,6 +306,22 @@ def op_exec_cell(params: dict) -> dict:
 
     execution_count = None
     reply_status = None
+    if status == "timeout":
+        # Do NOT wait for the shell reply here. The kernel is still running the
+        # cell (the interrupt did not land), so `execute_reply` cannot arrive:
+        # waiting the full 30 s budget meant a 3 s timeout cost the caller
+        # timeoutMs + 35 s of wall clock on Windows, where interrupt_kernel()
+        # needs a console the MCP server does not have (review v4 FID-6:
+        # measured 38.0 s for timeoutMs=3 s). SPEC §4.7 rule 5 says the
+        # response IS the timeout, and the detached execution's output is
+        # discarded by design, so there is nothing to wait for.
+        duration_ms = int((time.monotonic() - started) * 1000)
+        return {
+            "status": "timeout",
+            "executionCount": None,
+            "rawOutputs": [],
+            "durationMs": duration_ms,
+        }
     shell_deadline = time.monotonic() + 30
     while time.monotonic() < shell_deadline:
         try:

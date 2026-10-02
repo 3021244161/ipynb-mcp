@@ -97,7 +97,11 @@ export async function createBackup(
     try {
       await deps.unlink(path.join(dir, victim.name));
     } catch (cause) {
-      deps.onRetentionError?.(`[ipynb-mcp] warn failed to prune backup ${victim.name}: ${String(cause)}`);
+      // No `[ipynb-mcp] warn` prefix here: the sink owns the prefix and the
+      // level (review v3 QUAL-6). Keeping it produced
+      // "[ipynb-mcp] warn [ipynb-mcp] warn failed to prune ..." whenever the
+      // logger was not injected (review v4 QUAL-6 residue).
+      deps.onRetentionError?.(`failed to prune backup ${victim.name}: ${String(cause)}`);
     }
   }
   return { backupPath };
