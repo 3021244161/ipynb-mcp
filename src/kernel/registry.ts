@@ -118,6 +118,36 @@ export class KernelRegistry {
   }
 
   /**
+   * listKernels with the REAL kernel process state: transport.alive only says
+   * the sidecar is up, so kernel status queries must ask the sidecar's
+   * kernel_status op (review A18 — a killed/OOM kernel used to report
+   * alive: true until the next exec).
+   */
+  async listKernelsWithStatus(): Promise<KernelSessionInfo[]> {
+    const infos: KernelSessionInfo[] = [];
+    for (const session of Array.from(this.#sessions.values())) {
+      const base = this.#toInfo(session);
+      if (!base.alive) {
+        infos.push(base);
+        continue;
+      }
+      try {
+        const status = await session.transport.kernelStatus(session.kernelId);
+        infos.push({
+          ...base,
+          alive: status.alive,
+          executionCount: status.executionCount ?? base.executionCount,
+          pid: status.pid ?? base.pid,
+        });
+      } catch (cause) {
+        this.#logger?.warn(`kernel_status query failed for ${session.kernelId}: ${String(cause)}`);
+        infos.push({ ...base, alive: false });
+      }
+    }
+    return infos;
+  }
+
+  /**
    * Return a live kernel for the notebook, starting one when the reuse key
    * has no live session. Concurrent starts for the same key share the
    * in-flight promise (SPEC §5.3: one live kernel per key, no orphans).
@@ -275,8 +305,14 @@ export class KernelRegistry {
         session.executionCount = result.executionCount;
       }
       if (result.status === 'timeout') {
-        // Timeout kills the kernel (SPEC §4.7 rule 6).
-        await this.shutdown(notebookPath);
+        // Timeout kills the kernel (SPEC §4.7 rule 6). The timeout result is
+        // the primary outcome: a failed cleanup must not replace it (the
+        // session stays registered for shutdown_all to retry — review A30).
+        try {
+          await this.shutdown(notebookPath);
+        } catch (shutdownCause) {
+          this.#logger?.warn(`post-timeout shutdown failed for ${session.kernelId}: ${String(shutdownCause)}`);
+        }
       }
       return { result, session: this.#toInfo(session) };
     } finally {
@@ -300,12 +336,18 @@ export class KernelRegistry {
     if (session === null) {
       return;
     }
-    this.#removeSession(session);
     try {
       await session.transport.shutdownKernel(session.kernelId);
     } catch (cause) {
-      this.#logger?.warn(`kernel shutdown reported failure for ${session.kernelId}: ${String(cause)}`);
+      // Keep the session registered so a retry (or the final shutdown_all)
+      // can still reach this kernel — removing it first made the kernel
+      // invisible-but-alive (review A30).
+      this.#logger?.warn(`kernel shutdown failed for ${session.kernelId}; keeping the session for retry: ${String(cause)}`);
+      throw new IpynbError('kernel_died', `failed to shut down kernel ${session.kernelId}`, {
+        kernel_id: session.kernelId,
+      });
     }
+    this.#removeSession(session);
     this.#logger?.info(`kernel shutdown: ${session.kernelId}`);
   }
 

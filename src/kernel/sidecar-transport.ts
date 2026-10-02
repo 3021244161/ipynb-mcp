@@ -140,8 +140,10 @@ export class SidecarTransport implements KernelTransport {
     }
     try {
       await this.#request('shutdown_all', {}, 15_000);
-    } catch {
-      // Best effort: the kill path below still guarantees no orphans (R19).
+    } catch (cause) {
+      // Best effort: the kill path below still guarantees no orphans (R19),
+      // but the failure must be observable (R7).
+      this.#log?.('warn', `sidecar shutdown_all failed (kill path still guarantees no orphans): ${String(cause)}`);
     }
     await this.kill();
   }
@@ -151,7 +153,15 @@ export class SidecarTransport implements KernelTransport {
     if (this.#exited || this.#child.pid === undefined) {
       return;
     }
+    await this.#killTree();
+  }
+
+  /** Reclaim the sidecar process tree regardless of the #exited flag. */
+  async #killTree(): Promise<void> {
     const pid = this.#child.pid;
+    if (pid === undefined) {
+      return;
+    }
     if (this.#platform === 'win32') {
       await new Promise<void>((resolve) => {
         const killer = spawn('taskkill', ['/T', '/F', '/PID', String(pid)], { stdio: 'ignore' });
@@ -161,11 +171,12 @@ export class SidecarTransport implements KernelTransport {
     } else {
       try {
         process.kill(-pid, 'SIGKILL');
-      } catch {
+      } catch (groupCause) {
+        this.#log?.('warn', `process-group kill failed for sidecar ${pid}: ${String(groupCause)}`);
         try {
           this.#child.kill('SIGKILL');
-        } catch {
-          // already gone
+        } catch (childCause) {
+          this.#log?.('warn', `direct child kill failed for sidecar ${pid}: ${String(childCause)}`);
         }
       }
     }
@@ -177,11 +188,16 @@ export class SidecarTransport implements KernelTransport {
       return;
     }
     await new Promise<void>((resolve) => {
-      const timer = setTimeout(() => resolve(), timeoutMs);
-      this.#child.once('exit', () => {
+      const onExit = (): void => {
         clearTimeout(timer);
         resolve();
-      });
+      };
+      const timer = setTimeout(() => {
+        // Timeouts must not leak the once-listener onto the child (A28).
+        this.#child.removeListener('exit', onExit);
+        resolve();
+      }, timeoutMs);
+      this.#child.once('exit', onExit);
     });
   }
 

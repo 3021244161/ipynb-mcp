@@ -603,6 +603,9 @@ async function writeBackCompleted(
     backupKeep: deps.config.backupKeep,
     createBackup: req.createBackup,
     expectedContentHash: notebook.contentHash,
+    // Deliberately NOT passing req.abort.signal here: this write-back IS the
+    // abort handling (SPEC §4.8 rule 3 — completed cells are written back
+    // when a run dies), so an already-aborted signal must not block it.
     platform,
   });
   return { performed: true, backup_path: partialWrite.backupPath };

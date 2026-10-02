@@ -91,3 +91,18 @@ describe('[step2][U11] PathFence enforcement', () => {
     expectOutsideRoot(() => fence.assertInside('escape/secret.ipynb'));
   });
 });
+
+describe('[step2][A15] a relative root still fences correctly', () => {
+  it('assertInside accepts notebook paths under a "." root', () => {
+    const fence = new PathFence('.', false, process.platform);
+    const resolved = fence.assertInside('nb.ipynb');
+    // Resolved against the cwd, and recognised as inside.
+    expect(path.isAbsolute(resolved.replace(/\//g, path.sep))).toBe(true);
+    expect(fence.assertInside('./sub/nb.ipynb')).toContain('sub');
+  });
+
+  it('a relative root rejects paths outside the cwd', () => {
+    const fence = new PathFence('.', false, process.platform);
+    expectOutsideRoot(() => fence.assertInside('../outside.ipynb'));
+  });
+});

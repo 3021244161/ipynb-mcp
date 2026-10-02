@@ -55,8 +55,11 @@ export async function handleRunCancel(
       handle.abortController.abort();
       try {
         await ctx.registry.interrupt(handle.notebookPath);
-      } catch {
-        // kernel may already be gone; the abort is the authoritative signal
+      } catch (cause) {
+        // The abort is the authoritative cancellation signal; a failed
+        // interrupt only means the user's long task may keep running, which
+        // must be visible in the logs (R7, review A24).
+        ctx.logger.warn(`interrupt during cancel of ${handle.runId} failed: ${String(cause)}`);
       }
       // Give the background task a tick to observe the abort.
       await new Promise((resolve) => setTimeout(resolve, 50));

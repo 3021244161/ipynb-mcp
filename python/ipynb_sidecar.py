@@ -437,6 +437,10 @@ def main() -> int:
         worker = threading.Thread(target=handle_request, args=(request,), daemon=True)
         worker.start()
         workers.append(worker)
+        # Bound the thread table: finished workers must not accumulate for
+        # the lifetime of a long session (review A28).
+        if len(workers) > 64:
+            workers = [w for w in workers if w.is_alive()]
     # stdin closed: clean shutdown path (Node normally calls shutdown_all first).
     for worker in workers:
         worker.join(timeout=5)

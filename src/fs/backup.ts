@@ -6,11 +6,16 @@ import path from 'node:path';
 
 import type { JsonValue } from '../core/errors.js';
 
+/** COPYFILE_EXCL: fail with EEXIST instead of silently overwriting (review A29). */
+const COPYFILE_EXCL = 1;
+
 export interface BackupDeps {
-  copyFile(src: string, dest: string): Promise<void>;
+  copyFile(src: string, dest: string, flags?: number): Promise<void>;
   readdir(dir: string): Promise<string[]> | string[];
   unlink(target: string): Promise<void>;
   now(): Date;
+  /** Retention-prune failures are reported here, never thrown (review A29). */
+  onRetentionError?: (message: string) => void;
 }
 
 export interface BackupResult {
@@ -42,25 +47,51 @@ export async function createBackup(
     .sort(compareBackups);
 
   const ts = formatTimestamp(deps.now());
+  // Exclusive copy: two concurrent backups resolving the same second used to
+  // compute the same name and silently overwrite each other's content
+  // (review A29) — EEXIST now bumps the suffix and retries.
   let n = 0;
-  const taken = new Set(existingBackups.map((b) => `${b.ts}#${b.n}`));
-  while (taken.has(`${ts}#${n}`)) {
-    n += 1;
+  let backupPath: string | null = null;
+  const maxAttempts = existingBackups.length + 4;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const taken = new Set(existingBackups.map((b) => `${b.ts}#${b.n}`));
+    while (taken.has(`${ts}#${n}`)) {
+      n += 1;
+    }
+    const backupName = n === 0 ? `${stem}.${ts}.ipynb.bak` : `${stem}.${ts}-${n}.ipynb.bak`;
+    const candidate = path.join(dir, backupName);
+    try {
+      await deps.copyFile(notebookPath, candidate, COPYFILE_EXCL);
+      backupPath = candidate;
+      break;
+    } catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code === 'EEXIST') {
+        n += 1;
+        continue;
+      }
+      throw cause;
+    }
   }
-  const backupName = n === 0 ? `${stem}.${ts}.ipynb.bak` : `${stem}.${ts}-${n}.ipynb.bak`;
-  const backupPath = path.join(dir, backupName);
+  if (backupPath === null) {
+    throw new Error(`could not find a free backup name for ${notebookPath}`);
+  }
 
-  await deps.copyFile(notebookPath, backupPath);
-
-  // Rolling retention: after adding the new backup, drop the oldest beyond `keep`.
-  const allBackups = [...existingBackups, { name: backupName, ts, n }].sort(compareBackups);
+  // Rolling retention: after adding the new backup, drop the oldest beyond
+  // `keep`. Pruning is best-effort: a locked or missing OLD backup must not
+  // veto an edit whose backup already succeeded (review A29).
+  const finalName = path.basename(backupPath);
+  const allBackups = [...existingBackups, { name: finalName, ts, n }].sort(compareBackups);
   const excess = allBackups.length - keep;
   for (let i = 0; i < excess; i += 1) {
     const victim = allBackups[i];
-    if (victim === undefined) {
-      break;
+    if (victim === undefined || victim.name === finalName) {
+      continue;
     }
-    await deps.unlink(path.join(dir, victim.name));
+    try {
+      await deps.unlink(path.join(dir, victim.name));
+    } catch (cause) {
+      deps.onRetentionError?.(`[ipynb-mcp] warn failed to prune backup ${victim.name}: ${String(cause)}`);
+    }
   }
   return { backupPath };
 }

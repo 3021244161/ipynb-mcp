@@ -97,6 +97,23 @@ async function main(): Promise<number> {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.stdin.on('close', () => shutdown('stdin closed'));
 
+  // Last-resort hooks (review A23): an uncaught exception must not skip
+  // shutdown_all — POSIX sidecars run as detached process groups and would
+  // otherwise outlive this process (R19: no orphan kernels).
+  const fatal = (reason: string, cause: unknown): void => {
+    if (shuttingDown) {
+      return;
+    }
+    shuttingDown = true;
+    logger.error(`fatal: ${reason}: ${String(cause)}`);
+    void registry
+      .shutdownAll()
+      .catch(() => undefined)
+      .finally(() => process.exit(2));
+  };
+  process.on('uncaughtException', (cause) => fatal('uncaughtException', cause));
+  process.on('unhandledRejection', (cause) => fatal('unhandledRejection', cause));
+
   return 0;
 }
 

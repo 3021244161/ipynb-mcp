@@ -7,7 +7,7 @@
 // file; an existing file is never overwritten.
 
 import { createHash } from 'node:crypto';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { createWarning, type Warning } from '../core/errors.js';
@@ -112,7 +112,22 @@ export async function applyImagePolicy(
         ));
         continue;
       }
-      // EEXIST: identical content already materialized — reuse it.
+      // EEXIST: expected to be identical content, but a process death
+      // mid-write leaves a truncated file that must never be served as the
+      // artifact — verify the length and rewrite when it mismatches
+      // (review A26).
+      try {
+        const existing = await stat(artifactPath);
+        if (existing.size !== image.bytes.byteLength) {
+          await writeFile(artifactPath, image.bytes);
+        }
+      } catch (statCause) {
+        warnings.push(createWarning(
+          'image_materialize_failed',
+          `failed to verify existing artifact ${artifactPath}: ${String(statCause)}`,
+        ));
+        continue;
+      }
     }
     const item = items[image.outputIndex];
     if (item !== undefined && item.kind === 'image') {

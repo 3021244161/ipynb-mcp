@@ -35,9 +35,12 @@ export async function handleNotebookKernel(
     }
 
     if (action === 'status') {
+      // Live kernel process state via the sidecar's kernel_status op — the
+      // session record alone cannot see an externally killed kernel (A18).
+      const kernels = await ctx.registry.listKernelsWithStatus();
       const payload: Record<string, unknown> = {
         action,
-        kernels: ctx.registry.listKernels().map(sessionInfo),
+        kernels: kernels.map(sessionInfo),
         warnings: [],
       };
       return { payload: payload as JsonValue };
@@ -62,8 +65,8 @@ export async function handleNotebookKernel(
             handle.state = 'failed';
             handle.error = { code: 'kernel_died', message: 'kernel was shut down or restarted while the run was in flight' };
           }
-          void ctx.registry.interrupt(absolutePath).catch(() => {
-            // kernel already gone
+          void ctx.registry.interrupt(absolutePath).catch((cause: unknown) => {
+            ctx.logger.warn(`interrupt during ${action} of ${absolutePath} failed: ${String(cause)}`);
           });
         }
       }

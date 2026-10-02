@@ -30,12 +30,17 @@ export class PathFence {
     platform: NodeJS.Platform,
     deps: FenceDeps = DEFAULT_DEPS,
   ) {
-    this.#root = root;
+    // A relative --root ('.', 'notebooks') must be anchored before any
+    // comparison: resolve() produces absolute paths, so an unresolved '.'
+    // root would reject EVERY request as path_outside_root (review A15 —
+    // fail-closed but "the plugin is unusable" instead of "fix the flag").
+    const absoluteRoot = path.resolve(root);
+    this.#root = absoluteRoot;
     this.#allowOutside = allowOutsideRoot;
     this.#platform = platform;
     this.#deps = deps;
-    this.#rootNorm = normalizeForCompare(toPosix(root), platform);
-    this.#rootRealNorm = this.#realpathOrSelf(root);
+    this.#rootNorm = normalizeForCompare(toPosix(absoluteRoot), platform);
+    this.#rootRealNorm = this.#realpathOrSelf(absoluteRoot);
   }
 
   /** Resolve an input path (absolute, or relative to root) to an absolute path with `/` separators. */

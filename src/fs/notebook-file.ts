@@ -50,7 +50,37 @@ export interface WriteResult {
   readonly serialized: string;
 }
 
+/**
+ * In-process per-path write mutex (review A17): the hash recheck and the
+ * rename are individually correct but not atomic together — two concurrent
+ * edits could both pass the recheck and the later rename silently dropped
+ * the earlier one. Serialising the whole recheck->serialize->backup->rename
+ * window per absolute path closes that TOCTOU within this process.
+ */
+const writeLocks = new Map<string, Promise<unknown>>();
+
+async function withPathLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const prev = writeLocks.get(key) ?? Promise.resolve();
+  const next = prev.then(fn, fn);
+  writeLocks.set(key, next.catch(() => undefined));
+  try {
+    return await next;
+  } finally {
+    if (writeLocks.get(key) === next.catch(() => undefined)) {
+      writeLocks.delete(key);
+    }
+  }
+}
+
 export async function writeNotebookFile(
+  notebook: NotebookFile,
+  absolutePath: string,
+  options: WriteOptions,
+): Promise<WriteResult> {
+  return withPathLock(absolutePath, () => writeNotebookFileUnlocked(notebook, absolutePath, options));
+}
+
+async function writeNotebookFileUnlocked(
   notebook: NotebookFile,
   absolutePath: string,
   options: WriteOptions,
@@ -87,10 +117,11 @@ export async function writeNotebookFile(
   if (options.createBackup) {
     try {
       const result = await createBackup(absolutePath, options.backupKeep, {
-        copyFile: (src, dest) => copyFile(src, dest),
+        copyFile: (src, dest, flags) => copyFile(src, dest, flags),
         readdir: (dir) => readdir(dir),
         unlink: (target) => unlink(target),
         now: options.now ?? (() => new Date()),
+        onRetentionError: (message) => options.onCleanupError?.(message),
       });
       backupPath = result.backupPath;
     } catch (cause) {

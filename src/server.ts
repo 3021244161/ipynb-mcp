@@ -9,7 +9,7 @@ import { z } from 'zod';
 
 import { IpynbError } from './core/errors.js';
 import type { ToolContext } from './mcp/context.js';
-import { toCallToolResult, type ToolOutcome } from './mcp/tools/result.js';
+import { runTool, toCallToolResult, type ToolOutcome } from './mcp/tools/result.js';
 import { handleNotebookRead, notebookReadDescription } from './mcp/tools/read.js';
 import { handleNotebookEdit, notebookEditDescription } from './mcp/tools/edit.js';
 import { handleNotebookRun, notebookRunDescription, type RunToolHooks } from './mcp/tools/run.js';
@@ -28,7 +28,10 @@ export function createServer(ctx: ToolContext): McpServer {
 
   const wrap = (action: (args: Record<string, unknown>, extra: Extra) => Promise<ToolOutcome>) => {
     return async (rawArgs: Record<string, unknown>, extra: Extra): Promise<CallToolResult> => {
-      const outcome = await action(rawArgs, extra);
+      // runTool is idempotent (catch -> toolFailure); wrapping the action here
+      // keeps pre-handler throws (read_only_mode guard) inside the structured
+      // isError result instead of surfacing as protocol errors (review A19).
+      const outcome = await runTool(() => action(rawArgs, extra));
       return toCallToolResult(outcome);
     };
   };
@@ -50,8 +53,10 @@ export function createServer(ctx: ToolContext): McpServer {
               message: event.phase,
             },
           })
-          .catch(() => {
-            // notification failures must never fail the run
+          .catch((cause: unknown) => {
+            // Notification failures must never fail the run, but a stuck
+            // client progress bar should be diagnosable (R7, review A24).
+            ctx.logger.warn(`progress notification failed: ${String(cause)}`);
           });
       },
       signal: extra.signal,

@@ -73,8 +73,8 @@ export async function handleNotebookRun(
     // Client cancellation interrupts the in-flight cell immediately (SPEC §4.6.2).
     if (hooks?.signal !== undefined && !hooks.signal.aborted) {
       hooks.signal.addEventListener('abort', () => {
-        void ctx.registry.interrupt(absolutePath).catch(() => {
-          // kernel may already be gone
+        void ctx.registry.interrupt(absolutePath).catch((cause: unknown) => {
+          ctx.logger.warn(`client-cancel interrupt failed for ${absolutePath}: ${String(cause)}`);
         });
       });
     }
@@ -186,6 +186,15 @@ async function executeBackgroundRun(
     handle.state = 'completed';
   } catch (cause) {
     const error = cause instanceof IpynbError ? cause : new IpynbError('internal', String(cause));
+    // Surface the executed cells from the error detail so a failed run's
+    // status still reports what actually ran (review D4/I16).
+    if (error.detail !== undefined && typeof error.detail === 'object' && error.detail !== null) {
+      const detail = error.detail as Record<string, unknown>;
+      const executed = detail['executed'];
+      if (Array.isArray(executed)) {
+        handle.executed = executed as typeof handle.executed;
+      }
+    }
     // The run-store marker is authoritative: restart/shutdown mark
     // kernel_died even though the cooperative abort raised 'cancelled'
     // (the reason was fixed when the run started).

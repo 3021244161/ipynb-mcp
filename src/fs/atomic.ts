@@ -4,7 +4,7 @@
 // and maps to `notebook_locked`, never `internal`.
 
 import { randomUUID } from 'node:crypto';
-import { open, rename, unlink } from 'node:fs/promises';
+import { open, readdir, rename, stat, unlink } from 'node:fs/promises';
 import path from 'node:path';
 
 import { IpynbError } from '../core/errors.js';
@@ -14,6 +14,9 @@ export interface AtomicWriteDeps {
   rename(from: string, to: string): Promise<void>;
   unlink(target: string): Promise<void>;
   fsyncDir(dirPath: string): Promise<void>;
+  stat(target: string): Promise<{ mode: number; mtimeMs: number } | null>;
+  readdir(dir: string): Promise<string[]>;
+  now(): Date;
 }
 
 export interface FileHandleLike {
@@ -27,7 +30,51 @@ const DEFAULT_DEPS: AtomicWriteDeps = {
   rename,
   unlink,
   fsyncDir: defaultFsyncDir,
+  stat: async (target) => {
+    try {
+      return await stat(target);
+    } catch {
+      return null;
+    }
+  },
+  readdir: (dir) => readdir(dir),
+  now: () => new Date(),
 };
+
+/** Stale temp files (hard-killed writes) older than this are pruned (review A25). */
+const TMP_RETENTION_MS = 60 * 60 * 1000;
+
+async function pruneStaleTempFiles(
+  deps: AtomicWriteDeps,
+  dir: string,
+  base: string,
+  onWarn?: (message: string) => void,
+): Promise<void> {
+  // A SIGKILL between open and rename leaves .<name>.tmp-<uuid> behind
+  // forever; sweep entries for THIS notebook older than the retention
+  // window before writing (review A25 — net result must stay "backups and
+  // artifacts only" in the user's repo).
+  let entries: string[];
+  try {
+    entries = await deps.readdir(dir);
+  } catch {
+    return;
+  }
+  const prefix = `.${base}.tmp-`;
+  for (const entry of entries) {
+    if (!entry.startsWith(prefix)) {
+      continue;
+    }
+    try {
+      const info = await deps.stat(path.join(dir, entry));
+      if (info !== null && deps.now().getTime() - info.mtimeMs > TMP_RETENTION_MS) {
+        await deps.unlink(path.join(dir, entry));
+      }
+    } catch (cause) {
+      onWarn?.(`[ipynb-mcp] warn failed to prune stale temp file ${entry}: ${String(cause)}`);
+    }
+  }
+}
 
 export interface AtomicWriteOptions {
   /** Aborting before rename discards the temp file and leaves the target untouched (SPEC §4.6.2). */
@@ -50,10 +97,16 @@ export async function atomicWriteFile(
   const base = path.basename(absolutePath);
   // SPEC D12: temp file named `.<name>.tmp-<uuid>` in the same directory.
   const tmpPath = path.join(dir, `.${base}.tmp-${randomUUID()}`);
+  // rename replaces the target inode, so the temp file must carry the
+  // ORIGINAL file's permission bits — otherwise a 0600 notebook silently
+  // widens to the umask default (review A27).
+  const existingStat = await deps.stat(absolutePath);
+  const mode = existingStat !== null ? existingStat.mode & 0o777 : 0o666;
+  await pruneStaleTempFiles(deps, dir, base, options.onCleanupError);
   let renamed = false;
   try {
     throwIfAborted(options.signal);
-    const handle = await deps.open(tmpPath, 'wx', 0o666);
+    const handle = await deps.open(tmpPath, 'wx', mode);
     try {
       await handle.writeFile(content, 'utf8');
       await handle.sync();

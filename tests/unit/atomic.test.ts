@@ -53,6 +53,9 @@ describe('[step2] atomicWriteFile', () => {
         },
         unlink: (t) => import('node:fs/promises').then((m) => m.unlink(t)),
         fsyncDir: async () => undefined,
+        stat: async () => null,
+      readdir: async () => [],
+      now: () => new Date(),
       };
       const target = path.join(dir, `locked-${code}.ipynb`);
       await expect(atomicWriteFile(target, 'x', { deps })).rejects.toMatchObject({
@@ -72,6 +75,9 @@ describe('[step2] atomicWriteFile', () => {
       rename: async () => undefined,
       unlink: (t) => import('node:fs/promises').then((m) => m.unlink(t)),
       fsyncDir: async () => undefined,
+      stat: async () => null,
+      readdir: async () => [],
+      now: () => new Date(),
     };
     const wrappingDeps: AtomicWriteDeps = {
       ...deps,
@@ -101,6 +107,9 @@ describe('[step2] atomicWriteFile', () => {
       },
       unlink: (t) => import('node:fs/promises').then((m) => m.unlink(t)),
       fsyncDir: async () => undefined,
+      stat: async () => null,
+      readdir: async () => [],
+      now: () => new Date(),
     };
     await expect(atomicWriteFile(target, 'x', { deps })).rejects.toBeInstanceOf(IpynbError);
     expect(await tmpFiles()).toEqual([]);
@@ -115,6 +124,9 @@ describe('[step2] atomicWriteFile', () => {
       fsyncDir: async () => {
         fsyncCalls += 1;
       },
+      stat: async () => null,
+      readdir: async () => [],
+      now: () => new Date(),
     };
     await atomicWriteFile(path.join(dir, 'win.ipynb'), 'x', { deps, platform: 'win32' });
     expect(fsyncCalls).toBe(0);
