@@ -7,6 +7,10 @@
 > **本文档的 ✅ 只代表"代码里存在该实现 + 有对应的可复现验证"。**
 > 第一轮曾出现 3 处"标 ✅ 但代码里不存在"的虚报（第二轮 V1–V3），本表因此按此标准重写，
 > 并在每一行给出验证位置（用例名或文件）。
+>
+> **本轮门禁实测**（2026-10-02，提交 `aff0396`）：`pnpm typecheck` 0 错 / `pnpm lint` 0 警（57 文件 99 规则）/
+> 单测 **214（213 passed + 1 skipped）** / 集成 **38/38**（5 文件全绿）/ `npm pack --dry-run` 132 文件。
+> 唯一 skip 是 U20（本机无法起 kernel，已记录原因）。集成用到的解释器见 `COMPATIBILITY.md`。
 
 ---
 
@@ -48,8 +52,8 @@
 
 | # | 结论 | 修复要点 |
 |---|---|---|
-| **T1** | ✅ | I7 补"后续 run 不再 `kernel_died`"；死 sidecar 的确定性恢复由 `kernel-registry.test.ts` [R1] 覆盖 |
-| **T2** | ✅ | I10 改为"第一个 run 在 cell 1 超时后重建 kernel 的间隙里发起第二次调用"，断言第二次被拒（`kernel_busy` 或 `kernel_not_available`——两者都意味着"第一个 run 仍独占该 notebook"；删掉 `acquireRun` 后第二次会真的开始执行，用例变红） |
+| **T1** | ✅ | I7 补"后续 run 是冷启动（`mode_used === 'replay'`）"；死 sidecar 的确定性恢复由 `kernel-registry.test.ts` [R1] 覆盖。两个集成文件现在都**探测解释器能否真正起 kernel** 再决定用哪个（本机 venv 的 pyzmq 坏，否则 8 个用例会因环境变红） |
+| **T2** | ✅ | 两半分开验证：**在途重叠**由集成 I10 覆盖；**两 cell 之间的间隙**（此时没有任何在途 exec）由 `kernel-registry.test.ts` [W5] 直接断言 `acquireRun` 仍抛 `kernel_busy`——集成层无法确定性地制造那个间隙，硬做会变成竞态用例 |
 | **T3** | ✅ | `server.test.ts` 夹具改为可带**预置输出**（I16 的 cell 2–4 带 seed，未执行 cell 必须保住 seed）；I13 的 reject 分支从恒真式改为 `instanceof Error` + abort/cancel 形状；I16 断言集合不再接受 `completed` |
 | **T4** | ✅ | I18b 标题改为单 cell 可验证的说法；其余"校验先于写入"的守卫由 `tests/unit/edit-tool.test.ts` 的真写路径用例承担 |
 | **T5** | ✅ | U20 用例在无法启动 kernel 的环境下**显式 skip 并记录原因**（先起一次 kernel 探针，而不是只探测解释器是否存在），单测在无 Python / 无 ipykernel 机器上全绿 | 

@@ -26,7 +26,7 @@
 ## 已知缺口
 
 - **本机 `tests/.venv-test` 继承的 pyzmq 26.2.0 无法启动 kernel。** 现象：sidecar 一收到 `start_kernel` 就以 `0xC0000409` 退出，Python 侧打印 `Bad file descriptor (zmq …/epoll.cpp:73)`；同一台机器上 pyzmq 25.1.1 的 base anaconda 解释器一切正常。这是**解释器环境**问题，不是 ipynb-mcp 的代码问题（`ping`、`analyze` 正常，`run/server/stale/locked-file` 四个集成文件全绿）。
-  **处理方式**：`tests/integration/kernel.test.ts` 现在会在 `beforeAll` 里真正起一次 kernel 做候选择探测——venv 能起就用 venv，起不来就回退到 base 解释器并在 stderr 记录一行说明。因此该文件在两种环境下都是绿的，而"环境坏了"不会被误读成"代码坏了"。真正的修复（给测试 venv 一个能用的 pyzmq）属环境操作，未执行。
+  **处理方式**：`tests/integration/kernel.test.ts` 与 `run.test.ts` 里直接用 transport 的用例，现在会在 `beforeAll` 里**真正起一次 kernel**做候选探测——venv 能起就用 venv，起不来就回退到 base 解释器（`kernel.test.ts` 会在 stderr 记录一行说明；走 `runNotebook` 的用例本就用 SPEC §5.2 候选链，不受影响）。因此集成套件在两种环境下都全绿，"环境坏了"不会被误读成"代码坏了"。真正的修复（给测试 venv 一个能用的 pyzmq）属环境操作，未执行。
 - **`analyze-op.test.ts` 的 U20 用例在无 kernel 能力的环境下显式 skip**（记录原因），因此单测在无 Python / 无 ipykernel 的机器上仍然全绿（AGENTS §3 要求）。
 - **macOS 仅通过 unit 层验证**（SPEC §9 CI 矩阵的既定决策：macOS 不跑 integration；其 kernel 生命周期语义与 Linux 一致，unit 层覆盖其平台特有分支——路径规范化、缓存目录、`.venv/bin/python`）。
 - 集成测试在 vitest 下**按文件串行**（`fileParallelism: false`）：真实 kernel 的时序敏感用例（I16）在并行文件下不稳定，串行是准确性优先的取舍。
