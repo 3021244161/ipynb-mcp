@@ -41,6 +41,8 @@ ipynb-mcp-*.json
 patch-tmp*
 
 # 提交信息草稿（用 `git commit -F` 时产生；`git add -A` 会误收）
+# 两次都踩到了，所以把同一家族的写法一次列全
 commit-msg.txt
+msg*.txt
 
 # 注：本仓库无大体积原始数据目录；若未来引入只读数据集，须在此登记排除理由。
