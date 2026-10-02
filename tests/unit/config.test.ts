@@ -191,3 +191,29 @@ describe('[step1] validateStartupFiles (startup failures → exit 2, SPEC §5.1)
     expect(validateStartupFiles(cfg, makeFsDeps(), win32)).toEqual([]);
   });
 });
+
+describe('[step1][A16] empty environment values mean "not set"', () => {
+  it('IPYNB_PYTHON="" falls back to auto resolution, not an empty interpreter', () => {
+    const result = parseConfig([], { ...BASE_ENV, IPYNB_PYTHON: '' }, { fallbackRoot: 'C:/work' });
+    expect(result.config?.python).toBeNull();
+  });
+
+  it('IPYNB_EXEC_TIMEOUT_SECONDS="" keeps the default instead of becoming 0', () => {
+    const result = parseConfig([], { ...BASE_ENV, IPYNB_EXEC_TIMEOUT_SECONDS: '' }, { fallbackRoot: 'C:/work' });
+    expect(result.config?.execTimeoutSeconds).toBe(300);
+  });
+
+  it('IPYNB_KERNEL_IDLE_SECONDS="" keeps the default instead of becoming 0', () => {
+    const result = parseConfig([], { ...BASE_ENV, IPYNB_KERNEL_IDLE_SECONDS: '' }, { fallbackRoot: 'C:/work' });
+    expect(result.config?.kernelIdleSeconds).toBe(3600);
+  });
+});
+
+describe('[step1][A14] a relative --artifact-dir resolves to an absolute path', () => {
+  it('returns an absolute artifactDir for a relative CLI value', () => {
+    const result = parseConfig(['--artifact-dir', './artifacts'], BASE_ENV, { fallbackRoot: 'C:/work' });
+    const artifactDir = result.config?.artifactDir ?? '';
+    expect(artifactDir.startsWith('/') || /^[A-Za-z]:\//.test(artifactDir)).toBe(true);
+    expect(artifactDir.endsWith('artifacts')).toBe(true);
+  });
+});

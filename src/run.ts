@@ -115,7 +115,16 @@ export function parseCellSelector(
       });
     }
     if (piece.includes('-')) {
-      const [rawStart, rawEnd] = piece.split('-');
+      const parts = piece.split('-');
+      if (parts.length !== 2) {
+        // '1-2-3' silently truncated to 1-2 before (review A10): executing a
+        // WRONG cell set is worse than rejecting the selector.
+        throw new IpynbError('invalid_targets', `invalid range in cell_selector: ${piece}`, {
+          cell_selector: selector,
+        });
+      }
+      const rawStart = parts[0];
+      const rawEnd = parts[1];
       const start = Number(rawStart);
       const end = Number(rawEnd);
       if (!Number.isInteger(start) || !Number.isInteger(end)) {
@@ -208,8 +217,16 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
   const selected = parseCellSelector(req.cellSelector, codeCellIndexes);
   for (const index of selected) {
     const cell = notebook.cells[index];
-    if (cell === undefined || cell.cell_type !== 'code') {
-      throw new IpynbError('invalid_targets', `cell_selector points at a non-code or missing cell: ${index}`, {
+    if (cell === undefined) {
+      // Index beyond the notebook is a bounds problem, not a target-shape
+      // problem (SPEC §4.7 / §7 split, review A11).
+      throw new IpynbError('range_out_of_bounds', `cell_selector index ${index} is beyond the last cell (${notebook.cells.length - 1})`, {
+        cell_selector: req.cellSelector,
+        cell_index: index,
+      });
+    }
+    if (cell.cell_type !== 'code') {
+      throw new IpynbError('invalid_targets', `cell_selector points at a ${cell.cell_type} cell: ${index}`, {
         cell_selector: req.cellSelector,
         cell_index: index,
       });

@@ -139,7 +139,10 @@ export function applyEditOps(
   const markdownIssues: MarkdownIssue[] = [];
   const touchedCells: NotebookCell[] = [];
   const clearedOutputs = new Set<NotebookCell>();
-  let lastStructureChangeOpIndex = -1;
+  // First (not last) count-changing op: later structural ops must not reset
+  // the scan window, or index ops between two structural ops go unwarned
+  // (SPEC §4.1.9, review A8).
+  let firstStructureChangeOpIndex = -1;
   let noStableIdWarned = false;
 
   for (let opIndex = 0; opIndex < ops.length; opIndex += 1) {
@@ -223,7 +226,9 @@ export function applyEditOps(
         const cell = createCell(cellType, source, options.nbformatMinor, notebook);
         notebook.cells.splice(atIndex, 0, cell);
         trackCell(touchedCells, cell);
-        lastStructureChangeOpIndex = opIndex;
+        if (firstStructureChangeOpIndex < 0) {
+          firstStructureChangeOpIndex = opIndex;
+        }
         trackMarkdownWrite(cell, kind, options, markdownIssues, opIndex, warnings);
         break;
       }
@@ -231,7 +236,9 @@ export function applyEditOps(
         const cell = locate(notebook, raw, opIndex);
         checkAnchorsHashOrText(notebook, cell, raw, options, opIndex);
         notebook.cells.splice(notebook.cells.indexOf(cell), 1);
-        lastStructureChangeOpIndex = opIndex;
+        if (firstStructureChangeOpIndex < 0) {
+          firstStructureChangeOpIndex = opIndex;
+        }
         break;
       }
       case 'move_cell': {
@@ -275,6 +282,11 @@ export function applyEditOps(
       }
       case 'clear_outputs': {
         const cell = locate(notebook, raw, opIndex);
+        if (cell.cell_type !== 'code') {
+          // markdown/raw cells have no outputs (SPEC §5.5.6): writing
+          // cell.outputs on them would corrupt the nbformat (review A9).
+          throw invalidOps(opIndex, kind, `clear_outputs requires a code cell (cell ${notebook.cells.indexOf(cell)} is ${cell.cell_type})`);
+        }
         // Anchors are optional extra checks here (SPEC §4.5 matrix).
         checkOptionalHashAnchor(notebook, cell, raw, options, opIndex);
         const text = readStringField(raw, 'expected_text', opIndex);
@@ -307,13 +319,13 @@ export function applyEditOps(
   }
 
   // index_shifted: a count-changing op followed by an op using cell_index (SPEC §4.1.9).
-  if (lastStructureChangeOpIndex >= 0) {
-    for (let i = lastStructureChangeOpIndex + 1; i < ops.length; i += 1) {
+  if (firstStructureChangeOpIndex >= 0) {
+    for (let i = firstStructureChangeOpIndex + 1; i < ops.length; i += 1) {
       const raw = ops[i] ?? {};
       if (raw['cell_index'] !== undefined) {
         pushOnce(warnings, createWarning(
           'index_shifted',
-          `cell indexes in later ops refer to the model after earlier insert/delete ops (first at op ${lastStructureChangeOpIndex})`,
+          `cell indexes in later ops refer to the model after earlier insert/delete ops (first at op ${firstStructureChangeOpIndex})`,
         ));
         break;
       }

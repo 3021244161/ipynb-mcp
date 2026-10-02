@@ -186,6 +186,12 @@ def op_exec_cell(params: dict) -> dict:
             msg = kc.get_iopub_msg(timeout=min(wait_for, 5.0))
         except Empty:
             now = time.monotonic()
+            # A dead kernel never delivers iopub messages: poll the process
+            # state on every wake-up instead of waiting out the full timeout
+            # (review A12 — OOM-killed kernels used to hang until timeout).
+            if not entry.km.is_alive():
+                send_kernel_died(kernel_id)
+                raise KernelDiedError("kernel died during execution")
             if interrupt_deadline is None and now >= deadline:
                 if not entry.km.is_alive():
                     send_kernel_died(kernel_id)

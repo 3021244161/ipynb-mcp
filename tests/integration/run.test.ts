@@ -502,3 +502,19 @@ describe('[I10] concurrent notebook_run on the same kernel raises kernel_busy (r
     expect(outcome.executed).toHaveLength(2);
   }, 180_000);
 });
+
+describe('[A11] selector error codes split by failure kind (SPEC §4.7/§7)', () => {
+  it('an index beyond the notebook raises range_out_of_bounds', async () => {
+    const nb = await writeNb('a11.ipynb', [codeCell('x = 1', 'c0')]);
+    await expect(
+      runNotebook(request(nb, { cellSelector: '99' }), deps()),
+    ).rejects.toMatchObject({ code: 'range_out_of_bounds' });
+  });
+
+  it('a markdown target raises invalid_targets', async () => {
+    const nb = await writeNb('a11b.ipynb', [codeCell('x = 1', 'c0'), mdCell('# md', 'm1')]);
+    await expect(
+      runNotebook(request(nb, { cellSelector: '1' }), deps()),
+    ).rejects.toMatchObject({ code: 'invalid_targets' });
+  });
+});

@@ -209,3 +209,38 @@ describe('[I11] no orphan sidecar/kernel processes after shutdown', () => {
     }
   }, 120_000);
 });
+
+describe('[A12] a kernel killed mid-run fails fast with kernel_died', () => {
+  it('reports kernel_died within the iopub poll interval, not the full timeout', async () => {
+    const session = await registry.getOrCreate({
+      notebookPath,
+      interpreterPath: VENV_PY,
+      kernelSpecName: 'python3',
+      language: 'python',
+    });
+    const pid = session.pid;
+    expect(pid).not.toBeNull();
+
+    // Start a 60s cell, then kill the kernel process tree externally
+    // (simulating OOM): the sidecar must notice within its 5s iopub poll
+    // instead of holding the request until the 60s timeout.
+    const inflight = registry.execCell(notebookPath, {
+      code: 'import time\ntime.sleep(60)',
+      silent: false,
+      storeOutputs: true,
+      timeoutMs: 60_000,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    if (process.platform === 'win32') {
+      const { execFileSync } = await import('node:child_process');
+      execFileSync('taskkill', ['/T', '/F', '/PID', String(pid)], { stdio: 'ignore' });
+    } else {
+      process.kill(pid!, 'SIGKILL');
+    }
+
+    const started = Date.now();
+    await expect(inflight).rejects.toMatchObject({ code: 'kernel_died' });
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeLessThan(15_000); // << 60s timeout; poll interval is 5s
+  }, 120_000);
+});

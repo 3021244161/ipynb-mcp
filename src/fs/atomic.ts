@@ -81,8 +81,18 @@ export async function atomicWriteFile(
     throw cause;
   }
   if (platform !== 'win32') {
-    // Rename already landed; a failure here surfaces as-is (no temp to clean).
-    await deps.fsyncDir(dir);
+    // Rename already landed: the file itself is fsynced and safe. A directory
+    // fsync failure only weakens crash recovery of the directory entry, so it
+    // must NOT turn an already-successful write into a reported failure
+    // (review A13 — a "failed" edit whose file actually changed confuses the
+    // one-retry contract with a stale anchor).
+    try {
+      await deps.fsyncDir(dir);
+    } catch (cause) {
+      const sink = options.onCleanupError ?? ((message: string) => process.stderr.write(`${message}
+`));
+      sink(`[ipynb-mcp] warn directory fsync failed for ${dir}: ${String(cause)}`);
+    }
   }
 }
 

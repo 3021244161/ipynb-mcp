@@ -486,3 +486,38 @@ describe('[step4] remaining op behaviors', () => {
     expect(cellSource(notebook.cells[1]!)).toBe('b!');
   });
 });
+
+describe('[step4][A8] index_shifted survives a later structural op (SPEC §4.1.9)', () => {
+  it('warns when an index op sits BETWEEN two structural ops', () => {
+    const notebook = parseNotebook(
+      new TextEncoder().encode(notebookJson([
+        codeCell('a', 'cell-0'), codeCell('b', 'cell-1'), codeCell('c', 'cell-2'), codeCell('d', 'cell-3'),
+      ])),
+      hasher,
+    );
+    const result = apply(notebook, [
+      { op: 'insert_cell', at_index: 0, cell_type: 'code', source: 'new' },
+      // This index op is affected by the insert above, but a THIRD structural
+      // op used to reset the scan window and silence the warning.
+      { op: 'replace_lines', cell_index: 2, start_line: 1, end_line: 1, expected_text: 'b', new_text: 'b!' },
+      { op: 'insert_cell', at_index: 0, cell_type: 'code', source: 'newer' },
+    ]);
+    expect(result.warnings.map((w) => w.code)).toContain('index_shifted');
+  });
+});
+
+describe('[step4][A9] clear_outputs rejects non-code cells (SPEC §5.5.6)', () => {
+  it('throws invalid_ops for a markdown target instead of writing outputs', () => {
+    const notebook = parseNotebook(
+      new TextEncoder().encode(notebookJson([
+        { cell_type: 'markdown', id: 'md-0', metadata: {}, source: '# hi' },
+      ])),
+      hasher,
+    );
+    const err = expectError(() => apply(notebook, [{ op: 'clear_outputs', cell_index: 0 }]));
+    expect(err.code).toBe('invalid_ops');
+    expect(String((err.detail as Record<string, unknown>)['reason'])).toContain('code cell');
+    // The markdown cell is never given an outputs field.
+    expect('outputs' in (notebook.cells[0] as unknown as Record<string, unknown>)).toBe(false);
+  });
+});

@@ -224,6 +224,12 @@ function joinPath(...parts: readonly string[]): string {
   return parts.join('/').replace(/\\/g, '/');
 }
 
+import path from 'node:path';
+
+function pathResolve(target: string): string {
+  return path.resolve(target).replace(/\\/g, '/');
+}
+
 export function parseConfig(
   argv: readonly string[],
   env: EnvLike,
@@ -248,7 +254,10 @@ export function parseConfig(
       }
       continue;
     }
-    if (envRaw !== undefined) {
+    // An empty env value (VAR= in shell or .env) means "not set": treating it
+    // as a value made IPYNB_PYTHON="" an explicit empty interpreter and turned
+    // empty numbers into 0 (review A16).
+    if (envRaw !== undefined && envRaw.trim() !== '') {
       if (spec.kind === 'boolean') {
         const parsed = parseEnvBoolean(envRaw, spec.env ?? '', errors);
         if (parsed !== undefined) {
@@ -315,7 +324,9 @@ export function parseConfig(
     execTimeoutSeconds: Number(resolved['exec-timeout-seconds']),
     backgroundThresholdSeconds: Number(resolved['background-threshold-seconds']),
     backupKeep: Number(resolved['backup-keep']),
-    artifactDir: String(resolved['artifact-dir']),
+    // Explicit relative --artifact-dir values are resolved against the cwd:
+    // artifact_path is a returned field and must be absolute (SPEC §4.1.3).
+    artifactDir: pathResolve(String(resolved['artifact-dir'])),
     inlineTextChars: Number(resolved['inline-text-chars']),
     previewLines: Number(resolved['preview-lines']),
     maxImagesPerCall: Number(resolved['max-images-per-call']),
