@@ -92,8 +92,22 @@ function deps(): RunDeps {
   };
 }
 
-function codeCell(source: string, id: string): Record<string, unknown> {
-  return { cell_type: 'code', id, metadata: {}, source, outputs: [], execution_count: null };
+function codeCell(
+  source: string,
+  id: string,
+  seed?: { outputs?: unknown[]; execution_count?: number | null },
+): Record<string, unknown> {
+  // seed lets fixtures carry PRE-EXISTING outputs, so "unchanged" assertions
+  // distinguish "preserved" from "wiped" (review D1: an always-empty fixture
+  // made the A1 data-loss bug invisible to I1/I3/I5).
+  return {
+    cell_type: 'code',
+    id,
+    metadata: {},
+    source,
+    outputs: seed?.outputs ?? [],
+    execution_count: seed?.execution_count ?? null,
+  };
 }
 
 function mdCell(source: string, id: string): Record<string, unknown> {
@@ -218,8 +232,14 @@ describe('[I5] uninterruptible cell times out and kills the kernel', () => {
   it('raises exec_timeout, writes completed cells, kernel is gone', async () => {
     const nb = await writeNb('i5.ipynb', [
       codeCell('w = 1', 'c0'),
-      codeCell('import signal\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\nimport time\nwhile True: time.sleep(0.1)', 'c1'),
-      codeCell('z = 3', 'c2'),
+      // Seed pre-existing outputs on the timed-out and never-run cells: the
+      // run must never wipe them (review A1 / D1).
+      codeCell(
+        'import signal\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\nimport time\nwhile True: time.sleep(0.1)',
+        'c1',
+        { outputs: [{ output_type: 'stream', name: 'stdout', text: ['OLD-1\n'] }], execution_count: 11 },
+      ),
+      codeCell('z = 3', 'c2', { outputs: [{ output_type: 'stream', name: 'stdout', text: ['OLD-2\n'] }], execution_count: 12 }),
     ]);
     let caught: unknown;
     try {
@@ -232,15 +252,68 @@ describe('[I5] uninterruptible cell times out and kills the kernel', () => {
     expect(err.code).toBe('exec_timeout');
     expect((err.detail as Record<string, unknown>)['cell_index']).toBe(1);
 
-    // Completed cell 0 was written back; the timed-out cell was not.
+    // Completed cell 0 was written back; the timed-out cell keeps its
+    // PRE-RUN outputs (SPEC §4.8 rule 2), and the never-run cell is
+    // completely untouched (SPEC §4.7 rule 3).
     const cells = await readCells(nb);
     expect(cells[0]!['execution_count']).toBe(1);
-    expect(cells[1]!['execution_count']).toBeNull();
-    expect(cells[1]!['outputs']).toEqual([]);
+    expect(cells[1]!['execution_count']).toBe(11);
+    expect(cells[1]!['outputs']).toEqual([{ output_type: 'stream', name: 'stdout', text: ['OLD-1\n'] }]);
+    expect(cells[2]!['execution_count']).toBe(12);
+    expect(cells[2]!['outputs']).toEqual([{ output_type: 'stream', name: 'stdout', text: ['OLD-2\n'] }]);
 
     // The kernel is marked dead and closed (SPEC §4.7 rule 6).
     expect(registry.findByNotebook(nb)).toBeNull();
   }, 180_000);
+});
+
+describe('[I18] a timeout never wipes outputs of cells that did not run', () => {
+  it('preserves seeded outputs and execution_count across the failure', async () => {
+    const nb = await writeNb('i18.ipynb', [
+      codeCell(
+        'import signal\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\nimport time\nwhile True: time.sleep(0.1)',
+        'c0',
+      ),
+      codeCell('z = 3', 'c1', { outputs: [{ output_type: 'stream', name: 'stdout', text: ['PRESERVED\n'] }], execution_count: 7 }),
+    ]);
+    await expect(
+      runNotebook(request(nb, { cellSelector: 'all', timeoutSeconds: 4 }), deps()),
+    ).rejects.toMatchObject({ code: 'exec_timeout' });
+    const cells = await readCells(nb);
+    expect(cells[1]!['outputs']).toEqual([{ output_type: 'stream', name: 'stdout', text: ['PRESERVED\n'] }]);
+    expect(cells[1]!['execution_count']).toBe(7);
+  }, 120_000);
+});
+
+describe('[I18b] the executed cell re-executes over seeded outputs', () => {
+  it('clear_outputs_before=true clears only the cell about to run', async () => {
+    const nb = await writeNb('i18b.ipynb', [
+      codeCell('print("fresh")', 'c0', { outputs: [{ output_type: 'stream', name: 'stdout', text: ['STALE\n'] }], execution_count: 3 }),
+    ]);
+    const outcome = await runNotebook(request(nb, { cellSelector: 'all' }), deps());
+    expect(outcome.executed[0]!.status).toBe('ok');
+    const cells = await readCells(nb);
+    const outputs = cells[0]!['outputs'] as Array<Record<string, unknown>>;
+    expect(JSON.stringify(outputs)).toContain('fresh');
+    expect(JSON.stringify(outputs)).not.toContain('STALE');
+    expect(cells[0]!['execution_count']).toBe(1);
+  }, 120_000);
+});
+
+describe('[I-env] kernels inherit the full parent environment', () => {
+  it('PATH and HOME are visible inside executed cells (review A2)', async () => {
+    const nb = await writeNb('env.ipynb', [
+      codeCell('import os\nprint("PATH" in os.environ and os.environ["PATH"] != "")', 'c0'),
+      codeCell('import os\nprint(os.environ.get("HOME") is not None or os.environ.get("USERPROFILE") is not None)', 'c1'),
+    ]);
+    const outcome = await runNotebook(request(nb, { cellSelector: 'all' }), deps());
+    expect(outcome.executed[0]!.status).toBe('ok');
+    expect(outcome.executed[1]!.status).toBe('ok');
+    const first = outcome.executed[0]!.outputs[0]!;
+    const second = outcome.executed[1]!.outputs[0]!;
+    expect(first).toMatchObject({ kind: 'stream', text: 'True\n' });
+    expect(second).toMatchObject({ kind: 'stream', text: 'True\n' });
+  }, 120_000);
 });
 
 describe('[I6] write_outputs=false leaves the file untouched', () => {

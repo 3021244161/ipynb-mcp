@@ -197,6 +197,10 @@ export class KernelRegistry {
       spawnImpl: this.#spawnOptionsExtras.spawnImpl,
       sidecarPath: this.#spawnOptionsExtras.sidecarPath,
       platform: this.#platform,
+      // SPEC §5.8: the sidecar (and the kernels it spawns) must inherit the
+      // full parent environment — an env with only PYTHON* would strip PATH,
+      // HOME and conda vars from every executed cell.
+      env: process.env,
     });
     this.#transports.set(interpreterPath, transport);
     return transport;
@@ -214,6 +218,9 @@ export class KernelRegistry {
       });
     }
     session.busy = true;
+    // Entering an execution counts as activity: a long cell must never look
+    // idle to the reclamation timer (SPEC §5.3 "idle" semantics).
+    session.lastUsedAt = this.#now();
     try {
       const result = await session.transport.execCell({ ...params, kernelId: session.kernelId });
       session.lastUsedAt = this.#now();
@@ -357,6 +364,12 @@ export class KernelRegistry {
   async #reclaimIdle(): Promise<void> {
     const now = this.#now().getTime();
     for (const session of Array.from(this.#sessions.values())) {
+      if (session.busy) {
+        // Never reclaim a kernel mid-execution (SPEC §5.3 "idle" semantics):
+        // lastUsedAt only refreshes between cells, so a long-running cell
+        // would otherwise look idle to this timer.
+        continue;
+      }
       const idleMs = now - session.lastUsedAt.getTime();
       if (idleMs >= this.#idleSeconds * 1000) {
         this.#logger?.info(`reclaiming idle kernel ${session.kernelId} (idle ${Math.round(idleMs / 1000)}s)`);

@@ -300,16 +300,10 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
     });
   }
 
-  // ---- clear outputs before execution (in-memory model only) ----------------
-  if (req.clearOutputsBefore) {
-    for (const index of targets) {
-      const cell = notebook.cells[index]!;
-      cell.outputs = [];
-      cell.execution_count = null;
-    }
-  }
-
   // ---- execution loop --------------------------------------------------------
+  // clear_outputs_before applies per cell, immediately before that cell runs:
+  // pre-clearing the whole target set would wipe outputs of cells that never
+  // execute when a timeout/cancel interrupts the run (SPEC §4.7 rule 3).
   const executed: ExecutedCell[] = [];
   const imageBlocks: RunImageBlock[] = [];
   const executedCellsSet = new Set<number>();
@@ -321,6 +315,12 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
     }
     const cell = notebook.cells[index]!;
     deps.onProgress?.({ phase: 'cell', completed: executed.length, total: targets.length, current_cell_index: index });
+    const savedOutputs = cell.outputs;
+    const savedCount = cell.execution_count;
+    if (req.clearOutputsBefore) {
+      cell.outputs = [];
+      cell.execution_count = null;
+    }
     let result;
     try {
       result = await deps.registry.execCell(req.path, {
@@ -330,6 +330,8 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
         timeoutMs: req.timeoutSeconds * 1000,
       });
     } catch (cause) {
+      cell.outputs = savedOutputs;
+      cell.execution_count = savedCount;
       if (isAborted(req.abort)) {
         // The kernel was killed while this cell was in flight (restart/
         // shutdown raced the execution): fall through to the abort branch so
@@ -386,8 +388,10 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
     });
 
     if (result.result.status === 'timeout') {
-      // Half-finished outputs of the interrupted cell never reach the file
-      // (SPEC §4.7 rule 5 / §4.8 rule 2): stop before touching the model.
+      // Half-finished outputs of the interrupted cell never reach the file:
+      // restore the pre-run outputs instead (SPEC §4.7 rule 5 / §4.8 rule 2).
+      cell.outputs = savedOutputs;
+      cell.execution_count = savedCount;
       sawTimeout = true;
       break;
     }
@@ -401,6 +405,9 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
       cell.outputs = [...result.result.rawOutputs];
       cell.execution_count = result.result.executionCount;
       executedCellsSet.add(index);
+    } else {
+      cell.outputs = savedOutputs;
+      cell.execution_count = savedCount;
     }
     if (abortedNow) {
       break;
