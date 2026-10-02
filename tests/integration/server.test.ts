@@ -31,6 +31,7 @@ const BASE_PYTHON = process.env['IPYNB_TEST_PYTHON'] ?? (WINDOWS ? 'python' : 'p
 let workspace: string;
 let client: Client;
 let registry: KernelRegistry;
+let previousJupyterPath: string | undefined;
 let runStore: RunStore;
 
 beforeAll(async () => {
@@ -41,6 +42,9 @@ beforeAll(async () => {
   workspace = await mkdtemp(path.join(tmpdir(), 'ipynb-mcp-server-'));
   const basePython = BASE_PYTHON === 'python' || BASE_PYTHON === 'python3' ? null : BASE_PYTHON;
   const jupyterRoot = basePython !== null ? path.join(pythonPrefix(basePython), 'share', 'jupyter') : null;
+  // Save/restore so this file cannot leak the var into other test files in
+  // the same worker (review D6: env pollution made cases order-dependent).
+  previousJupyterPath = process.env['JUPYTER_PATH'];
   if (jupyterRoot !== null && existsSync(path.join(jupyterRoot, 'kernels'))) {
     process.env['JUPYTER_PATH'] = jupyterRoot;
   }
@@ -81,6 +85,12 @@ beforeAll(async () => {
 }, 180_000);
 
 afterAll(async () => {
+  // Restore the env var this file may have set (review D6).
+  if (previousJupyterPath === undefined) {
+    delete process.env['JUPYTER_PATH'];
+  } else {
+    process.env['JUPYTER_PATH'] = previousJupyterPath;
+  }
   await registry.shutdownAll();
   await rm(workspace, { recursive: true, force: true });
 }, 120_000);

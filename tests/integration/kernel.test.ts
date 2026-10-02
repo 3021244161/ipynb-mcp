@@ -28,7 +28,6 @@ const BASE_PYTHON = process.env['IPYNB_TEST_PYTHON'] ?? (WINDOWS ? 'python' : 'p
 let workspace: string;
 let notebookPath: string;
 let registry: KernelRegistry;
-let sidecarPids: number[] = [];
 
 beforeAll(async () => {
   if (!existsSync(VENV_PY)) {
@@ -73,7 +72,6 @@ function processExists(pid: number | null): boolean {
 describe('[I-smoke] sidecar transport with a real kernel', () => {
   it('pings and reports versions', async () => {
     const transport = new SidecarTransport({ interpreterPath: VENV_PY, onLog: () => undefined });
-    sidecarPids.push(transport.pid ?? -1);
     const pong = await transport.ping();
     expect(pong.pythonVersion).toMatch(/^\d+\.\d+/);
     expect(pong.jupyterClientVersion).toMatch(/^\d+/);
@@ -194,6 +192,19 @@ describe('[I-smoke] sidecar transport with a real kernel', () => {
 
 describe('[I11] no orphan sidecar/kernel processes after shutdown', () => {
   it('kills all spawned processes', async () => {
+    // Self-contained (review D6): this case spawns the processes it checks, so
+    // running it alone (vitest -t '[I11]') cannot degrade into an empty loop
+    // that passes vacuously. It also asserts the checked set is non-empty.
+    const transport = new SidecarTransport({ interpreterPath: VENV_PY, onLog: () => undefined });
+    const ownSidecarPid = transport.pid ?? -1;
+    expect(ownSidecarPid).toBeGreaterThan(0);
+    await transport.startKernel({
+      kernelId: 'i11-kernel',
+      interpreterPath: VENV_PY,
+      kernelSpecName: 'python3',
+      language: 'python',
+    });
+
     const session = await registry.getOrCreate({
       notebookPath,
       interpreterPath: VENV_PY,
@@ -202,18 +213,22 @@ describe('[I11] no orphan sidecar/kernel processes after shutdown', () => {
     });
     const pid = session.pid;
     expect(pid).not.toBeNull();
+
     await registry.shutdownAll();
+    await transport.shutdownAll();
     expect(registry.listKernels()).toEqual([]);
-    // Give the OS a moment to reap the tree.
+
+    // Give the OS a moment to reap the trees.
     await new Promise((resolve) => setTimeout(resolve, 1_500));
-    expect(processExists(pid)).toBe(false);
-    for (const sidecarPid of sidecarPids) {
-      if (sidecarPid > 0) {
-        expect(processExists(sidecarPid)).toBe(false);
-      }
+
+    const checked = [pid, ownSidecarPid].filter((value): value is number => typeof value === 'number' && value > 0);
+    expect(checked.length).toBeGreaterThanOrEqual(2); // guards the vacuous-pass shape
+    for (const candidate of checked) {
+      expect(processExists(candidate)).toBe(false);
     }
   }, 120_000);
 });
+
 
 describe('[A12] a kernel killed mid-run fails fast with kernel_died', () => {
   it('reports kernel_died within the iopub poll interval, not the full timeout', async () => {
