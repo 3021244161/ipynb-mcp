@@ -1,6 +1,8 @@
 // Read/write orchestration for notebook files: parse + hash + optimistic-lock
 // recheck + self check + backup + atomic write (SPEC §4.1.8, §5.5.5, §5.9, D12).
-// Notebook semantics live in core/parse; this module only moves bytes.
+// Notebook STRUCTURE is core/parse's business; what this module owns is the file
+// protocol around it: which errno becomes which error code (file_not_found /
+// notebook_locked / file_changed) and the ordering of backup and rename.
 
 import { copyFile, readFile, readdir, unlink } from 'node:fs/promises';
 import path from 'node:path';
@@ -17,10 +19,25 @@ import { normalizeForCompare } from '../config.js';
 import { atomicWriteFile, isLockError } from './atomic.js';
 import { createBackup } from './backup.js';
 
-export async function readNotebookFile(absolutePath: string, hasher: Hasher): Promise<NotebookFile> {
+export interface ReadFileDeps {
+  /**
+   * Byte reader. Injectable because the lock mapping below is otherwise only
+   * reachable with a real OS-level exclusive handle (Windows-only I15), and a
+   * function-body test of `translateLockError` does not prove the read path
+   * calls it (review v3 TST-7).
+   */
+  readonly readFileImpl?: (target: string) => Promise<Uint8Array>;
+}
+
+export async function readNotebookFile(
+  absolutePath: string,
+  hasher: Hasher,
+  deps: ReadFileDeps = {},
+): Promise<NotebookFile> {
+  const readBytes = deps.readFileImpl ?? readFile;
   let bytes: Uint8Array;
   try {
-    bytes = await readFile(absolutePath);
+    bytes = await readBytes(absolutePath);
   } catch (cause) {
     if (errnoCode(cause) === 'ENOENT') {
       throw new IpynbError('file_not_found', `notebook file not found: ${absolutePath}`, {
@@ -80,16 +97,23 @@ export interface WriteResult {
  * window per absolute path closes that TOCTOU within this process.
  *
  * Keys are normalised so `C:\NB.ipynb` and `c:/nb.ipynb` share one lock on
- * case-insensitive platforms (review W7).
+ * case-insensitive platforms (review W7), using the CALLER's platform rather
+ * than the global one: `options.platform` is injected for a reason, and a test
+ * running with `platform: 'linux'` on Windows must not silently inherit
+ * Windows folding (review v3 ARCH-3).
  */
 const writeLocks = new Map<string, Promise<unknown>>();
 
-function lockKey(absolutePath: string): string {
-  return normalizeForCompare(path.resolve(absolutePath), process.platform);
+function lockKey(absolutePath: string, platform: NodeJS.Platform): string {
+  return normalizeForCompare(path.resolve(absolutePath), platform);
 }
 
-async function withPathLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
-  const normalizedKey = lockKey(key);
+async function withPathLock<T>(
+  key: string,
+  platform: NodeJS.Platform,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const normalizedKey = lockKey(key, platform);
   const prev = writeLocks.get(normalizedKey) ?? Promise.resolve();
   const next = prev.then(fn, fn);
   // Store the REJECTION-SWALLOWED promise: the cleanup comparison must see the
@@ -112,7 +136,11 @@ export async function writeNotebookFile(
   absolutePath: string,
   options: WriteOptions,
 ): Promise<WriteResult> {
-  return withPathLock(absolutePath, () => writeNotebookFileUnlocked(notebook, absolutePath, options));
+  return withPathLock(
+    absolutePath,
+    options.platform ?? process.platform,
+    () => writeNotebookFileUnlocked(notebook, absolutePath, options),
+  );
 }
 
 /**

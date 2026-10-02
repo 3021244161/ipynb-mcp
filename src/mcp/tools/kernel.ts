@@ -7,8 +7,11 @@ import { readNotebookMetadata } from '../../core/parse.js';
 import { readNotebookFile } from '../../fs/notebook-file.js';
 import { resolveForNotebook } from '../../kernel/interpreter.js';
 import type { KernelSessionInfo } from '../../kernel/registry.js';
-import { requireNonEmptyString, type ToolContext } from '../context.js';
+import { rejectUnknownArguments, requireNonEmptyString, type ToolContext } from '../context.js';
 import { runTool, type ToolOutcome } from './result.js';
+
+/** Declared arguments (SPEC §4.9); anything else is a caller mistake (SEC-1). */
+export const KERNEL_ARGUMENTS = ['action', 'path'] as const;
 
 export const notebookKernelDescription =
   'Inspect or manage the kernels held for notebooks: status, start, shutdown, restart.';
@@ -18,6 +21,7 @@ export async function handleNotebookKernel(
   args: Record<string, unknown>,
 ): Promise<ToolOutcome> {
   return runTool(async () => {
+    rejectUnknownArguments(args, KERNEL_ARGUMENTS);
     const action = requireNonEmptyString(args, 'action');
     if (action !== 'status' && action !== 'start' && action !== 'shutdown' && action !== 'restart') {
       throw new IpynbError('invalid_arguments', `invalid argument 'action': must be one of status|start|shutdown|restart`, {

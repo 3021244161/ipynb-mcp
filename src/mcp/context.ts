@@ -22,8 +22,25 @@ export interface ToolContext {
   readonly platform: NodeJS.Platform;
 }
 
-export function fieldPath(fields: readonly string[]): string {
-  return fields.length === 1 ? (fields[0] ?? '') : fields.join('.');
+/** Upper bound for index-array arguments (SPEC §4.1.12 length validation). */
+export const MAX_INDEX_ARRAY_LENGTH = 1000;
+
+/**
+ * Reject arguments the tool does not declare. The SDK's zod shape silently
+ * strips unknown keys, so a caller sending `cell_selector` to `notebook_read`
+ * (the two selection argument names are deliberately different, SPEC §4.1.11)
+ * used to get a silent default-value read of the whole notebook instead of an
+ * error (review v3 SEC-1).
+ */
+export function rejectUnknownArguments(
+  args: Record<string, unknown>,
+  allowed: readonly string[],
+): void {
+  for (const key of Object.keys(args)) {
+    if (!allowed.includes(key)) {
+      throw invalidArguments(key, `unknown argument (expected one of: ${allowed.join(', ')})`);
+    }
+  }
 }
 
 export function invalidArguments(field: string, reason: string, detail?: JsonValue): IpynbError {

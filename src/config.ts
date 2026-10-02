@@ -2,6 +2,8 @@
 // Precedence: CLI args > environment variables > defaults.
 // Startup-time failures exit with code 2 (never 1 or 0) — see bin.ts.
 
+import path from 'node:path';
+
 import type { LogLevel } from './log.js';
 
 export type ImagesPolicy = 'auto' | 'never' | 'always';
@@ -236,8 +238,6 @@ export function defaultArtifactDir(platform: NodeJS.Platform, env: EnvLike): str
 function joinPath(...parts: readonly string[]): string {
   return parts.join('/').replace(/\\/g, '/');
 }
-
-import path from 'node:path';
 
 function pathResolve(target: string): string {
   return path.resolve(target).replace(/\\/g, '/');

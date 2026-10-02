@@ -1,7 +1,7 @@
 // Execution orchestration (SPEC §4.7): selector parsing, the mode matrix,
 // sequential cell execution with replay's silent prefix, output mapping and
-// the guarded write-back. This module composes core/fs/kernel pieces; it is
-// exposed to MCP tools in step 9.
+// the guarded write-back. This module composes core/fs/kernel pieces and is
+// the only cross-layer assembly point; mcp/tools/run.ts calls runNotebook.
 
 import { IpynbError, createWarning, type JsonValue, type Warning } from './core/errors.js';
 import { mapRawOutputs, type OutputItem } from './core/outputs.js';
@@ -235,10 +235,11 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
   }
 
   // ---- mode matrix (SPEC §4.7) ----------------------------------------------
-  // "Live keeper" is a real probe, not the session record: a killed kernel
+  // "Live kernel" is a real probe, not the session record: a killed kernel
   // lingers in the registry until the sidecar's next request, and choosing
   // `resume` for it would run the prefix-less path against a dead kernel.
-  const hasLiveKernel = await deps.registry.hasLiveKernel(req.path);
+  const liveKernel = await deps.registry.liveKernel(req.path);
+  const hasLiveKernel = liveKernel !== null;
   let modeUsed: ModeUsed;
   let targets = selected;
   let replayPrefix: number[] = [];
@@ -296,11 +297,12 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
   // is killed (OOM, external taskkill, restart) the cells that already finished
   // must still be written back and reported (SPEC §4.8 rule 3 / review R3).
   //
-  // A termination only counts once a cell is actually in flight. Before that,
-  // the death being reported belongs to the PREVIOUS session — the sidecar
-  // notices a killed kernel on its next request, so a stale session's death can
-  // surface while the run that replaced it is starting. Latching an abort there
-  // would fail a run that never touched a kernel.
+  // A termination only counts once a cell is actually in flight. Outside that
+  // window the run notices the missing kernel by itself — via the session check
+  // below and the `kernel_not_available` branch in the loop — which is what
+  // makes a `notebook_kernel restart` landing between two cells a terminal
+  // `kernel_died` instead of a silent continuation on the new kernel
+  // (review v3 ROB-8).
   const kernelAbort = new AbortController();
   const kernelAbortState = { cellInFlight: false };
   const unregisterKernelAbort = deps.registry.onRunAbort(req.path, () => {
@@ -308,13 +310,30 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
       kernelAbort.abort();
     }
   });
+  // ROB-1: the merged signal registers listeners on a long-lived signal; they
+  // must be detached on the normal path too, not only when abort fires.
+  const merged = combineAbortSignals(req.abort?.signal, kernelAbort.signal);
   const abort: RunRequest['abort'] = {
-    signal: combineAbortSignals(req.abort?.signal, kernelAbort.signal),
+    signal: merged.signal,
     // Without a client signal the only way this run can be aborted is the
     // kernel terminating, so that is the honest reason (SPEC §4.8 rule 1).
     reason: req.abort?.reason ?? 'kernel_died',
   };
   const effectiveReq: RunRequest = { ...req, abort };
+
+  // ---- execution loop ------------------------------------------------------
+  // clear_outputs_before applies per cell, immediately before that cell runs:
+  // pre-clearing the whole target set would wipe outputs of cells that never
+  // execute when a timeout/cancel interrupts the run (SPEC §4.7 rule 3).
+  const executed: ExecutedCell[] = [];
+  const imageBlocks: RunImageBlock[] = [];
+  const executedCellsSet = new Set<number>();
+  // Guards the failure-path write-back against running twice for one run.
+  const abortState: AbortState = { writtenBack: false };
+  // Running cursor so image_index stays unique across the whole call
+  // (SPEC §4.3), not reset per cell (review A5).
+  let imageCursor = 0;
+  let sawTimeout = false;
 
   try {
     // Ensure the kernel exists (getOrCreate is idempotent per reuse key).
@@ -326,12 +345,38 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
       // replay must rebuild state on a NEW kernel (SPEC §4.7 matrix, review A4):
       // reusing a live one would leave stale variables masking prefix failures.
       fresh: modeUsed === 'replay',
+      // The mode decision just probed this exact session; hand the answer over
+      // so getOrCreate neither probes again nor flips the mode it was chosen
+      // for if the kernel dies in between (review v3 ROB-14).
+      ...(modeUsed === 'resume' ? { knownAlive: true } : {}),
     });
 
     // Run-level lock (review A6 / SPEC §10.2 I10): a second concurrent run on
     // the same kernel raises kernel_busy instead of interleaving cells.
     const releaseRun = deps.registry.acquireRun(req.path);
     try {
+      // A `resume` promised to continue in the kernel whose state the caller
+      // already has. If that exact session was replaced between the mode probe
+      // and here (an explicit restart/shutdown landing in the gap, or a sidecar
+      // exiting), running the targets anyway would execute them on a kernel
+      // that never ran the earlier cells and write back a result that looks
+      // successful while half of it is missing (review v3 ROB-8 item 8).
+      // `replay` and `full` build their own state, so a fresh kernel is exactly
+      // what they asked for.
+      const activeSession = deps.registry.findByNotebook(req.path);
+      if (modeUsed === 'resume' && activeSession?.kernelId !== session.kernelId) {
+        throw await failedRunError(
+          'kernel_died',
+          'kernel was shut down or restarted while the run was starting',
+          executed,
+          deps,
+          abortState,
+          notebook,
+          effectiveReq,
+          platform,
+          executedCellsSet,
+        );
+      }
       deps.onProgress?.({ phase: 'start', total: targets.length });
 
       // ---- replay prefix: silent, no outputs, no counters, nothing written ------
@@ -347,20 +392,6 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
           timeoutMs: req.timeoutSeconds * 1000,
         });
       }
-
-      // ---- execution loop ------------------------------------------------------
-      // clear_outputs_before applies per cell, immediately before that cell runs:
-      // pre-clearing the whole target set would wipe outputs of cells that never
-      // execute when a timeout/cancel interrupts the run (SPEC §4.7 rule 3).
-      const executed: ExecutedCell[] = [];
-      const imageBlocks: RunImageBlock[] = [];
-      const executedCellsSet = new Set<number>();
-      // Running cursor so image_index stays unique across the whole call
-      // (SPEC §4.3), not reset per cell (review A5).
-      let imageCursor = 0;
-      let sawTimeout = false;
-      // Guards the failure-path write-back against running twice for one run.
-      const abortState: AbortState = { writtenBack: false };
 
       for (const index of targets) {
         if (isAborted(effectiveReq.abort)) {
@@ -399,11 +430,13 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
             // the abort branch so completed cells still get written back.
             break;
           }
-          if (cause instanceof IpynbError && cause.code === 'kernel_died') {
-            // The kernel died on its own (OOM, external kill, dead sidecar).
-            // With no client signal there is nothing to set isAborted(), and
-            // simply throwing here lost every cell that had already completed
-            // — the run's own record of what it did (review R3).
+          if (cause instanceof IpynbError && isKernelGone(cause)) {
+            // The kernel died on its own (OOM, external kill, dead sidecar) or
+            // was already gone before this cell could run (a restart/shutdown
+            // landing between two cells). With no client signal nothing sets
+            // isAborted(), and simply throwing here lost every cell that had
+            // already completed — the run's own record of what it did
+            // (SPEC §4.8 rule 3 / review R3, v3 ROB-8 item 7).
             throw await failedRunError(
               'kernel_died',
               cause.message,
@@ -411,7 +444,7 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
               deps,
               abortState,
               notebook,
-              req,
+              effectiveReq,
               platform,
               executedCellsSet,
             );
@@ -419,112 +452,103 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
           throw cause;
         }
         kernelAbortState.cellInFlight = false;
-      const mapped = mapRawOutputs(result.result.rawOutputs, {
-        inlineTextChars: deps.config.inlineTextChars,
-        maxImageBytes: deps.config.maxImageBytes,
-        hasher: deps.hasher,
-      });
-      // Materialize images for run results (auto policy: always for runs).
-      const returnImages = shouldReturnImages(deps.imagesPolicy, true);
-      const policyResult = await applyImagePolicy(
-        mapped.items,
-        mapped.extractedImages,
-        { returnImages, maxImages: deps.config.maxImagesPerCall, indexStart: imageCursor },
-        {
-          artifactRoot: deps.config.artifactDir,
-          notebookAbsPath: req.path,
-          cellIndex: index,
-          platform,
-          realpath: deps.realpath,
-        },
-      );
-      for (const warning of policyResult.warnings) {
-        if (!warnings.some((existing) => existing.code === warning.code)) {
-          warnings.push(warning);
+        const mapped = mapRawOutputs(result.result.rawOutputs, {
+          inlineTextChars: deps.config.inlineTextChars,
+          maxImageBytes: deps.config.maxImageBytes,
+          hasher: deps.hasher,
+        });
+        // Materialize images for run results (auto policy: always for runs).
+        const returnImages = shouldReturnImages(deps.imagesPolicy, true);
+        const policyResult = await applyImagePolicy(
+          mapped.items,
+          mapped.extractedImages,
+          { returnImages, maxImages: deps.config.maxImagesPerCall, indexStart: imageCursor },
+          {
+            artifactRoot: deps.config.artifactDir,
+            notebookAbsPath: req.path,
+            cellIndex: index,
+            platform,
+            realpath: deps.realpath,
+          },
+        );
+        for (const warning of policyResult.warnings) {
+          if (!warnings.some((existing) => existing.code === warning.code)) {
+            warnings.push(warning);
+          }
+        }
+        imageCursor += policyResult.materialized.length;
+        for (const materialized of policyResult.materialized) {
+          const image = mapped.items[materialized.outputIndex];
+          if (image === undefined || image.kind !== 'image') {
+            continue;
+          }
+          // items and rawOutputs are index-aligned (each raw output maps to
+          // exactly one item), so the base64 payload sits at the same index.
+          const rawOutput = result.result.rawOutputs[materialized.outputIndex];
+          const base64 = rawOutput?.data?.[image.media_type];
+          if (base64 !== undefined) {
+            imageBlocks.push({ data: base64, media_type: image.media_type });
+          }
+        }
+
+        executed.push({
+          cell_index: index,
+          cell_id: cell.id ?? null,
+          status: result.result.status,
+          duration_ms: result.result.durationMs,
+          execution_count: result.result.executionCount,
+          outputs: mapped.items,
+        });
+
+        if (result.result.status === 'timeout') {
+          // Half-finished outputs of the interrupted cell never reach the file:
+          // restore the pre-run outputs instead (SPEC §4.7 rule 5 / §4.8 rule 2).
+          cell.outputs = savedOutputs;
+          cell.execution_count = savedCount;
+          sawTimeout = true;
+          break;
+        }
+
+        // A cell interrupted by the abort (status error) is NOT a completed
+        // cell: its partial output never lands (SPEC §4.8 rule 2). Cells that
+        // finished cleanly (ok) still count, even if the abort raced in.
+        const abortedNow = isAborted(effectiveReq.abort);
+        const interruptedByAbort = abortedNow && result.result.status === 'error';
+        if (!interruptedByAbort) {
+          cell.outputs = [...result.result.rawOutputs];
+          cell.execution_count = result.result.executionCount;
+          executedCellsSet.add(index);
+        } else {
+          cell.outputs = savedOutputs;
+          cell.execution_count = savedCount;
+        }
+        if (abortedNow) {
+          break;
         }
       }
-      imageCursor += policyResult.materialized.length;
-      for (const materialized of policyResult.materialized) {
-        const image = mapped.items[materialized.outputIndex];
-        if (image === undefined || image.kind !== 'image') {
-          continue;
-        }
-        // items and rawOutputs are index-aligned (each raw output maps to
-        // exactly one item), so the base64 payload sits at the same index.
-        const rawOutput = result.result.rawOutputs[materialized.outputIndex];
-        const base64 = rawOutput?.data?.[image.media_type];
-        if (base64 !== undefined) {
-          imageBlocks.push({ data: base64, media_type: image.media_type });
-        }
+
+      if (sawTimeout) {
+        // Write back the cells that DID complete (SPEC §4.7 rule 5), then raise
+        // exec_timeout with the partial state in detail.
+        abortState.writtenBack = true;
+        const timeoutWriteBack = await writeBackCompleted(notebook, effectiveReq, deps, platform, executedCellsSet);
+        const timeoutCell = executed[executed.length - 1];
+        throw new IpynbError('exec_timeout', `cell execution timed out after ${req.timeoutSeconds}s (interrupt did not land)`, {
+          cell_index: timeoutCell?.cell_index ?? null,
+          completed_cells: executed.length - 1,
+          // ExecutedCell is structurally JSON-safe; the cast bridges it to the
+          // JsonValue union so failed-run status can report what actually ran.
+          executed: executed as unknown as JsonValue,
+          write_back: timeoutWriteBack,
+        });
       }
 
-      executed.push({
-        cell_index: index,
-        cell_id: cell.id ?? null,
-        status: result.result.status,
-        duration_ms: result.result.durationMs,
-        execution_count: result.result.executionCount,
-        outputs: mapped.items,
-      });
-
-      if (result.result.status === 'timeout') {
-        // Half-finished outputs of the interrupted cell never reach the file:
-        // restore the pre-run outputs instead (SPEC §4.7 rule 5 / §4.8 rule 2).
-        cell.outputs = savedOutputs;
-        cell.execution_count = savedCount;
-        sawTimeout = true;
-        break;
+      if (isAborted(effectiveReq.abort)) {
+        // Completed cells stay written; the interrupted cell never lands
+        // (SPEC §4.8). This is the ONE terminal path for both the mid-cell abort
+        // and the cancel that lands while the write-back is running (v3 ROB-8).
+        throw await abortedRunError(executed, deps, abortState, notebook, effectiveReq, platform, executedCellsSet);
       }
-
-      // A cell interrupted by the abort (status error) is NOT a completed cell:
-      // its partial output never lands (SPEC §4.8 rule 2). Cells that finished
-      // cleanly (ok) still count, even if the abort raced in afterwards.
-      const abortedNow = isAborted(effectiveReq.abort);
-      const interruptedByAbort = abortedNow && result.result.status === 'error';
-      if (!interruptedByAbort) {
-        cell.outputs = [...result.result.rawOutputs];
-        cell.execution_count = result.result.executionCount;
-        executedCellsSet.add(index);
-      } else {
-        cell.outputs = savedOutputs;
-        cell.execution_count = savedCount;
-      }
-      if (abortedNow) {
-        break;
-      }
-    }
-
-    if (sawTimeout) {
-      // Write back the cells that DID complete (SPEC §4.7 rule 5), then raise
-      // exec_timeout with the partial state in detail.
-      abortState.writtenBack = true;
-      const timeoutWriteBack = await writeBackCompleted(notebook, effectiveReq, deps, platform, executedCellsSet);
-      const timeoutCell = executed[executed.length - 1];
-      throw new IpynbError('exec_timeout', `cell execution timed out after ${req.timeoutSeconds}s (interrupt did not land)`, {
-        cell_index: timeoutCell?.cell_index ?? null,
-        completed_cells: executed.length - 1,
-        // ExecutedCell is structurally JSON-safe; the cast bridges it to the
-        // JsonValue union so failed-run status can report what actually ran.
-        executed: executed as unknown as JsonValue,
-        write_back: timeoutWriteBack,
-      });
-    }
-
-    if (isAborted(effectiveReq.abort)) {
-      // Completed cells stay written; the interrupted cell never lands (SPEC §4.8).
-      const code = effectiveReq.abort!.reason === 'kernel_died' ? 'kernel_died' : 'cancelled';
-      throw await failedRunError(
-        code,
-        `run aborted (${code})`,
-        executed,
-        deps,
-        abortState,
-        notebook,
-        effectiveReq,
-        platform,
-        executedCellsSet,
-      );
-    }
 
     if (mappedTruncated(executed)) {
       warnings.push(createWarning(
@@ -569,12 +593,18 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
         defsByCodeIndex = codeSources.map((source) => regexDefs(source));
         usesByCodeIndex = codeSources.map((source) => regexUses(source));
       }
-      // Map code-index-aligned arrays onto full cell-index space.
+      // Map code-index-aligned arrays onto full cell-index space. Built with
+      // one forward pass: the previous `codeCellIndexes.indexOf(i)` inside the
+      // loop was O(cells x code cells) (review v3 PERF-3).
+      const codePositionOf = new Map<number, number>();
+      for (const [position, cellIndex] of codeCellIndexes.entries()) {
+        codePositionOf.set(cellIndex, position);
+      }
       const defs: string[][] = [];
       const uses: string[][] = [];
       for (let i = 0; i < notebook.cells.length; i += 1) {
-        const codePosition = codeCellIndexes.indexOf(i);
-        if (codePosition >= 0) {
+        const codePosition = codePositionOf.get(i);
+        if (codePosition !== undefined) {
           defs[i] = defsByCodeIndex[codePosition] ?? [];
           uses[i] = usesByCodeIndex[codePosition] ?? [];
         } else {
@@ -625,8 +655,13 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
           onCleanupError: (message) => deps.logger?.warn(message),
         });
       } catch (cause) {
-        if (isAbortCause(cause, req.abort?.signal)) {
-          throw new IpynbError('cancelled', 'run cancelled while writing results back', {});
+        if (isAbortError(cause, effectiveReq.abort?.signal)) {
+          // A cancel that lands here (after the last cell, while the results are
+          // being written) is the same terminal state as a cancel mid-cell: the
+          // completed cells must still land and be reported. Throwing a bare
+          // `cancelled` with no detail lost them silently and made one terminal
+          // code answer with two different shapes (review v3 ROB-8).
+          throw await abortedRunError(executed, deps, abortState, notebook, effectiveReq, platform, executedCellsSet);
         }
         throw cause;
       }
@@ -657,8 +692,9 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
     };
   } finally {
     releaseRun();
-    }
+  }
   } finally {
+    merged.cleanup();
     unregisterKernelAbort();
   }
 }
@@ -669,36 +705,87 @@ function isAborted(abort: RunRequest['abort']): boolean {
   return abort?.signal.aborted === true;
 }
 
+/** Kernel failures that mean "there is no live kernel for this cell to run on". */
+function isKernelGone(cause: IpynbError): boolean {
+  return cause.code === 'kernel_died' || cause.code === 'kernel_not_available';
+}
+
+/**
+ * The ONE terminal path for a run cut short by cancellation or kernel death
+ * (SPEC §4.8 rules 1/3). Collapsing both triggers here is what guarantees the
+ * same answer whichever side of the write-back window the cancel lands on
+ * (review v3 ROB-8).
+ */
+async function abortedRunError(
+  executed: readonly ExecutedCell[],
+  deps: RunDeps,
+  abortState: AbortState,
+  notebook: NotebookFile,
+  req: RunRequest,
+  platform: NodeJS.Platform,
+  executedCellsSet: ReadonlySet<number>,
+): Promise<IpynbError> {
+  const code = req.abort!.reason === 'kernel_died' ? 'kernel_died' : 'cancelled';
+  return failedRunError(
+    code,
+    `run aborted (${code})`,
+    executed,
+    deps,
+    abortState,
+    notebook,
+    req,
+    platform,
+    executedCellsSet,
+  );
+}
+
 /**
  * Merge the client's cancellation signal with the registry's kernel-death
  * signal. A run has exactly one abort state, so both triggers must feed it
  * (review R3): completed cells are written back either way, and the terminal
  * error code comes from the reason the run was created with.
+ *
+ * Returns the detach function too: the kernel signal is long-lived (it belongs
+ * to the registry), so a listener left behind on every completed run is an
+ * unbounded leak (review v3 ROB-1).
  */
 function combineAbortSignals(
   clientSignal: AbortSignal | undefined,
   kernelSignal: AbortSignal,
-): AbortSignal {
+): { signal: AbortSignal; cleanup: () => void } {
   if (clientSignal === undefined) {
-    return kernelSignal;
+    return { signal: kernelSignal, cleanup: () => undefined };
   }
   if (clientSignal.aborted || kernelSignal.aborted) {
-    return clientSignal.aborted ? clientSignal : kernelSignal;
+    return {
+      signal: clientSignal.aborted ? clientSignal : kernelSignal,
+      cleanup: () => undefined,
+    };
   }
   const controller = new AbortController();
   const forward = (): void => controller.abort();
   // once:true so neither listener outlives the run it belongs to (review W8).
   clientSignal.addEventListener('abort', forward, { once: true });
   kernelSignal.addEventListener('abort', forward, { once: true });
-  return controller.signal;
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      // Idempotent by construction: removing a listener that already fired (and
+      // was thus already detached) is a no-op.
+      clientSignal.removeEventListener('abort', forward);
+      kernelSignal.removeEventListener('abort', forward);
+    },
+  };
 }
 
 /**
  * Did this throw come from the abort signal rather than from a real write
  * failure? atomic.ts rejects with `signal.reason` (or a plain Error('aborted'))
- * when it discards the temp file (SPEC §4.6.2).
+ * when it discards the temp file (SPEC §4.6.2). The signal must be the MERGED
+ * one: a sidecar that dies during the write aborts that but not the client's
+ * (review v3 ROB-8 item 6).
  */
-function isAbortCause(cause: unknown, signal: AbortSignal | undefined): boolean {
+function isAbortError(cause: unknown, signal: AbortSignal | undefined): boolean {
   if (signal === undefined || !signal.aborted) {
     return false;
   }

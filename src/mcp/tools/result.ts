@@ -1,8 +1,9 @@
 // Tool result helpers: single text JSON block + optional image blocks (D24).
 // IpynbError -> isError with {"code","message","detail"}; unexpected errors
-// -> internal with stack on stderr only.
+// -> internal, with the stack kept OFF the model-visible payload.
 
 import { IpynbError, type JsonValue } from '../../core/errors.js';
+import type { Logger } from '../../log.js';
 
 export type ImageBlock = { type: 'image'; data: string; mimeType: 'image/png' | 'image/jpeg' };
 
@@ -39,14 +40,24 @@ export function toCallToolResult(outcome: ToolOutcome): {
 }
 
 /** Wrap a handler so every throw becomes a structured tool failure. */
-export async function runTool(action: () => Promise<ToolOutcome>): Promise<ToolOutcome> {
+export async function runTool(
+  action: () => Promise<ToolOutcome>,
+  logger?: Logger,
+): Promise<ToolOutcome> {
   try {
     return await action();
   } catch (cause) {
     if (cause instanceof IpynbError) {
       return toolFailure(cause);
     }
-    const detail: JsonValue = { stack: cause instanceof Error ? String(cause.stack ?? cause.message) : String(cause) };
+    // The stack carries server-side source lines and absolute paths, and
+    // `detail` is model-visible: send the stack to the log, a name+message to
+    // the model (review v3 SEC-2).
+    const stack = cause instanceof Error ? String(cause.stack ?? cause.message) : String(cause);
+    logger?.warn(`unexpected internal failure: ${stack}`);
+    const detail: JsonValue = {
+      error: cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause),
+    };
     return toolFailure(new IpynbError('internal', 'unexpected internal failure', detail));
   }
 }

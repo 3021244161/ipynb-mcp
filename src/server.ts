@@ -23,6 +23,22 @@ import { handleNotebookKernel, notebookKernelDescription } from './mcp/tools/ker
 
 type Extra = RequestHandlerExtra<ServerRequest, ServerNotification>;
 
+/**
+ * The SDK validates the declared shape with a NON-strict zod object, so an
+ * unknown key is silently stripped before the handler runs — the advertised
+ * JSON Schema even says `additionalProperties: false` while the runtime drops
+ * the key instead of rejecting it (measured, review v3 SEC-1). Handing the SDK
+ * a strict object restores the rejection; the zod version in use (v3) then
+ * throws a plain `Error` from the handler path, so the failure arrives as a
+ * protocol `invalid params` rather than an `invalid_arguments` tool result.
+ * That trade is deliberate: a caller that misspells `cell_selector` gets an
+ * error instead of a silent full-notebook read. SPEC §4.1.12's value-level
+ * rule is unaffected — the tool layer still validates values and bounds.
+ */
+function strict<T extends Record<string, z.ZodTypeAny>>(fields: T): z.ZodObject<T, 'strict'> {
+  return z.object(fields).strict();
+}
+
 export function createServer(ctx: ToolContext): McpServer {
   const server = new McpServer({ name: 'ipynb-mcp', version: '0.1.0' });
 
@@ -31,7 +47,9 @@ export function createServer(ctx: ToolContext): McpServer {
       // runTool is idempotent (catch -> toolFailure); wrapping the action here
       // keeps pre-handler throws (read_only_mode guard) inside the structured
       // isError result instead of surfacing as protocol errors (review A19).
-      const outcome = await runTool(() => action(rawArgs, extra));
+      // The logger receives unexpected stacks, which stay out of the
+      // model-visible detail (review v3 SEC-2).
+      const outcome = await runTool(() => action(rawArgs, extra), ctx.logger);
       return toCallToolResult(outcome);
     };
   };
@@ -67,10 +85,14 @@ export function createServer(ctx: ToolContext): McpServer {
     'notebook_read',
     {
       description: notebookReadDescription,
-      inputSchema: {
+      inputSchema: strict({
         path: z.string().describe('Notebook path (absolute, or relative to the server root)'),
         cell_indexes: z
           .array(z.number().int())
+          // NO `.max()` here on purpose: the SDK turns a zod violation into a
+          // protocol error, while SPEC §4.1.12 wants a VALUE-level rejection as
+          // `invalid_arguments` (same split as `ops`, which is also bounded in
+          // the tool layer). The bound lives in handleNotebookRead.
           .optional()
           .describe("0-based cell indexes to read; omit for all cells. This is an integer array — do not pass a range string."),
         include_source: z
@@ -82,7 +104,7 @@ export function createServer(ctx: ToolContext): McpServer {
           .optional()
           .describe("Output detail: 'none' | 'summary' (default) | 'full'"),
         expected_content_hash: z.string().optional().describe('Optional optimistic-lock hash'),
-      },
+      }),
     },
     wrap((args, extra) => {
       assertWritableAllowed(ctx, 'notebook_read', false);
@@ -95,7 +117,7 @@ export function createServer(ctx: ToolContext): McpServer {
     'notebook_edit',
     {
       description: notebookEditDescription,
-      inputSchema: {
+      inputSchema: strict({
         path: z.string().describe('Notebook path'),
         ops: z
           .array(z.record(z.unknown()))
@@ -103,7 +125,7 @@ export function createServer(ctx: ToolContext): McpServer {
         expected_content_hash: z.string().optional().describe('Optional optimistic-lock hash'),
         dry_run: z.boolean().optional().describe('Compute everything but do not write. Default false'),
         create_backup: z.boolean().optional().describe('Default true'),
-      },
+      }),
     },
     wrap((args, extra) => {
       assertWritableAllowed(ctx, 'notebook_edit', true);
@@ -115,7 +137,7 @@ export function createServer(ctx: ToolContext): McpServer {
     'notebook_run',
     {
       description: notebookRunDescription,
-      inputSchema: {
+      inputSchema: strict({
         path: z.string().describe('Notebook path'),
         cell_selector: z
           .string()
@@ -127,7 +149,7 @@ export function createServer(ctx: ToolContext): McpServer {
         clear_outputs_before: z.boolean().optional().describe("Clear target cells' outputs before running. Default true"),
         expected_content_hash: z.string().optional().describe('Optional optimistic-lock hash'),
         create_backup: z.boolean().optional().describe('Default true'),
-      },
+      }),
     },
     wrap((args, extra) => {
       assertWritableAllowed(ctx, 'notebook_run', true);
@@ -139,9 +161,9 @@ export function createServer(ctx: ToolContext): McpServer {
     'notebook_run_status',
     {
       description: notebookRunStatusDescription,
-      inputSchema: {
+      inputSchema: strict({
         run_id: z.string().describe('Run id returned by notebook_run'),
-      },
+      }),
     },
     wrap((args) => {
       assertWritableAllowed(ctx, 'notebook_run_status', true);
@@ -153,9 +175,9 @@ export function createServer(ctx: ToolContext): McpServer {
     'notebook_run_cancel',
     {
       description: notebookRunCancelDescription,
-      inputSchema: {
+      inputSchema: strict({
         run_id: z.string().describe('Run id returned by notebook_run'),
-      },
+      }),
     },
     wrap((args) => {
       assertWritableAllowed(ctx, 'notebook_run_cancel', true);
@@ -167,10 +189,10 @@ export function createServer(ctx: ToolContext): McpServer {
     'notebook_kernel',
     {
       description: notebookKernelDescription,
-      inputSchema: {
+      inputSchema: strict({
         action: z.string().describe("One of 'status' | 'start' | 'shutdown' | 'restart'"),
         path: z.string().optional().describe('Notebook path; required for start/shutdown/restart, ignored for status'),
-      },
+      }),
     },
     wrap((args) => {
       // read-only mode only allows action 'status'; enforced in the handler.

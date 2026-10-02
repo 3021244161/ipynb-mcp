@@ -7,8 +7,11 @@ Speaks NDJSON over stdio with the Node transport:
   event   : {"event": "kernel_died"|"log", ...}
 
 Hard rules:
-  - NEVER reads or writes any file (the only writer of .ipynb files is Node);
-    jupyter_client's internal connection files are infrastructure it manages.
+  - NEVER reads or writes any USER file (the only writer of .ipynb files is
+    Node). Its own jupyter_client connection file is placed in the OS temp
+    directory (never the cwd, which is the user's project directory) and is
+    removed on every exit path this process controls — see CONNECTION_FILE_
+    DEVIATION below.
   - Only depends on jupyter_client + the standard library.
   - stdout carries protocol frames ONLY; debug output goes to stderr.
 """
@@ -16,7 +19,9 @@ Hard rules:
 from __future__ import annotations
 
 import json
+import os
 import sys
+import tempfile
 import threading
 import time
 from queue import Empty
@@ -56,6 +61,24 @@ class KernelEntry:
                 self.km.shutdown_kernel(now=True)
             except Exception as exc2:
                 send_log("warn", f"forced shutdown failed for {self.kernel_id}: {exc2}")
+        self.remove_connection_file()
+
+    def remove_connection_file(self) -> None:
+        """Delete our connection file (it carries the kernel's HMAC key).
+
+        jupyter_client only removes it inside a successful graceful shutdown, so
+        every other exit path (forced kill, host crash, protocol error) used to
+        leave it behind — in the sidecar's cwd when the interpreter's temp
+        directory is unusable, i.e. the user's project directory
+        (review v3 DEP-1 / SPEC §5.9 net-result rule).
+        """
+        path = getattr(self.km, "connection_file", None)
+        if not path:
+            return
+        try:
+            os.unlink(path)
+        except OSError:
+            pass  # already gone, or unlinkable: nothing left to do
 
 
 KERNELS: dict[str, KernelEntry] = {}
@@ -118,6 +141,18 @@ def op_start_kernel(params: dict) -> dict:
     language = params.get("language", "python")
 
     km = KernelManager(kernel_name=kernel_spec_name)
+    # Pin the connection file into the OS temp directory BEFORE start_kernel:
+    # jupyter_client's default is `tempfile.mkstemp('.json')`, which falls back
+    # to the CURRENT WORKING DIRECTORY when the interpreter's temp dir is
+    # unusable — and the cwd is the user's notebook project when an MCP client
+    # launches us via npx (review v3 DEP-1). The file carries the kernel's HMAC
+    # key, so where it lives matters.
+    try:
+        km.connection_file = os.path.join(
+            tempfile.gettempdir(), f"ipynb-mcp-{kernel_id}-{os.getpid()}.json"
+        )
+    except Exception as exc:  # pragma: no cover - tempdir resolution failure
+        send_log("warn", f"could not pin the connection file location: {exc}")
     if language == "python":
         # Run the kernel with the interpreter the Node side resolved (D23):
         # keep the spec's env/metadata but pin argv[0] to that interpreter.
@@ -446,7 +481,18 @@ def main() -> int:
     for worker in workers:
         worker.join(timeout=5)
     op_shutdown_all({})
+    _remove_leftover_connection_files()
     return 0
+
+
+def _remove_leftover_connection_files() -> None:
+    """Belt and braces for DEP-1: any kernel entry that survived shutdown_all
+    (started milliseconds ago, or already dropped from KERNELS) still gets its
+    connection file unlinked before we exit."""
+    with KERNELS_LOCK:
+        entries = list(KERNELS.values())
+    for entry in entries:
+        entry.remove_connection_file()
 
 
 if __name__ == "__main__":

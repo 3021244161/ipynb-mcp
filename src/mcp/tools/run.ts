@@ -2,7 +2,6 @@
 // handle + polling when timeout_seconds * target cells exceeds the threshold.
 
 import { IpynbError, type JsonValue } from '../../core/errors.js';
-import { cellSource } from '../../core/parse.js';
 import { readNotebookFile } from '../../fs/notebook-file.js';
 import type { ToolContext } from '../context.js';
 import {
@@ -10,10 +9,23 @@ import {
   optionalEnum,
   optionalInteger,
   optionalString,
+  rejectUnknownArguments,
   requireNonEmptyString,
 } from '../context.js';
 import { parseCellSelector, runNotebook, type RunOutcome } from '../../run.js';
 import { runTool, type ToolOutcome } from './result.js';
+
+/** Declared arguments (SPEC §4.7); anything else is a caller mistake (SEC-1). */
+export const RUN_ARGUMENTS = [
+  'path',
+  'cell_selector',
+  'mode',
+  'timeout_seconds',
+  'write_outputs',
+  'clear_outputs_before',
+  'expected_content_hash',
+  'create_backup',
+] as const;
 
 export const notebookRunDescription =
   "Execute notebook cells. mode='resume' runs only the target cells in the live kernel; 'replay' silently rebuilds state from cell 0 first; 'full' re-runs everything.";
@@ -30,6 +42,7 @@ export async function handleNotebookRun(
   hooks?: RunToolHooks,
 ): Promise<ToolOutcome> {
   return runTool(async () => {
+    rejectUnknownArguments(args, RUN_ARGUMENTS);
     const inputPath = requireNonEmptyString(args, 'path');
     const cellSelector = (() => {
       const value = args['cell_selector'];
@@ -256,5 +269,3 @@ function completedPayload(outcome: RunOutcome): JsonValue {
     content_hash_after: outcome.content_hash_after,
   } as unknown as JsonValue;
 }
-
-export { cellSource };

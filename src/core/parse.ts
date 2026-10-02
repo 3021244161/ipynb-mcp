@@ -173,3 +173,12 @@ export function readNotebookMetadata(doc: NotebookDoc): NotebookMetadataInfo {
     languageVersion: pick(languageInfo, 'version'),
   };
 }
+
+/**
+ * Whether cells carry stable ids (nbformat_minor >= 5, SPEC §4.1.11). Lives
+ * here because it is a fact about the format, not about the text projection
+ * (review v3 ARCH-1).
+ */
+export function hasStableCellIds(doc: NotebookDoc): boolean {
+  return doc.nbformat_minor >= 5;
+}

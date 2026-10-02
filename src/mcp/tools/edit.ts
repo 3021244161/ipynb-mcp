@@ -11,14 +11,20 @@ import { readNotebookFile, writeNotebookFile } from '../../fs/notebook-file.js';
 import {
   optionalBoolean,
   optionalString,
+  rejectUnknownArguments,
   requireNonEmptyString,
   requireOpsArray,
   type ToolContext,
 } from '../context.js';
 import { runTool, type ToolOutcome } from './result.js';
 
+/**
+ * Shared abort-cause check. `run.ts` used to carry a near-identical copy whose
+ * only difference was a `signal.aborted` pre-check — two implementations of one
+ * rule is a drift surface (review v3 QUAL-2).
+ */
 export function isAbortCause(cause: unknown, signal: AbortSignal | undefined): boolean {
-  if (signal === undefined) {
+  if (signal === undefined || !signal.aborted) {
     return false;
   }
   return (
@@ -26,6 +32,14 @@ export function isAbortCause(cause: unknown, signal: AbortSignal | undefined): b
     (cause instanceof Error && (cause.name === 'AbortError' || cause.message === 'aborted'))
   );
 }
+
+export const EDIT_ARGUMENTS = [
+  'path',
+  'ops',
+  'expected_content_hash',
+  'dry_run',
+  'create_backup',
+] as const;
 
 export const notebookEditDescription =
   'Edit notebook cells. Every source change requires a compare-and-swap anchor (expected_source_hash or expected_text); a mismatch fails the whole request without writing.';
@@ -36,6 +50,7 @@ export async function handleNotebookEdit(
   options?: { signal?: AbortSignal },
 ): Promise<ToolOutcome> {
   return runTool(async () => {
+    rejectUnknownArguments(args, EDIT_ARGUMENTS);
     const inputPath = requireNonEmptyString(args, 'path');
     const ops = requireOpsArray(args, 'ops');
     const expectedContentHash = optionalString(args, 'expected_content_hash');

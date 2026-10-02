@@ -41,7 +41,7 @@ export interface EditResult {
 export interface EditOptions {
   readonly hasher: Hasher;
   readonly nbformatMinor: number;
-  /** Markdown structural checker (SPEC §5.7); absent = no checking (wired in step 5). */
+  /** Markdown structural checker (SPEC §5.7); absent = no checking. */
   readonly checkMarkdown?: (source: string) => MarkdownIssue[];
 }
 
@@ -148,6 +148,11 @@ export function applyEditOps(
   for (let opIndex = 0; opIndex < ops.length; opIndex += 1) {
     const raw = ops[opIndex] ?? {};
     const kind = readOpName(raw, opIndex);
+    // The cell this op targets, resolved by the branch itself. Tracking it here
+    // instead of re-locating it afterwards also removes a second locate() per
+    // op (a linear cell_id search) and a branch that could never be reached
+    // (review v3 QUAL-7).
+    let touchedCell: NotebookCell | undefined;
     const row = MATRIX[kind];
     if (row === undefined) {
       throw invalidOps(opIndex, kind, `unknown op: ${kind}`);
@@ -172,7 +177,8 @@ export function applyEditOps(
         checkTextAnchor(notebook, cell, userAnchor, actualRangeText, 'line_text', opIndex, options);
         lines.splice(startLine - 1, endLine - startLine + 1, ...newText.split('\n'));
         setCellSource(cell, lines.join('\n'));
-        trackMarkdownWrite(cell, kind, options, markdownIssues, opIndex, warnings);
+        trackMarkdownWrite(cell, kind, options, markdownIssues);
+        touchedCell = cell;
         break;
       }
       case 'insert_lines': {
@@ -199,7 +205,8 @@ export function applyEditOps(
         }
         lines.splice(atLine - 1, 0, ...newText.split('\n'));
         setCellSource(cell, lines.join('\n'));
-        trackMarkdownWrite(cell, kind, options, markdownIssues, opIndex, warnings);
+        trackMarkdownWrite(cell, kind, options, markdownIssues);
+        touchedCell = cell;
         break;
       }
       case 'replace_source': {
@@ -209,11 +216,12 @@ export function applyEditOps(
         if (cell.cell_type === 'markdown' && newText.length > cellSource(cell).length * 1.5) {
           pushOnce(warnings, createWarning(
             'large_markdown_rewrite',
-            `markdown rewrite at cell index ${opIndexOfCell(notebook, cell)} grows the source beyond 1.5x; consider insert_lines/replace_lines instead`,
+            `markdown rewrite at cell index ${notebook.cells.indexOf(cell)} grows the source beyond 1.5x; consider insert_lines/replace_lines instead`,
           ));
         }
         setCellSource(cell, newText);
-        trackMarkdownWrite(cell, kind, options, markdownIssues, opIndex, warnings);
+        trackMarkdownWrite(cell, kind, options, markdownIssues);
+        touchedCell = cell;
         break;
       }
       case 'insert_cell': {
@@ -229,7 +237,8 @@ export function applyEditOps(
         if (firstStructureChangeOpIndex < 0) {
           firstStructureChangeOpIndex = opIndex;
         }
-        trackMarkdownWrite(cell, kind, options, markdownIssues, opIndex, warnings);
+        trackMarkdownWrite(cell, kind, options, markdownIssues);
+        touchedCell = cell;
         break;
       }
       case 'delete_cell': {
@@ -277,7 +286,8 @@ export function applyEditOps(
             cell.execution_count = null;
           }
         }
-        trackMarkdownWrite(cell, kind, options, markdownIssues, opIndex, warnings);
+        trackMarkdownWrite(cell, kind, options, markdownIssues);
+        touchedCell = cell;
         break;
       }
       case 'clear_outputs': {
@@ -295,6 +305,7 @@ export function applyEditOps(
         }
         cell.outputs = [];
         clearedOutputs.add(cell);
+        touchedCell = cell;
         break;
       }
       default: {
@@ -310,11 +321,8 @@ export function applyEditOps(
       ));
     }
 
-    if (kind !== 'delete_cell' && kind !== 'insert_cell' && kind !== 'move_cell') {
-      const cell = lastTouchedCell(notebook, raw, kind, opIndex);
-      if (cell !== undefined) {
-        trackCell(touchedCells, cell);
-      }
+    if (touchedCell !== undefined) {
+      trackCell(touchedCells, touchedCell);
     }
   }
 
@@ -395,7 +403,7 @@ function validateMatrix(raw: EditOpInput, row: OpMatrixRow, opIndex: number, kin
   // Defensive type narrowing (schema-level typing happens at the tool layer;
   // anything malformed that slips through is a matrix violation, not internal).
   for (const [field, value] of Object.entries(raw)) {
-    const expected = fieldType(kind, field);
+    const expected = fieldType(field);
     if (expected === 'string' && typeof value !== 'string') {
       throw invalidOps(opIndex, kind, `field ${field} must be a string`);
     }
@@ -408,7 +416,7 @@ function validateMatrix(raw: EditOpInput, row: OpMatrixRow, opIndex: number, kin
   }
 }
 
-function fieldType(kind: string, field: string): 'string' | 'integer' | 'cell_type' | 'ignored' {
+function fieldType(field: string): 'string' | 'integer' | 'cell_type' | 'ignored' {
   switch (field) {
     case 'op':
       return 'ignored';
@@ -489,13 +497,6 @@ function locate(notebook: NotebookFile, raw: EditOpInput, opIndex: number): Note
   return cell;
 }
 
-function lastTouchedCell(notebook: NotebookFile, raw: EditOpInput, kind: string, opIndex: number): NotebookCell | undefined {
-  if (kind === 'insert_cell') {
-    return undefined;
-  }
-  return locate(notebook, raw, opIndex);
-}
-
 // ---------------------------------------------------------------------------
 // Anchors
 // ---------------------------------------------------------------------------
@@ -547,6 +548,9 @@ function casMismatch(
   actual: JsonValue,
 ): IpynbError {
   const currentSource = cellSource(cell);
+  // Computed once: truncateText walks the whole source, and a large cell paid
+  // for that walk twice on every anchor mismatch (review v3 QUAL-7).
+  const truncatedSource = truncateText(currentSource);
   return new IpynbError('cas_mismatch', 'compare-and-swap anchor mismatch', {
     failed_op_index: opIndex,
     anchor,
@@ -555,8 +559,8 @@ function casMismatch(
     expected: truncate(expected),
     actual: truncate(actual),
     current_source_hash: cellSourceHash(cell, options.hasher),
-    current_source: truncateText(currentSource).text,
-    current_source_truncated: truncateText(currentSource).truncated,
+    current_source: truncatedSource.text,
+    current_source_truncated: truncatedSource.truncated,
   });
 }
 
@@ -606,10 +610,6 @@ function trackCell(touchedCells: NotebookCell[], cell: NotebookCell): void {
   }
 }
 
-function opIndexOfCell(notebook: NotebookFile, cell: NotebookCell): number {
-  return notebook.cells.indexOf(cell);
-}
-
 function createCell(
   cellType: 'code' | 'markdown',
   source: string,
@@ -642,8 +642,6 @@ function trackMarkdownWrite(
   kind: string,
   options: EditOptions,
   markdownIssues: MarkdownIssue[],
-  opIndex: number,
-  _warnings: Warning[],
 ): void {
   const isMarkdownWrite =
     cell.cell_type === 'markdown' &&
@@ -655,5 +653,4 @@ function trackMarkdownWrite(
   for (const issue of issues) {
     markdownIssues.push(issue);
   }
-  void opIndex;
 }

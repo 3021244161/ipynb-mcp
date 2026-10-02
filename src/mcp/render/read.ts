@@ -4,8 +4,8 @@
 // the image policy allows blocks to be returned.
 
 import { createWarning, type Warning } from '../../core/errors.js';
-import { mapRawOutputs, type OutputItem, type RawOutput } from '../../core/outputs.js';
-import { cellSource, readNotebookMetadata, type NotebookFile } from '../../core/parse.js';
+import { mapRawOutputs, rawOutputsOfCell, type OutputItem } from '../../core/outputs.js';
+import { cellSource, hasStableCellIds, readNotebookMetadata, type NotebookFile } from '../../core/parse.js';
 import { applyImagePolicy, shouldReturnImages, type ImagesPolicy } from '../../fs/artifact.js';
 
 const SUMMARY_PREVIEW_CHARS = 160;
@@ -41,9 +41,10 @@ export async function renderReadResult(input: RenderReadInput): Promise<RenderRe
 
   const selectedIndexes =
     input.cellIndexes !== undefined ? [...input.cellIndexes].sort((a, b) => a - b) : input.notebook.cells.map((_, i) => i);
+  // `cell_indexes` is deduped by the tool layer before it gets here (SPEC
+  // §4.1.12 length validation + review v3 ROB-5), so this loop renders each
+  // requested cell exactly once.
 
-  const imageBudgetTotal = input.maxImagesPerCall;
-  let imageBudget = imageBudgetTotal;
   // Running cursor so image_index stays unique across the whole call
   // (SPEC §4.3), not reset per cell (review A5).
   let imageCursor = 0;
@@ -78,8 +79,8 @@ export async function renderReadResult(input: RenderReadInput): Promise<RenderRe
       cellPayload['outputs_summary'] = [];
       cellPayload['outputs'] = null;
     } else {
-      const rawOutputs = (cell.outputs ?? []) as unknown[];
-      const typedRawOutputs: RawOutput[] = rawOutputs.map((entry) => normalizeRawOutput(entry));
+      // nbformat output shape lives in core (review v3 ARCH-1 / AGENTS §4).
+      const typedRawOutputs = rawOutputsOfCell(cell);
       const mapped = mapRawOutputs(typedRawOutputs, {
         inlineTextChars: input.inlineTextChars,
         maxImageBytes: input.maxImageBytes,
@@ -114,7 +115,6 @@ export async function renderReadResult(input: RenderReadInput): Promise<RenderRe
         warnings.push(warning);
       }
       imageCursor += policyResult.materialized.length;
-      imageBudget -= policyResult.materialized.length;
       if (returnImages) {
         for (const materialized of policyResult.materialized) {
           const rawOutput = typedRawOutputs[materialized.outputIndex];
@@ -150,7 +150,7 @@ export async function renderReadResult(input: RenderReadInput): Promise<RenderRe
     kernel_name: kernelName,
     language_name: languageName,
     language_version: languageVersion,
-    has_stable_cell_ids: doc.nbformat_minor >= 5,
+    has_stable_cell_ids: hasStableCellIds(doc),
     cell_count: input.notebook.cells.length,
     content_hash: input.notebook.contentHash,
     cells: cellsPayload,
@@ -209,49 +209,4 @@ function truncatePreview(text: string): string {
     return text;
   }
   return `${text.slice(0, SUMMARY_PREVIEW_CHARS)}…`;
-}
-
-/** nbformat outputs are loosely typed in the parsed tree; narrow defensively. */
-function normalizeRawOutput(entry: unknown): RawOutput {
-  if (typeof entry !== 'object' || entry === null) {
-    return { outputType: 'display_data', data: {} };
-  }
-  const record = entry as Record<string, unknown>;
-  const outputType = record['output_type'];
-  const rawOutput: RawOutput = {
-    outputType:
-      outputType === 'stream' || outputType === 'error' || outputType === 'execute_result' || outputType === 'display_data'
-        ? outputType
-        : 'display_data',
-  };
-  const data = record['data'];
-  if (typeof data === 'object' && data !== null && !Array.isArray(data)) {
-    rawOutput.data = Object.fromEntries(
-      Object.entries(data as Record<string, unknown>)
-        .filter(([, value]) => typeof value === 'string')
-        .map(([key, value]) => [key, value as string]),
-    );
-  }
-  if (typeof record['text'] === 'string') {
-    rawOutput.text = record['text'];
-  } else if (Array.isArray(record['text'])) {
-    rawOutput.text = (record['text'] as unknown[]).map(String).join('');
-  }
-  if (record['name'] === 'stderr' || record['name'] === 'stdout') {
-    rawOutput.name = record['name'];
-  }
-  if (typeof record['ename'] === 'string') {
-    rawOutput.ename = record['ename'];
-  }
-  if (typeof record['evalue'] === 'string') {
-    rawOutput.evalue = record['evalue'];
-  }
-  if (Array.isArray(record['traceback'])) {
-    rawOutput.traceback = (record['traceback'] as unknown[]).map(String);
-  }
-  const metadata = record['metadata'];
-  if (typeof metadata === 'object' && metadata !== null && !Array.isArray(metadata)) {
-    rawOutput.metadata = metadata as Record<string, unknown>;
-  }
-  return rawOutput;
 }

@@ -4,7 +4,7 @@
 // image headers are parsed by hand (no image libraries, SPEC §4.4).
 
 import type { JsonValue } from './errors.js';
-import type { Hasher } from './parse.js';
+import type { Hasher, NotebookCell } from './parse.js';
 
 /** Raw output as delivered by the sidecar protocol (SPEC §5.8, + metadata for §4.4). */
 export interface RawOutput {
@@ -16,6 +16,88 @@ export interface RawOutput {
   evalue?: string;
   traceback?: string[];
   metadata?: Record<string, unknown>;
+}
+
+/**
+ * nbformat stores multi-line strings in `data` either as a string or as an
+ * array of lines (both are valid, and Jupyter writes arrays). Joining mirrors
+ * what the stream/`text` branch has always done; silently dropping the array
+ * form lost real outputs (review v3 ARCH-1).
+ */
+function dataValueToString(value: unknown): string | null {
+  if (typeof value === 'string') {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => String(entry)).join('');
+  }
+  return null;
+}
+
+/**
+ * nbformat cell outputs -> RawOutput[], the ONLY place that knows the nbformat
+ * output shape (SPEC §4.1.1: conversion happens at the parse boundary, D15).
+ * The mcp projection layer calls this instead of parsing outputs itself
+ * (review v3 ARCH-1 / AGENTS §4 module rule).
+ */
+export function rawOutputsOfCell(cell: NotebookCell): RawOutput[] {
+  const outputs = cell.outputs;
+  if (!Array.isArray(outputs)) {
+    return [];
+  }
+  const mapped: RawOutput[] = [];
+  for (const entry of outputs) {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      continue;
+    }
+    const record = entry as Record<string, unknown>;
+    const outputType = record['output_type'];
+    if (
+      outputType !== 'stream' &&
+      outputType !== 'error' &&
+      outputType !== 'execute_result' &&
+      outputType !== 'display_data'
+    ) {
+      // Unknown output kinds are not this layer's business: nbformat has no
+      // catch-all shape to project, so they are dropped like any other
+      // unparseable entry rather than invented into display_data.
+      continue;
+    }
+    const raw: RawOutput = { outputType };
+    const data = record['data'];
+    if (typeof data === 'object' && data !== null && !Array.isArray(data)) {
+      const normalized: Record<string, string> = {};
+      for (const [key, value] of Object.entries(data as Record<string, unknown>)) {
+        const text = dataValueToString(value);
+        if (text !== null) {
+          normalized[key] = text;
+        }
+      }
+      raw.data = normalized;
+    }
+    const text = dataValueToString(record['text']);
+    if (text !== null) {
+      raw.text = text;
+    }
+    if (record['name'] === 'stderr' || record['name'] === 'stdout') {
+      raw.name = record['name'];
+    }
+    if (typeof record['ename'] === 'string') {
+      raw.ename = record['ename'];
+    }
+    if (typeof record['evalue'] === 'string') {
+      raw.evalue = record['evalue'];
+    }
+    if (Array.isArray(record['traceback'])) {
+      raw.traceback = (record['traceback'] as unknown[]).map(String);
+    }
+    const metadata = record['metadata'];
+    if (typeof metadata === 'object' && metadata !== null && !Array.isArray(metadata)) {
+      raw.metadata = metadata as Record<string, unknown>;
+    }
+    mapped.push(raw);
+  }
+  return mapped;
 }
 
 export type OutputItem =
@@ -106,6 +188,20 @@ export function mapRawOutputs(rawOutputs: readonly RawOutput[], options: MapOutp
       data['image/png'] !== undefined ? 'image/png' : data['image/jpeg'] !== undefined ? 'image/jpeg' : null;
     if (imageMediaType !== null) {
       const base64 = data[imageMediaType] ?? '';
+      // Cheap pre-check on the ENCODED length before decoding: base64 is 4/3 of
+      // the payload, so an obviously oversized image never needs the decode
+      // (which itself costs ~2.5x the image in transient copies) nor the
+      // SHA-256 pass. Behaviour is unchanged — the check below still reports
+      // the exact byte count for anything that gets decoded (review v3 PERF-2).
+      const approxBytes = approximateBase64Bytes(base64);
+      if (approxBytes > options.maxImageBytes) {
+        items.push({
+          kind: 'unsupported',
+          mime_type: imageMediaType,
+          message: `image exceeds max_image_bytes (>= ${approxBytes} > ${options.maxImageBytes})`,
+        });
+        continue;
+      }
       const decoded = decodeBase64(base64);
       if (decoded !== null && decoded.byteLength > options.maxImageBytes) {
         // Oversized images become unsupported and never materialize (SPEC §4.4).
@@ -211,6 +307,29 @@ function decodeBase64(base64: string): Uint8Array | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Lower-bound byte estimate from the base64 text alone (no decode): 4 encoded
+ * characters carry 3 bytes, minus padding. Deliberately conservative (never
+ * over-estimates by more than the line breaks it ignores), so it can only
+ * reject what the exact check would reject too.
+ */
+function approximateBase64Bytes(base64: string): number {
+  let encoded = 0;
+  let padding = 0;
+  for (let i = 0; i < base64.length; i += 1) {
+    const code = base64.charCodeAt(i);
+    // Skip ASCII whitespace, which base64 permits and Jupyter emits.
+    if (code === 0x20 || code === 0x0a || code === 0x0d || code === 0x09) {
+      continue;
+    }
+    encoded += 1;
+    if (code === 0x3d /* '=' */) {
+      padding += 1;
+    }
+  }
+  return Math.floor((encoded * 3) / 4) - padding;
 }
 
 /** width/height priority: output metadata -> parsed image header -> null (SPEC §4.4). */

@@ -10,10 +10,6 @@ const LEVEL_ORDER: Readonly<Record<LogLevel, number>> = {
   error: 40,
 };
 
-export function isLogLevel(value: string): value is LogLevel {
-  return value === 'debug' || value === 'info' || value === 'warn' || value === 'error';
-}
-
 export class Logger {
   readonly #level: LogLevel;
   // Injectable so tests can capture output without touching the real stderr.

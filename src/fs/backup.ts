@@ -4,7 +4,7 @@
 
 import path from 'node:path';
 
-import type { JsonValue } from '../core/errors.js';
+import { IpynbError } from '../core/errors.js';
 
 /** COPYFILE_EXCL: fail with EEXIST instead of silently overwriting (review A29). */
 const COPYFILE_EXCL = 1;
@@ -73,7 +73,14 @@ export async function createBackup(
     }
   }
   if (backupPath === null) {
-    throw new Error(`could not find a free backup name for ${notebookPath}`);
+    // Only IpynbError crosses the tool boundary (AGENTS §5): a bare Error here
+    // reached the model as "unexpected internal failure" with no detail,
+    // losing the one thing that makes a name collision diagnosable.
+    throw new IpynbError('internal', 'could not find a free backup name', {
+      path: notebookPath,
+      attempted: maxAttempts,
+      timestamp: ts,
+    });
   }
 
   // Rolling retention: after adding the new backup, drop the oldest beyond
@@ -118,9 +125,4 @@ function formatTimestamp(date: Date): string {
     `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}` +
     `-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`
   );
-}
-
-/** JSON detail helper for write paths that report `backup_path`. */
-export function backupPathDetail(backupPath: string | null): JsonValue {
-  return { backup_path: backupPath };
 }

@@ -23,16 +23,6 @@ export interface StaleCell {
   readonly confidence: 'high' | 'low';
 }
 
-export interface StaleAnalysisResult {
-  readonly stale_cells: StaleCell[];
-  readonly stale_analysis: {
-    approximate: true;
-    analysis_version: 1;
-    method: 'python-symtable' | 'regex' | 'skipped';
-  };
-  readonly degraded: boolean;
-}
-
 const MAX_STALE_CELLS = 50;
 
 export function analyzeStale(input: {
@@ -45,48 +35,54 @@ export function analyzeStale(input: {
   const executed = new Set<number>([...input.targetIndexes, ...input.replayIndexes]);
   const stale: StaleCell[] = [];
 
+  // `hasTargetAfter` is queried once per cell and the dependency scan is
+  // indexed. The previous shape rescanned `0..j` per cell with a nested
+  // `.some(name => uses.includes(name))`, i.e. quadratic: an 8 000-cell
+  // notebook spent ~180 ms here while parse+serialize+selfcheck together cost
+  // ~15 ms (review v3 PERF-3). Results are unchanged.
+  const lastTarget = maxOf(input.targetIndexes);
+  const latestDefiner = new Map<string, number>();
+
   for (const cell of input.cells) {
-    if (!cell.is_code || executed.has(cell.cell_index) || !cell.has_nonempty_outputs) {
-      continue;
-    }
-    const uses = input.uses[cell.cell_index] ?? [];
-    if (uses.length === 0) {
-      // Nothing referenced at module level: only out-of-order can apply.
-      if (hasTargetAfter(cell.cell_index, input.targetIndexes)) {
+    const index = cell.cell_index;
+    const uses = input.uses[index] ?? [];
+
+    if (cell.is_code && !executed.has(index) && cell.has_nonempty_outputs) {
+      let latestDependency = -1;
+      for (const name of uses) {
+        const definer = latestDefiner.get(name);
+        if (definer !== undefined && definer > latestDependency) {
+          latestDependency = definer;
+        }
+      }
+      if (latestDependency >= 0) {
+        const confidence: 'high' | 'low' = input.targetIndexes.has(latestDependency) ? 'high' : 'low';
+        const reason = input.targetIndexes.has(latestDependency)
+          ? `uses-variable-defined-in-${latestDependency}`
+          : `depends-on-replayed-cell-${latestDependency}`;
+        stale.push({ cell_index: index, cell_id: cell.cell_id, reason, confidence });
+      } else if (lastTarget > index) {
+        // No dependency on an executed cell (or none referenced at all): only
+        // the out-of-order rule can still apply.
         stale.push({
-          cell_index: cell.cell_index,
+          cell_index: index,
           cell_id: cell.cell_id,
           reason: 'out-of-order-execution',
           confidence: 'low',
         });
       }
-      continue;
     }
-    let latestDependency: number | null = null;
-    for (let i = 0; i < cell.cell_index; i += 1) {
-      if (!executed.has(i)) {
-        continue;
+
+    // Register this cell's definitions for every LATER cell (executed or not:
+    // only executed indexes are ever read back, and a definer is only recorded
+    // when it was executed).
+    if (executed.has(index)) {
+      for (const name of input.defs[index] ?? []) {
+        const previous = latestDefiner.get(name);
+        if (previous === undefined || index > previous) {
+          latestDefiner.set(name, index);
+        }
       }
-      const defs = input.defs[i] ?? [];
-      if (defs.some((name) => uses.includes(name))) {
-        latestDependency = i;
-      }
-    }
-    if (latestDependency !== null) {
-      const confidence: 'high' | 'low' = input.targetIndexes.has(latestDependency) ? 'high' : 'low';
-      const reason = input.targetIndexes.has(latestDependency)
-        ? `uses-variable-defined-in-${latestDependency}`
-        : `depends-on-replayed-cell-${latestDependency}`;
-      stale.push({ cell_index: cell.cell_index, cell_id: cell.cell_id, reason, confidence });
-      continue;
-    }
-    if (hasTargetAfter(cell.cell_index, input.targetIndexes)) {
-      stale.push({
-        cell_index: cell.cell_index,
-        cell_id: cell.cell_id,
-        reason: 'out-of-order-execution',
-        confidence: 'low',
-      });
     }
   }
 
@@ -94,13 +90,14 @@ export function analyzeStale(input: {
   return stale.slice(0, MAX_STALE_CELLS);
 }
 
-function hasTargetAfter(index: number, targets: ReadonlySet<number>): boolean {
-  for (const target of targets) {
-    if (target > index) {
-      return true;
+function maxOf(indexes: ReadonlySet<number>): number {
+  let max = -1;
+  for (const value of indexes) {
+    if (value > max) {
+      max = value;
     }
   }
-  return false;
+  return max;
 }
 
 // ---------------------------------------------------------------------------

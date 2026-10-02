@@ -57,7 +57,11 @@ async function pruneStaleTempFiles(
   let entries: string[];
   try {
     entries = await deps.readdir(dir);
-  } catch {
+  } catch (cause) {
+    // Best-effort sweep: an unreadable directory must not block the write, but
+    // swallowing this silently broke R7 and left permission problems with no
+    // trace at all (review v3 ROB-9).
+    onWarn?.(`could not scan ${dir} for stale temp files: ${String(cause)}`);
     return;
   }
   const prefix = `.${base}.tmp-`;
@@ -71,7 +75,7 @@ async function pruneStaleTempFiles(
         await deps.unlink(path.join(dir, entry));
       }
     } catch (cause) {
-      onWarn?.(`[ipynb-mcp] warn failed to prune stale temp file ${entry}: ${String(cause)}`);
+      onWarn?.(`failed to prune stale temp file ${entry}: ${String(cause)}`);
     }
   }
 }
@@ -142,9 +146,11 @@ export async function atomicWriteFile(
     try {
       await deps.fsyncDir(dir);
     } catch (cause) {
-      const sink = options.onCleanupError ?? ((message: string) => process.stderr.write(`${message}
-`));
-      sink(`[ipynb-mcp] warn directory fsync failed for ${dir}: ${String(cause)}`);
+      // The fallback sink (no logger injected) owns the `[ipynb-mcp] warn`
+      // decoration: hard-coding it here produced doubled prefixes and levels
+      // once the logger became the production sink (review v3 QUAL-6).
+      const sink = options.onCleanupError ?? fallbackWarnSink;
+      sink(`directory fsync failed for ${dir}: ${String(cause)}`);
     }
   }
 }
@@ -162,9 +168,14 @@ async function cleanupTempFile(
     }
     // Re-throwing would mask the primary failure (e.g. notebook_locked);
     // report through the sink instead. R7 satisfied: error is surfaced, not swallowed.
-    const sink = onCleanupError ?? ((message: string) => process.stderr.write(`${message}\n`));
-    sink(`[ipynb-mcp] warn failed to remove temp file ${tmpPath}: ${String(cleanupCause)}`);
+    const sink = onCleanupError ?? fallbackWarnSink;
+    sink(`failed to remove temp file ${tmpPath}: ${String(cleanupCause)}`);
   }
+}
+
+/** Used only when no logger was injected (tests, direct callers). */
+function fallbackWarnSink(message: string): void {
+  process.stderr.write(`[ipynb-mcp] warn ${message}\n`);
 }
 
 export function isLockError(cause: unknown): boolean {
