@@ -6,13 +6,13 @@
 服务器本地启动方式（无需发布）：
 
 ```bash
-node E:/Work/ipynb-mcp/ipynb-mcp/lib/bin.js --root <你的 notebook 目录>
+node <repo>/lib/bin.js --root <你的 notebook 目录>
 ```
 
 或先本地打包再 `npx`：
 
 ```bash
-cd E:/Work/ipynb-mcp/ipynb-mcp && pnpm build && npm pack
+cd <repo> && pnpm build && npm pack
 npx -y file:./ipynb-mcp-0.1.0.tgz --root <你的 notebook 目录>
 ```
 

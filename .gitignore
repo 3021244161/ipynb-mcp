@@ -12,13 +12,26 @@ coverage/
 .DS_Store
 Thumbs.db
 
+# 编码 agent 的工作记忆（含本机绝对路径，属个人环境信息）
+.workbuddy/
+
 # 测试专用虚拟环境（本地生成，禁止改动用户解释器环境；见 AGENTS.md §3）
 .venv-test/
 tests/.venv*/
+
+# 打包产物（README 让人类跑 `npm pack`，会在根目录产出 tgz）
+*.tgz
 
 # 日志与临时文件
 *.log
 *.tmp-*
 *.bak
+
+# 真实 ipykernel 的 connection file（jupyter_client 默认落在 cwd 的 tmp*.json）
+# 集成测试偶发把工作目录留在仓库根时会出现，属测试痕迹而非源码
+tmp*.json
+
+# 一次性补丁脚本（历史遗留形状：patch-tmp.py，见审查 H1）
+patch-tmp*
 
 # 注：本仓库无大体积原始数据目录；若未来引入只读数据集，须在此登记排除理由。

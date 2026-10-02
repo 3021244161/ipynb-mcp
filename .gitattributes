@@ -1,0 +1,19 @@
+# Line-ending policy (review H3).
+#
+# The tree had 53 CRLF files, 28 LF files and 5 files that were internally
+# MIXED — and no attribute file. `git diff` therefore reported whole-file
+# rewrites (markdown.ts: 252+/241- by default, 20+/9- with
+# `--ignore-all-space`), which destroys the credibility of review and blame.
+#
+# `text=auto` + `eol=lf` normalises the index to LF; checkouts on Windows stay
+# byte-identical to what the tests read. Binary artifacts are excluded
+# explicitly so git never rewrites them.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.tgz binary

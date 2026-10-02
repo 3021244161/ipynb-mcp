@@ -48,7 +48,7 @@ Precedence: CLI flags > `IPYNB_*` environment variables > defaults. Boolean flag
 | `--python <path>` | `IPYNB_PYTHON` | auto | Explicit interpreter (failure is final) |
 | `--kernel-idle-seconds <n>` | `IPYNB_KERNEL_IDLE_SECONDS` | `3600` | Idle kernel reclamation |
 | `--exec-timeout-seconds <n>` | `IPYNB_EXEC_TIMEOUT_SECONDS` | `300` | Per-cell timeout |
-| `--background-threshold-seconds <n>` | `IPYNB_BACKGROUND_THRESHOLD_SECONDS` | `30` | Runs longer than this go background |
+| `--background-threshold-seconds <n>` | `IPYNB_BACKGROUND_THRESHOLD_SECONDS` | `30` | Runs whose estimated upper bound (`timeout_seconds × target cells`) exceeds **10×** this go background |
 | `--backup-keep <n>` | `IPYNB_BACKUP_KEEP` | `10` | Rolling backups per notebook |
 | `--artifact-dir <dir>` | `IPYNB_ARTIFACT_DIR` | platform cache | Where image artifacts are written |
 | `--inline-text-chars <n>` | `IPYNB_INLINE_TEXT_CHARS` | `20000` | Text output truncation threshold |
@@ -59,6 +59,8 @@ Precedence: CLI flags > `IPYNB_*` environment variables > defaults. Boolean flag
 
 Startup failures (bad values, root does not exist / is your home dir / artifact dir unwritable) exit with code **2**.
 
+With the defaults, a single-cell run is executed synchronously (its upper bound is exactly the 10× cut-off); two or more cells, or a raised `--exec-timeout-seconds`, return a background `run_id` you poll with `notebook_run_status`. The multiplier is `DEVIATIONS.md` D-015.
+
 ## Interpreter selection
 
 When a notebook needs a kernel, the interpreter is resolved by candidate chain: `--python` → the notebook's own `metadata.kernelspec` argv → `.venv`/`venv` next to the notebook → `python3`/`python` on PATH. Every failed candidate is recorded; only if all fail does the tool error (with a ready-to-run `pip install ipykernel` command — the server never installs anything itself). A `.venv` that disagrees with the kernelspec produces a `kernelspec_mismatch` warning; pass `--python` to pin one explicitly.
@@ -68,8 +70,9 @@ When a notebook needs a kernel, the interpreter is resolved by candidate chain: 
 - **Execution is arbitrary code execution.** Point the root at directories you would let the agent write to; the fence is a path boundary, not a sandbox. Only run notebooks you can read.
 - **Stale analysis is Python-only.** Non-Python kernels (R, Julia…) work for read/edit/run but skip stale analysis (`method: "skipped"`). It also cannot see through `globals()`/`locals()`/`exec`/`eval`/`setattr`, attribute assignments (`obj.attr = 1`) or `import *`. When a cell fails to parse, the whole analysis degrades to a conservative regex pass (all confidences drop to `low`; the regex pass additionally misses tuple unpacking, annotated assignments, indented assignments and `with … as`, and may flag identifiers inside strings/comments).
 - **Interactive widgets are unsupported** (`application/vnd.jupyter.widget-view+json` degrades to `unsupported`).
-- **Image-heavy single executions are still bounded by the transport.** The sidecar speaks one NDJSON line per response, and a line is capped at 64 MiB; since an `exec_cell` response carries every output's base64, a single cell producing more than roughly 64 MiB of base64 image data (e.g. several near-`max_image_bytes` figures) fails with a protocol error rather than returning the images. Lower `max_image_bytes`, split the cell, or read the images back through `notebook_read`. Tracked as `DEVIATIONS.md` D-017.
-- **One run per notebook at a time.** A second concurrent `notebook_run` on the same notebook fails with `kernel_busy` instead of interleaving cell executions; different notebooks run in parallel.
+- **Image-heavy single executions are still bounded by the transport.** The sidecar speaks one NDJSON line per response, and a line is capped at 64 MiB; since an `exec_cell` response carries every output's base64, a single cell producing more than roughly 64 MiB of base64 image data (e.g. several near-`max_image_bytes` figures) fails with a protocol error rather than returning the images. Lower `max_image_bytes`, split the cell, or read the images back through `notebook_read`. Tracked as `DEVIATIONS.md` D-017. **A protocol error tears the whole sidecar down, so every kernel it hosted (for every notebook in that interpreter) dies with it**: the next `notebook_run` rebuilds silently via `replay`, but a long training cell that had already finished in memory will not be re-run.
+- **A kernel that dies while no cell is running is noticed on the next request, not immediately.** The sidecar polls the kernel process while it is executing a cell; between cells it only learns of an external kill (OOM killer, `taskkill`) when the next call arrives. `notebook_run` probes kernel liveness before reusing a session, so that case becomes a silent `replay`/rebuild rather than a failure — but the kernel's in-memory state is gone at that point.
+- **One run per notebook at a time.** A second concurrent `notebook_run` on the same notebook fails with `kernel_busy` instead of interleaving cell executions — including when it arrives in the gap between the first run's cells. Different notebooks run in parallel.
 - **Byte-level fidelity is logical, not literal.** Serialization normalizes `\uXXXX` escapes and number formats, so untouched regions of a heavily-escaped notebook may show file-level diffs. Semantics are preserved, and rolling backups (`<name>.<timestamp>.ipynb.bak`) cover the rest.
 - **No auto-creation** of notebooks, no format conversion, no collaboration features.
 
