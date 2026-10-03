@@ -54,6 +54,96 @@ const DEFAULT_SPEC_NAME = 'python3';
 export const SIDECAR_REQUIRED_MODULES = ['ipykernel', 'jupyter_client'] as const;
 
 /**
+ * How much of a probed interpreter's stdout may be considered.
+ *
+ * The probe prints one module name or nothing; the bound exists because that
+ * stdout comes from a process we did not write and is quoted back in an error
+ * detail a model has to read (review v7 V7-4).
+ */
+const PROBE_STDOUT_LIMIT = 4096;
+
+/** What a probe run concluded about one interpreter. */
+export interface ProbeResult {
+  readonly ok: boolean;
+  /** The module that could not be imported, when the probe got that far. */
+  readonly missingModule: string | null;
+  /**
+   * Whether the probe could run the candidate at all.
+   *
+   * `'not-found'` means the command does not exist, and it must be distinguishable
+   * from "ran and failed": SPEC §5.2 says `install_command` names the first
+   * candidate that EXISTS but lacks ipykernel. Telling a user to run
+   * `"python3" -m pip install …` when `python3` is not installed is a dead end, and
+   * the PATH candidates reported exactly that (review v7 V7-6).
+   */
+  readonly status: 'ok' | 'failed' | 'not-found';
+}
+
+/**
+ * Why a candidate was rejected, in the words the error detail uses.
+ *
+ * "not found" is its own answer: reporting a missing command as
+ * `ipykernel_missing` told the user to install a module into an interpreter that
+ * does not exist (review v7 V7-6).
+ */
+function candidateReason(probe: ProbeResult): string {
+  if (probe.status === 'not-found') {
+    return 'not found';
+  }
+  return probe.missingModule === null ? 'ipykernel_missing' : `missing_module:${probe.missingModule}`;
+}
+
+/**
+ * Whether an install command makes sense for this candidate.
+ *
+ * SPEC §5.2: the command names the first candidate that EXISTS but lacks the
+ * modules. A command for a path that is not installed cannot be run, and it is the
+ * one thing here a model may act on, so it must not be guessed.
+ */
+function canInstallInto(probe: ProbeResult): boolean {
+  return probe.status !== 'not-found';
+}
+
+/**
+ * The module name a probe failure reported, or null when it reported none that we
+ * recognise.
+ *
+ * The probe's stdout comes from a process we did NOT write — a wrapper script, a
+ * shim, a broken interpreter can print anything, including
+ * `jupyter_client && rm -rf ~/notebooks`. That output used to be interpolated
+ * straight into `install_command`, a command this tool HANDS TO A MODEL to run, so
+ * a hostile or merely noisy interpreter could append arbitrary shell to it
+ * (review v7 V7-4).
+ *
+ * Only a name from the fixed whitelist counts, and the WHOLE output must equal it:
+ * the probe prints one bare module name, so `jupyter_client_evil` and
+ * `jupyter_client && rm -rf /` both fail to match. Anything else degrades to
+ * "cannot provide the sidecar's modules", which is true and actionable without
+ * guessing.
+ *
+ * Requiring an exact match — rather than taking the first whitespace-delimited
+ * token — is what closes the hole: `... && rm -rf /` STARTS with a real module
+ * name, so every prefix rule accepts it. A probe that prints anything more than
+ * the name is already misbehaving, and losing its "which module" detail costs only
+ * precision in one error message.
+ */
+function reportedModuleName(stdout: string): string | null {
+  // Bounded before parsing: a megabyte of output must not be scanned, stored, or
+  // carried into an error detail.
+  const head = stdout.slice(0, PROBE_STDOUT_LIMIT).trim();
+  // The probe prints ONE bare module name (or nothing), so the whole output must
+  // equal a name from the whitelist. No tokenizing and no prefix matching: every
+  // weaker rule I tried here accepted `jupyter_client && rm -rf ~/notebooks`,
+  // because the injected text simply starts with a real module name.
+  for (const module of SIDECAR_REQUIRED_MODULES) {
+    if (module === head) {
+      return module;
+    }
+  }
+  return null;
+}
+
+/**
  * Prints the first module the interpreter cannot import, then exits non-zero.
  * Importing beats `importlib.util.find_spec` here: it also catches a broken
  * install (a native extension that fails to load), which is exactly the pyzmq
@@ -148,19 +238,32 @@ export async function resolveInterpreter(
   const probeInterpreter = async (candidate: string): Promise<ProbeResult> => {
     const cached = input.cache?.get(probeKey(candidate));
     if (cached !== undefined) {
-      return cached ? { ok: true, missingModule: null } : { ok: false, missingModule: probeReasons.get(probeKey(candidate)) ?? null };
+      return cached
+        ? { ok: true, missingModule: null, status: 'ok' }
+        : {
+            ok: false,
+            missingModule: probeReasons.get(probeKey(candidate)) ?? null,
+            // A cache hit cannot tell "not found" from "ran and failed", and it
+            // does not have to: a path that does not exist is never cached as a
+            // usable interpreter, and only the not-found case has to suppress the
+            // install command (review v7 V7-6).
+            status: 'failed',
+          };
     }
     const script = missingModuleScript(SIDECAR_REQUIRED_MODULES);
     let result: ProbeResult;
     if (deps.runCapturing !== undefined) {
       const run = await deps.runCapturing(candidate, ['-c', script], 10_000);
-      const reported = run.stdout.trim();
-      result = run.status === 'ok' ? { ok: true, missingModule: null } : { ok: false, missingModule: reported === '' ? null : reported };
+      const reported = reportedModuleName(run.stdout);
+      result =
+        run.status === 'ok'
+          ? { ok: true, missingModule: null, status: 'ok' }
+          : { ok: false, missingModule: reported, status: run.status };
     } else {
       // No capturing runner injected: the exit status still refuses an
       // interpreter that cannot provide the modules, it just cannot say WHICH.
       const status = await deps.execFile(candidate, ['-c', script], 10_000);
-      result = { ok: status === 'ok', missingModule: null };
+      result = { ok: status === 'ok', missingModule: null, status };
     }
     input.cache?.set(probeKey(candidate), result.ok);
     if (result.missingModule !== null) {
@@ -251,11 +354,8 @@ export async function resolveInterpreter(
         warnings,
       };
     }
-    failed.push({
-      path: venvPython,
-      reason: probe.missingModule === null ? 'ipykernel_missing' : `missing_module:${probe.missingModule}`,
-    });
-    if (installCommand === null) {
+    failed.push({ path: venvPython, reason: candidateReason(probe) });
+    if (installCommand === null && canInstallInto(probe)) {
       installCommand = installCommandFor(venvPython, probe);
     }
   }
@@ -272,11 +372,8 @@ export async function resolveInterpreter(
         warnings,
       };
     }
-    failed.push({
-      path: candidate,
-      reason: probe.missingModule === null ? 'ipykernel_missing' : `missing_module:${probe.missingModule}`,
-    });
-    if (installCommand === null) {
+    failed.push({ path: candidate, reason: candidateReason(probe) });
+    if (installCommand === null && canInstallInto(probe)) {
       installCommand = installCommandFor(candidate, probe);
     }
   }

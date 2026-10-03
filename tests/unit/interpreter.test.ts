@@ -7,10 +7,14 @@
 // instead of the actionable "install this" message the candidate chain exists to
 // produce (CI issue #1 problem 2 → D-038).
 //
-// Two things are pinned here:
+// What is pinned here:
 //   1. the probe tests what the sidecar actually imports, and the failure names
 //      the missing module and the exact install command;
-//   2. the required-module list cannot drift away from the sidecar's imports —
+//   2. a candidate that does not EXIST is not reported as missing modules, and no
+//      install command is offered for it (SPEC §5.2, review v7 V7-6);
+//   3. the probe's stdout can never become part of the install command, which is a
+//      string this tool hands to a model to execute (review v7 V7-4);
+//   4. the required-module list cannot drift away from the sidecar's imports —
 //      the last case parses python/ipynb_sidecar.py and compares.
 
 import { readFileSync } from 'node:fs';
@@ -76,6 +80,33 @@ function fakeDeps(world: FakeWorld): InterpreterDeps & { readonly probed: string
 
 const NOTEBOOK = '/work/nb.ipynb';
 
+/** Resolve and return the thrown error, so a passing case cannot be a missing throw. */
+async function failureOf(
+  deps: InterpreterDeps,
+  input: { readonly explicitPython: string | null; readonly notebookPath: string },
+): Promise<IpynbError> {
+  const outcome = await resolveInterpreter(
+    {
+      ...input,
+      kernelSpecName: null,
+      languageInfoName: 'python',
+      // A FRESH cache per call. The module-level probe cache is keyed by candidate
+      // path, so without this a cached verdict from an earlier case in this file
+      // answers for a case whose fake world is different — which is exactly how
+      // these two cases failed while every individual behaviour they describe was
+      // already correct (found by instrumenting the predicate: the function under
+      // test was never reached, because a previous test's verdict was cached).
+      cache: new Map(),
+    },
+    deps,
+  ).then(
+    () => null,
+    (cause: unknown) => cause,
+  );
+  expect(outcome, 'resolution was expected to fail').toBeInstanceOf(IpynbError);
+  return outcome as IpynbError;
+}
+
 describe('[CI-2][D-038] the capability probe matches what the sidecar needs', () => {
   it('accepts an interpreter that provides every sidecar module', async () => {
     const deps = fakeDeps({
@@ -95,17 +126,12 @@ describe('[CI-2][D-038] the capability probe matches what the sidecar needs', ()
       interpreters: { '/usr/bin/python3': { modules: ['ipykernel'] } },
       pathCommands: {},
     });
-    const failure = await resolveInterpreter(
-      { explicitPython: '/usr/bin/python3', notebookPath: NOTEBOOK, kernelSpecName: null, languageInfoName: 'python' },
-      deps,
-    ).catch((cause: unknown) => cause);
+    const error = await failureOf(deps, { explicitPython: '/usr/bin/python3', notebookPath: NOTEBOOK });
 
-    expect(failure).toBeInstanceOf(IpynbError);
-    const error = failure as IpynbError;
     // `ipykernel_missing` is the §7 code for "this interpreter cannot host a
     // kernel"; the MESSAGE is where the precision goes.
     expect(error.code).toBe('ipykernel_missing');
-    expect(error.message).toContain("jupyter_client");
+    expect(error.message).toContain('jupyter_client');
     expect(error.message).not.toContain('ipykernel:');
     const detail = error.detail as Record<string, unknown>;
     expect(detail['missing_module']).toBe('jupyter_client');
@@ -118,19 +144,28 @@ describe('[CI-2][D-038] the capability probe matches what the sidecar needs', ()
     // A candidate that cannot host a kernel must not be SELECTED, even when it is
     // the only candidate: the previous code returned it and let the sidecar fail
     // later, which is the "internal error instead of guidance" symptom.
+    //
+    // The notebook path matters: the `.venv` candidate is discovered next to the
+    // notebook (through `deps.existsSync`), so a notebook elsewhere has no venv
+    // candidate and this case would assert nothing about one. The path is built
+    // with the HOST's `path.join`, which is what the source uses — a hard-coded
+    // POSIX string silently matched nothing on Windows.
+    const venvPython = path.join('/work', '.venv', 'bin', 'python');
     const deps = fakeDeps({
-      interpreters: { '/work/.venv/bin/python': { modules: ['ipykernel'] } },
+      interpreters: { [venvPython]: { modules: ['ipykernel'] } },
       pathCommands: {},
     });
-    const failure = await resolveInterpreter(
-      { explicitPython: null, notebookPath: '/work/sub/nb.ipynb', kernelSpecName: null, languageInfoName: 'python' },
-      deps,
-    ).catch((cause: unknown) => cause);
+    const error = await failureOf(deps, { explicitPython: null, notebookPath: '/work/nb.ipynb' });
 
-    expect(failure).toBeInstanceOf(IpynbError);
-    const detail = (failure as IpynbError).detail as Record<string, unknown>;
-    expect((failure as IpynbError).code).toBe('interpreter_not_found');
-    expect(JSON.stringify(detail)).toContain('jupyter_client');
+    expect(error.code).toBe('interpreter_not_found');
+    const candidates = (error.detail as Record<string, unknown>)['candidates'] as Array<Record<string, unknown>>;
+    // The venv IS reported, and its reason names the missing module — not the
+    // generic 'ipykernel_missing', which would send the user to install what the
+    // interpreter already has.
+    expect(candidates[0]).toEqual({
+      path: venvPython,
+      reason: 'missing_module:jupyter_client',
+    });
   });
 
   it('the required-module list cannot drift from the sidecar imports', () => {
@@ -172,6 +207,84 @@ describe('[CI-2][D-038] the capability probe matches what the sidecar needs', ()
   it('the production deps can capture stdout (the probe depends on it)', () => {
     const deps = createNodeInterpreterDeps('linux');
     expect(typeof deps.runCapturing).toBe('function');
+  });
+});
+
+describe('[V7-6] a candidate that does not exist is not reported as missing modules', () => {
+  // SPEC §5.2: `install_command` names the first candidate that EXISTS but lacks
+  // ipykernel. The PATH candidates set it unconditionally, so on a machine with no
+  // python at all the model was handed `"python3" -m pip install …` — a command
+  // that cannot run, presented as the way forward (review v7 V7-6).
+  it('says "not found" and offers no install command when nothing exists', async () => {
+    const deps = fakeDeps({ interpreters: {}, pathCommands: {} });
+    const error = await failureOf(deps, { explicitPython: null, notebookPath: NOTEBOOK });
+
+    const detail = error.detail as Record<string, unknown>;
+    expect(detail['install_command']).toBeUndefined();
+    const candidates = detail['candidates'] as Array<Record<string, unknown>>;
+    expect(candidates.length).toBeGreaterThan(0);
+    for (const candidate of candidates) {
+      expect(candidate['reason']).toBe('not found');
+    }
+  });
+
+  it('still offers the command for an interpreter that exists and lacks a module', async () => {
+    // The guard must not disable the guidance it protects: a PATH python that
+    // exists without jupyter_client is exactly the case the command is for.
+    const deps = fakeDeps({
+      interpreters: { python3: { modules: ['ipykernel'] } },
+      pathCommands: {},
+    });
+    const error = await failureOf(deps, { explicitPython: null, notebookPath: NOTEBOOK });
+
+    const detail = error.detail as Record<string, unknown>;
+    expect(String(detail['install_command'])).toContain('pip install jupyter_client');
+    const candidates = detail['candidates'] as Array<Record<string, unknown>>;
+    expect(candidates.find((entry) => entry['path'] === 'python3')?.['reason']).toBe('missing_module:jupyter_client');
+  });
+});
+
+describe('[V7-4] the probe never lets a foreign process write the install command', () => {
+  // The probe's stdout comes from a process we did not write, and
+  // `install_command` is a command this tool HANDS TO A MODEL to run. A shim that
+  // printed `jupyter_client && rm -rf ~/notebooks` used to be interpolated
+  // verbatim (review v7 V7-4).
+  it('ignores injected shell syntax', async () => {
+    const deps = fakeDeps({ interpreters: { '/usr/bin/python3': { modules: [] } }, pathCommands: {} });
+    deps.runCapturing = () => Promise.resolve({ status: 'failed', stdout: 'jupyter_client && rm -rf ~/notebooks' });
+
+    const error = await failureOf(deps, { explicitPython: '/usr/bin/python3', notebookPath: NOTEBOOK });
+
+    expect(error.code).toBe('ipykernel_missing');
+    // Neither the message nor the detail may carry the injected text.
+    expect(error.message).not.toContain('rm -rf');
+    expect(JSON.stringify(error.detail)).not.toContain('rm -rf');
+    // With nothing recognisable reported, the guidance degrades to the fixed list.
+    const detail = error.detail as Record<string, unknown>;
+    expect(detail['missing_module'], JSON.stringify(detail)).toBeUndefined();
+    expect(String(detail['install_command'])).toContain('pip install ipykernel jupyter_client');
+  });
+
+  it('accepts only an exact module name from the whitelist', async () => {
+    const deps = fakeDeps({ interpreters: { '/usr/bin/python3': { modules: [] } }, pathCommands: {} });
+    deps.runCapturing = () => Promise.resolve({ status: 'failed', stdout: 'jupyter_client_evil' });
+
+    const error = await failureOf(deps, { explicitPython: '/usr/bin/python3', notebookPath: NOTEBOOK });
+
+    const detail = error.detail as Record<string, unknown>;
+    expect(detail['missing_module']).toBeUndefined();
+    expect(JSON.stringify(detail)).not.toContain('jupyter_client_evil');
+  });
+
+  it('does not carry an unbounded amount of foreign output into the detail', async () => {
+    // A megabyte of stdout must not travel into an error a model has to read.
+    const deps = fakeDeps({ interpreters: { '/usr/bin/python3': { modules: [] } }, pathCommands: {} });
+    deps.runCapturing = () => Promise.resolve({ status: 'failed', stdout: 'x'.repeat(200_000) });
+
+    const error = await failureOf(deps, { explicitPython: '/usr/bin/python3', notebookPath: NOTEBOOK });
+
+    expect(JSON.stringify(error.detail).length).toBeLessThan(2000);
+    expect(error.message.length).toBeLessThan(2000);
   });
 });
 

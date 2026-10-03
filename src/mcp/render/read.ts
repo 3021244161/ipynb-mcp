@@ -120,8 +120,11 @@ export async function renderReadResult(input: RenderReadInput): Promise<RenderRe
           const rawOutput = typedRawOutputs[materialized.outputIndex];
           const image = mapped.items[materialized.outputIndex];
           if (image !== undefined && image.kind === 'image') {
+            // Narrowed, not asserted: `RawOutput.data` is `unknown` per mime because
+            // a json mime legitimately holds any JSON value (review v7 V7-1). An
+            // image block may only be built from an actual base64 string.
             const base64 = rawOutput?.data?.[image.media_type];
-            if (base64 !== undefined) {
+            if (typeof base64 === 'string') {
               imageBlocks.push({ data: base64, media_type: image.media_type });
             }
           }

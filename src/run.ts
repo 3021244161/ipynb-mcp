@@ -501,8 +501,10 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
             // items and rawOutputs are index-aligned (each raw output maps to
             // exactly one item), so the base64 payload sits at the same index.
           const rawOutput = result.result.rawOutputs[materialized.outputIndex];
+          // Narrowed, not asserted: `RawOutput.data` is `unknown` per mime because a
+          // json mime legitimately holds any JSON value (review v7 V7-1).
           const base64 = rawOutput?.data?.[image.media_type];
-          if (base64 !== undefined) {
+          if (typeof base64 === 'string') {
             imageBlocks.push({ data: base64, media_type: image.media_type });
           }
         }

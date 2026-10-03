@@ -11,7 +11,18 @@ import { isJsonMime, isRepresentableMimeValue, type Hasher, type NotebookCell } 
 /** Raw output as delivered by the sidecar protocol (SPEC §5.8, + metadata for §4.4). */
 export interface RawOutput {
   outputType: 'stream' | 'display_data' | 'execute_result' | 'error';
-  data?: Record<string, string>;
+  /**
+   * Mime-keyed values.
+   *
+   * `unknown`, not `string`: nbformat's `application/json` (and every `+json`
+   * mime) may hold ANY JSON value, and the schema says so explicitly — the read
+   * direction used to run every value through `String()`/`JSON.parse`, which
+   * turned a legal `[1,2,3]` into `123` and dropped objects, numbers, `null` and
+   * booleans entirely, all with no warning. Claiming `string` here was the lie
+   * that let it happen (review v7 V7-1). Every other mime type is still a string
+   * or an array of strings; `mapRawOutputs` narrows per mime.
+   */
+  data?: Record<string, unknown>;
   text?: string;
   name?: 'stdout' | 'stderr';
   ename?: string;
@@ -32,6 +43,20 @@ export interface RawOutput {
  * what the stream/`text` branch has always done; silently dropping the array
  * form lost real outputs (review v3 ARCH-1).
  */
+/**
+ * A text-bearing mime value as a string, or null when it cannot be one.
+ *
+ * `text/*` mimes are declared by nbformat as "string or array of strings", so
+ * the type is a contract — but the type we hold says `unknown`, because the
+ * SAME field carries `application/json` (any JSON value). Narrowing here rather
+ * than asserting keeps a hostile/garbled value out of a `text: string` field:
+ * `display({'text/plain': 5}, raw=True)` used to come back as `text: 5`
+ * (review v7 P1-b).
+ */
+function mimeText(value: unknown): string | null {
+  return dataValueToString(value);
+}
+
 function dataValueToString(value: unknown): string | null {
   if (typeof value === 'string') {
     return value;
@@ -77,8 +102,19 @@ export function rawOutputsOfCell(cell: NotebookCell): RawOutput[] {
     const raw: RawOutput = { outputType };
     const data = record['data'];
     if (typeof data === 'object' && data !== null && !Array.isArray(data)) {
-      const normalized: Record<string, string> = {};
+      const normalized: Record<string, unknown> = {};
       for (const [key, value] of Object.entries(data as Record<string, unknown>)) {
+        // JSON mime types carry the value ITSELF, in whatever JSON shape the
+        // kernel produced — nbformat's schema allows any of them, and the write
+        // gate already exempts them for exactly that reason (review v6 GATE-5).
+        // Passing them through `dataValueToString` broke that contract on the read
+        // side: `[1,2,3]` was joined to "1,2,3", parsed back as the number 123,
+        // and objects/numbers/null/booleans were dropped with `warnings: []` — the
+        // model was handed a wrong answer for legal data (review v7 V7-1).
+        if (isJsonMime(key)) {
+          normalized[key] = value;
+          continue;
+        }
         const text = dataValueToString(value);
         if (text !== null) {
           normalized[key] = text;
@@ -261,6 +297,30 @@ export interface MapOutputsOptions {
 
 const TRACEBACK_TAIL_LINES = 20;
 
+/**
+ * A stored `application/json` value as the model should see it, plus whether it is
+ * still JSON at all.
+ *
+ * nbformat's schema puts no type constraint on a `json` mime's value, so a file may
+ * legally hold an array, an object, a number, `null` or a boolean, and the read
+ * direction must hand those back unchanged (review v7 V7-1 — `[1,2,3]` used to
+ * reach the model as `123`, and objects/numbers/null/booleans vanished entirely).
+ *
+ * A STRING is parsed, because that is the shape the sidecar delivers and what SPEC
+ * §5.4 row 7 describes; a string that is not valid JSON degrades to `text`, which is
+ * row 7's documented fallback — hence the flag rather than a guess.
+ */
+function jsonValueOf(value: unknown): { parsed: true; value: JsonValue } | { parsed: false; text: string } {
+  if (typeof value !== 'string') {
+    return { parsed: true, value: (value === undefined ? null : value) as JsonValue };
+  }
+  try {
+    return { parsed: true, value: JSON.parse(value) as JsonValue };
+  } catch {
+    return { parsed: false, text: value };
+  }
+}
+
 export function mapRawOutputs(rawOutputs: readonly RawOutput[], options: MapOutputsOptions): MapOutputsResult {
   const items: OutputItem[] = [];
   const extractedImages: ExtractedImage[] = [];
@@ -327,7 +387,7 @@ export function mapRawOutputs(rawOutputs: readonly RawOutput[], options: MapOutp
           bytes: 0,
           artifact_path: null,
           image_index: null,
-          text_fallback: typeof data['text/plain'] === 'string' ? data['text/plain'] : '',
+          text_fallback: mimeText(data['text/plain']) ?? '',
         });
         // Register the failure so the caller emits the documented
         // `image_materialize_failed` warning. Without this entry the output would
@@ -369,7 +429,7 @@ export function mapRawOutputs(rawOutputs: readonly RawOutput[], options: MapOutp
         });
         continue;
       }
-      const fallback = data['text/plain'] ?? '';
+      const fallback = mimeText(data['text/plain']) ?? '';
       if (decoded === null) {
         // Decoding failed: stays kind:"image" with nulls; caller warns
         // image_materialize_failed (SPEC §4.4).
@@ -418,28 +478,37 @@ export function mapRawOutputs(rawOutputs: readonly RawOutput[], options: MapOutp
     }
     // 5. markdown
     if (data['text/markdown'] !== undefined) {
-      items.push({ kind: 'markdown', text: data['text/markdown'] ?? '' });
+      items.push({ kind: 'markdown', text: mimeText(data['text/markdown']) ?? '' });
       continue;
     }
     // 6. html
     if (data['text/html'] !== undefined) {
-      items.push({ kind: 'html', html: data['text/html'] ?? '', text_fallback: data['text/plain'] ?? '' });
+      items.push({
+        kind: 'html',
+        html: mimeText(data['text/html']) ?? '',
+        text_fallback: mimeText(data['text/plain']) ?? '',
+      });
       continue;
     }
-    // 7. json (parse failure degrades to text, SPEC §5.4 row 7)
+    // 7. json (SPEC §5.4 row 7: parse failure degrades to text)
+    //
+    // The stored value is emitted as it is. nbformat puts no type constraint on a
+    // json mime, so the old `JSON.parse(String(value))` was both wrong (it
+    // re-parsed a converted string, turning a legal `[1,2,3]` into the number 123)
+    // and lossy (an object became `[object Object]`, failed to parse, and was pushed
+    // into a `text: string` field as garbage) — review v7 V7-1.
     if (data['application/json'] !== undefined) {
-      const rawJson = data['application/json'] ?? '';
-      try {
-        const value = JSON.parse(rawJson) as JsonValue;
-        items.push({ kind: 'json', value });
-      } catch {
-        items.push({ kind: 'text', media_type: 'text/plain', text: rawJson });
-      }
+      const json = jsonValueOf(data['application/json']);
+      items.push(
+        json.parsed
+          ? { kind: 'json', value: json.value }
+          : { kind: 'text', media_type: 'text/plain', text: json.text },
+      );
       continue;
     }
     // 8. text
     if (data['text/plain'] !== undefined) {
-      items.push({ kind: 'text', media_type: 'text/plain', text: data['text/plain'] ?? '' });
+      items.push({ kind: 'text', media_type: 'text/plain', text: mimeText(data['text/plain']) ?? '' });
       continue;
     }
     // 9. unsupported

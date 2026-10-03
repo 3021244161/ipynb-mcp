@@ -4,7 +4,13 @@ import path from 'node:path';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { dropUnrepresentableOutputs, mapRawOutputs, type RawOutput } from '../../src/core/outputs.js';
+import {
+  dropUnrepresentableOutputs,
+  mapRawOutputs,
+  rawOutputsOfCell,
+  type RawOutput,
+} from '../../src/core/outputs.js';
+import { parseNotebook } from '../../src/core/parse.js';
 import { applyImagePolicy, shouldReturnImages } from '../../src/fs/artifact.js';
 import { hasher } from '../../src/hash.js';
 
@@ -472,5 +478,118 @@ describe('[GATE-5][CRASH-1] values nbformat cannot store', () => {
     expect(findStructuralProblem(doc({
       output_type: 'display_data', data: { 'application/json': { any: 1 } }, metadata: {},
     }))).toBeNull();
+  });
+});
+
+describe('[V7-1] the READ direction preserves legal application/json values', () => {
+  // nbformat's schema puts no type constraint on a json mime, so all of these are
+  // legal on disk. The read path used to run every value through String() and then
+  // JSON.parse: `[1,2,3]` reached the model as the number 123, and an object,
+  // number, null or boolean was dropped entirely as `unsupported, mime_type:
+  // "unknown"` — with `warnings: []`. Legal data, wrong answer, no signal
+  // (review v7 V7-1, independently reproduced by the reviewer).
+  const LEGAL: ReadonlyArray<readonly [string, unknown]> = [
+    ['array of numbers', [1, 2, 3]],
+    ['array of strings', ['a', 'b']],
+    ['nested object', { a: [1, 2, 3], b: { c: true } }],
+    ['number', 5],
+    ['null', null],
+    ['true', true],
+    ['false', false],
+    ['empty object', {}],
+    ['empty array', []],
+  ];
+
+  it.each(LEGAL)('round-trips %s unchanged, with no warning', async (_label, value) => {
+    const doc = parseNotebook(new TextEncoder().encode(JSON.stringify({
+      nbformat: 4,
+      nbformat_minor: 5,
+      metadata: {},
+      cells: [{
+        cell_type: 'code',
+        id: 'c0',
+        metadata: {},
+        source: 'x',
+        execution_count: 1,
+        outputs: [{ output_type: 'display_data', data: { 'application/json': value }, metadata: {} }],
+      }],
+    })), hasher).doc;
+    const cell = (doc.cells as readonly unknown[])[0] as Parameters<typeof rawOutputsOfCell>[0];
+    const mapped = mapRawOutputs(rawOutputsOfCell(cell), {
+      maxImageBytes: 20_971_520,
+      inlineTextChars: 20000,
+      hasher,
+    });
+    // The MIME must survive too: it used to be rewritten to text/plain for string
+    // arrays, which meant the model could not tell what the file actually held.
+    expect(mapped.items).toHaveLength(1);
+    expect(mapped.items[0]).toMatchObject({ kind: 'json', value: value ?? null });
+  });
+
+  it('still degrades an unparseable json STRING to text (SPEC §5.4 row 7)', () => {
+    // A stored string that is not JSON is the one case row 7 sends to `text`. This
+    // is the contract that a blanket "pass the value through" would have broken.
+    const mapped = mapRawOutputs(
+      [{ outputType: 'display_data', data: { 'application/json': '{broken' }, metadata: {} }],
+      { maxImageBytes: 20_971_520, inlineTextChars: 20000, hasher },
+    );
+    expect(mapped.items[0]).toMatchObject({ kind: 'text', media_type: 'text/plain', text: '{broken' });
+  });
+
+  it('parses a json STRING that is valid JSON (the sidecar delivers strings)', () => {
+    const mapped = mapRawOutputs(
+      [{ outputType: 'display_data', data: { 'application/json': '{"k":1}' }, metadata: {} }],
+      { maxImageBytes: 20_971_520, inlineTextChars: 20000, hasher },
+    );
+    expect(mapped.items[0]).toEqual({ kind: 'json', value: { k: 1 } });
+  });
+});
+
+describe('[P1-b] text-bearing mimes are narrowed before they reach the model', () => {
+  // The write direction narrows a mime value before storing it; the response
+  // contract did not, so `display({'text/plain': 5}, raw=True)` came back as
+  // `text: 5` — a number in a field declared `text: string` — while the same
+  // output was stored as `data: {}` (review v7 P1-b).
+  const options = { maxImageBytes: 20_971_520, inlineTextChars: 20000, hasher };
+
+  it.each([
+    ['text/plain', 5],
+    ['text/plain', { nested: true }],
+    ['text/markdown', 7],
+    // An array of strings is the OTHER legal nbformat shape and still joins
+    // (`dataValueToString`); an object is not representable at all.
+    ['text/html', { nested: true }],
+  ] as ReadonlyArray<readonly [string, unknown]>)('%s with a non-string value yields a string', (mime, value) => {
+    const mapped = mapRawOutputs([{ outputType: 'display_data', data: { [mime]: value }, metadata: {} }], options);
+    const item = mapped.items[0] as Record<string, unknown>;
+    for (const field of ['text', 'html', 'text_fallback']) {
+      if (field in item) {
+        expect(typeof item[field], `${mime} ${field} must be a string`).toBe('string');
+      }
+    }
+  });
+
+  it('an unrepresentable html value yields empty html, not invented content', () => {
+    const mapped = mapRawOutputs(
+      [{ outputType: 'display_data', data: { 'text/html': { nested: true } }, metadata: {} }],
+      options,
+    );
+    expect(mapped.items[0]).toMatchObject({ kind: 'html', html: '' });
+  });
+
+  it('a string ARRAY is still joined rather than dropped (the other legal shape)', () => {
+    const mapped = mapRawOutputs(
+      [{ outputType: 'display_data', data: { 'text/html': ['<b>a</b>', '<i>b</i>'] }, metadata: {} }],
+      options,
+    );
+    expect(mapped.items[0]).toMatchObject({ kind: 'html', html: '<b>a</b><i>b</i>' });
+  });
+
+  it('a non-string text/plain never becomes an image fallback either', () => {
+    const mapped = mapRawOutputs(
+      [{ outputType: 'display_data', data: { 'image/png': 123, 'text/plain': 5 }, metadata: {} }],
+      options,
+    );
+    expect(mapped.items[0]).toMatchObject({ kind: 'image', text_fallback: '' });
   });
 });
