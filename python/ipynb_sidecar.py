@@ -18,6 +18,7 @@ Hard rules:
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import sys
@@ -85,14 +86,66 @@ class KernelEntry:
 # its own leftovers.
 CONNECTION_PREFIX = "ipynb-mcp-"
 
-# A connection file older than this cannot belong to a live kernel: every path that
-# ends a kernel deletes its own file, so anything this old was orphaned by a crash
-# or a hard kill.
+# Fallback only, and deliberately conservative. The PRIMARY test for "nobody is using
+# this file" is the pid in its name: `tempfile.mkstemp` is called with
+# `prefix=f"ipynb-mcp-{kernel_id}-{os.getpid()}-"`, so the owning process is right
+# there in the filename and `os.kill(pid, 0)` answers the question directly. Age alone
+# was wrong in both directions: a kernel running longer than this still owns its file,
+# and a file orphaned after the last sidecar started would never be swept at all
+# (review v8 V8-6).
+#
+# So age is applied in a different shape depending on what the platform can tell us —
+# see the two constants below. A single "one hour and it is fair game" rule let a live
+# sidecar's file be swept on Windows, where pid liveness is not testable.
 ORPHAN_CONNECTION_AGE_SECONDS = 3600
+
+# Where pid liveness is NOT testable (Windows), an old file is only removed when it
+# cannot be attributed to a process at all. A week is far longer than any test run and
+# longer than a normal working session, so a file this old with no readable pid is
+# certainly debris rather than something in use.
+UNATTRIBUTABLE_CONNECTION_AGE_SECONDS = 7 * 24 * 3600
+
+
+def _owner_pid(name: str) -> int | None:
+    """The pid embedded in a connection file's name, or None if there is none.
+
+    `ipynb-mcp-<kernelId>-<pid>-<random>.json`; the kernelId may itself contain `-`,
+    so this walks from the end looking for the first all-digit field.
+    """
+    for field in reversed(name.split("-")):
+        head = field.split(".")[0]
+        # At least two digits: single-digit fields are far more likely to be part of a
+        # kernelId than a pid, and guessing wrong means deleting someone's file.
+        if head.isdigit() and len(head) >= 2:
+            return int(head)
+    return None
+
+
+def _owner_is_alive(pid: int) -> bool | None:
+    """Whether `pid` names a live process: True, False, or None if unknowable.
+
+    Only meaningful where `os.kill(pid, 0)` is a liveness test, which Windows is not:
+    a pid can be reused, and CPython surfaces the failure as
+    `OSError: <class 'OSError'> returned a result with an exception set` rather than a
+    clean ESRCH. `None` means the caller must fall back to an age rule.
+    """
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        return None
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError as exc:
+        # ESRCH: no such process. EPERM: it exists but belongs to someone else — alive
+        # either way for our purposes.
+        return getattr(exc, "errno", None) == errno.EPERM
+    except BaseException:  # pragma: no cover - defensive, see the docstring
+        return None
 
 
 def sweep_orphan_connection_files() -> int:
-    """Delete our own stale connection files from the temp directory.
+    """Delete our own abandoned connection files from the temp directory.
 
     The files carry the kernel's HMAC key, so leaving them behind is a (small) leak
     of a credential. Every graceful path already deletes its own file; this exists
@@ -100,31 +153,67 @@ def sweep_orphan_connection_files() -> int:
     down mid-run, which is where the 45 files the v7 review found came from.
 
     Deliberately narrow: only files matching our own name prefix, only in the
-    interpreter's temp directory, only when older than an hour, and never fatal —
-    a sweep that fails must not stop kernels from working.
+    interpreter's temp directory, only when the owning pid is provably gone, and never
+    fatal — a sweep that fails must not stop kernels from working. Where pid liveness
+    cannot be tested at all (Windows), only a file with no readable pid AND older than
+    a week is removed, because "one hour old" is not evidence that nothing owns it.
+
+    This is the ONLY place the sidecar touches a file it did not create, which is why
+    it is registered as D-046 rather than left as an implicit exception to the module
+    rule in AGENTS §4.
     """
     removed = 0
     try:
         temp_dir = tempfile.gettempdir()
         if not os.path.isdir(temp_dir):
             return 0
-        cutoff = time.time() - ORPHAN_CONNECTION_AGE_SECONDS
-        for name in os.listdir(temp_dir):
+        now = time.time()
+        try:
+            entries = os.listdir(temp_dir)
+        except OSError as exc:
+            send_log("warn", f"could not list {temp_dir} to sweep connection files: {exc}")
+            return 0
+        for name in entries:
             if not (name.startswith(CONNECTION_PREFIX) and name.endswith(".json")):
                 continue
-            candidate = os.path.join(temp_dir, name)
+            # Each file is judged independently, and a failure to judge ONE file must
+            # not abort the scan: the whole point is to clean up after crashes, and a
+            # crashed run can leave anything behind. The previous shape let a single
+            # bad entry end the loop with a warning, which is how the sweep "failed"
+            # while still removing five files.
             try:
-                if os.path.getmtime(candidate) > cutoff:
-                    continue
+                pid = _owner_pid(name)
+                candidate = os.path.join(temp_dir, name)
+                age = now - os.path.getmtime(candidate)
+                if pid is None:
+                    # Nothing in the name says who owns it: only a file this old is
+                    # certainly debris. Never a live candidate's file.
+                    if age <= UNATTRIBUTABLE_CONNECTION_AGE_SECONDS:
+                        continue
+                else:
+                    alive = _owner_is_alive(pid)
+                    if alive is True:
+                        continue
+                    if alive is None and age <= UNATTRIBUTABLE_CONNECTION_AGE_SECONDS:
+                        # This platform cannot judge the pid, so age has to carry the
+                        # whole argument — and an hour does not.
+                        continue
+                    if alive is False and age <= ORPHAN_CONNECTION_AGE_SECONDS:
+                        # A just-exited kernel removes its own file; racing that path
+                        # buys nothing.
+                        continue
                 os.unlink(candidate)
                 removed += 1
             except OSError:
+                continue
+            except BaseException as exc:  # pragma: no cover - defensive
+                send_log("warn", f"skipping {name} during the connection-file sweep: {exc!r}")
                 continue
     except Exception as exc:  # pragma: no cover - the sweep must never be fatal
         send_log("warn", f"orphan connection-file sweep failed: {exc}")
         return removed
     if removed:
-        send_log("info", f"removed {removed} orphaned connection file(s) from {tempfile.gettempdir()}")
+        send_log("info", f"removed {removed} orphaned connection file(s) from {temp_dir}")
     return removed
 
 

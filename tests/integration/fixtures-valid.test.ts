@@ -122,7 +122,10 @@ describe('[FID-1] every notebook fixture is valid nbformat', () => {
       // that never ran — the failure mode review v7 P0-a is about. The reason is
       // in the test name now, and `IPYNB_REQUIRE_NBFORMAT=1` turns the absence
       // into a failure.
-      const reason = nbformatSkipReason(process.env['IPYNB_TEST_PYTHON'] ?? 'python3');
+      // The interpreter the search DID select, not a fresh guess: the old call asked
+      // the base interpreter, so a venv that had nbformat while the base did not
+      // produced "nbformat is not importable" and skipped the check (review v8 V8-11).
+      const reason = nbformatSkipReason(interpreter);
       context.skip(reason ?? 'no interpreter with nbformat was found');
       return;
     }

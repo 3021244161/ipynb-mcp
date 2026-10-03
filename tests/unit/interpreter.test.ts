@@ -290,6 +290,7 @@ describe('[V7-4] the probe never lets a foreign process write the install comman
 
 /** Every standard-library module the sidecar imports (kept beside the check). */
 const STDLIB = new Set([
+  'errno',
   'json',
   'os',
   'sys',
