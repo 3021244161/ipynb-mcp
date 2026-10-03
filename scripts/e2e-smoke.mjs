@@ -17,6 +17,7 @@
 
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -78,7 +79,9 @@ await writeFile(notebookPath, JSON.stringify({
   cells: [
     { cell_type: 'code', id: 'c0', metadata: {}, source: 'text = "hello"\nprint(text)\nlen(text)', outputs: [], execution_count: null },
     { cell_type: 'code', id: 'c1', metadata: {}, source: 'text.upper()', outputs: [], execution_count: null },
+    { cell_type: 'code', id: 'c2', metadata: {}, source: 'import time\ntime.sleep(30)', outputs: [], execution_count: null },
     { cell_type: 'markdown', id: 'm0', metadata: {}, source: '# title' },
+    { cell_type: 'markdown', id: 'm1', metadata: {}, source: 'to be converted' },
   ],
 }));
 
@@ -120,7 +123,7 @@ try {
 
   const read = await call('notebook_read', { path: notebookPath });
   const readBody = parse(read);
-  check('notebook_read returns parseable JSON with 3 cells', readBody?.cells?.length === 3);
+  check('notebook_read returns parseable JSON with 5 cells', readBody?.cells?.length === 5, `cells=${readBody?.cells?.length}`);
 
   // The unknown-argument check must come from the TOOL layer (SPEC §4.1.12),
   // not from the SDK's schema validation (review v4 NEW-1).
@@ -132,7 +135,23 @@ try {
     bogusBody?.code ?? bogus.text.slice(0, 60),
   );
 
-  const run = await call('notebook_run', { path: notebookPath, cell_selector: 'all', timeout_seconds: 120 });
+  // EDIT before RUN: the review found that this script never called
+  // notebook_edit, so a failure mode that lives only on the edit path (the write
+  // gate rejecting an edit it should have allowed) was invisible to it (SMOKE-1).
+  const edit = await call('notebook_edit', {
+    path: notebookPath,
+    ops: [{ op: 'replace_source', cell_index: 1, expected_text: 'text.upper()', new_text: 'text.title()' }],
+  });
+  const editBody = parse(edit);
+  check(
+    'a CAS-anchored edit applies',
+    edit.isError === false && editBody?.applied === 1,
+    editBody?.code ?? `applied=${editBody?.applied}`,
+  );
+
+  // Run only the first two cells: cell 2 is the timeout probe and needs its own
+  // call with a short timeout.
+  const run = await call('notebook_run', { path: notebookPath, cell_selector: '0-1', timeout_seconds: 120 });
   const runBody = parse(run);
   check(
     'notebook_run completes and reports write_back.performed',
@@ -158,12 +177,54 @@ try {
     'the execute_result carries execution_count (nbformat requires it there)',
     outputs.some((output) => output.output_type === 'execute_result' && 'execution_count' in output),
   );
-  check('the markdown cell kept no outputs/execution_count', written.cells[2].outputs === undefined && written.cells[2].execution_count === undefined);
+  check('the markdown cell kept no outputs/execution_count', written.cells[3].outputs === undefined && written.cells[3].execution_count === undefined);
+  check(
+    'the edit reached the file',
+    written.cells[1].source.join('') === 'text.title()',
+    written.cells[1].source.join(''),
+  );
 
-  // Round trip: the tool must read back what it just wrote.
+  // Round trip at CONTENT level: a count-based assertion passed for a writer
+  // that produced the right NUMBER of wrong outputs (SMOKE-1).
   const reread = parse(await call('notebook_read', { path: notebookPath, include_outputs: 'full' }));
   const cellOutputs = reread?.cells?.[0]?.outputs ?? [];
-  check('notebook_read can read back the outputs it wrote', cellOutputs.length >= 2, `outputs=${cellOutputs.length}`);
+  const serializedOutputs = JSON.stringify(cellOutputs);
+  check(
+    'notebook_read reads back the TEXT that was written',
+    serializedOutputs.includes('hello') && serializedOutputs.includes('5'),
+    `outputs=${cellOutputs.length}`,
+  );
+
+  // A timed-out cell: SPEC §4.7 rule 5 must report exec_timeout, and the run
+  // must not hang for the cell's full duration (the sidecar returns as soon as
+  // the interrupt grace expires instead of waiting for a reply that cannot come).
+  const timeoutStartedAt = Date.now();
+  const timedOut = await call('notebook_run', { path: notebookPath, cell_selector: '2', timeout_seconds: 2 });
+  const timeoutMs = Date.now() - timeoutStartedAt;
+  const timedOutBody = parse(timedOut);
+  check(
+    'a timed-out cell reports exec_timeout',
+    timedOut.isError === true && timedOutBody?.code === 'exec_timeout',
+    timedOutBody?.code ?? timedOut.text.slice(0, 60),
+  );
+  // Generous ceiling: the budget is timeout + interrupt grace, measured at about
+  // +10 s including teardown on Windows. Anything close to the cell's own 30 s
+  // means the timeout is not being reported promptly.
+  check('the timeout was reported promptly', timeoutMs < 25_000, `${timeoutMs} ms`);
+  check(
+    'the timed-out cell kept its pre-run state',
+    (() => {
+      const after = JSON.parse(readFileSync(notebookPath, 'utf8'));
+      return after.cells[2].execution_count === null && after.cells[2].outputs.length === 0;
+    })(),
+  );
+
+  // No residue: the kernel tool must be able to shut everything down, and the
+  // session must not leave a kernel behind (SMOKE-1).
+  const shutdown = await call('notebook_kernel', { action: 'shutdown', path: notebookPath });
+  check('kernel shutdown succeeds', shutdown.isError === false, parse(shutdown)?.code);
+  const status = parse(await call('notebook_kernel', { action: 'status' }));
+  check('no kernel is reported after shutdown', Array.isArray(status?.kernels) && status.kernels.length === 0, `kernels=${status?.kernels?.length}`);
 
   // stdout must stay pure JSON-RPC: the transport's stderr is separate, so a
   // leak would have broken connect()/listTools() above, but the log line proves

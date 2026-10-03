@@ -8,9 +8,22 @@
 // execution_count). Those fixtures made the suite's "the file is fine"
 // assertions meaningless, because they described files nbformat rejects.
 //
-// This walks every notebook fixture the integration suite writes and validates
-// it, so a fixture cannot silently drift away from the format the product
-// claims to produce.
+// This file has two layers, and the review was right that the first version
+// over-claimed (TEST-1): it said "every notebook fixture the integration suite
+// writes" while checking two hand-written literals.
+//
+//   1. REPRESENTATIVE literals (below): the two shapes the product must produce,
+//      judged by both our own gate and the real validator, so the two cannot
+//      drift apart.
+//   2. A STATIC sweep over `tests/**/*.ts` (the last case) that enforces the rule
+//      which actually bit us — a kernelspec without `display_name` — on every
+//      literal in the suite, without needing to parse the suite's source.
+//
+// Layer 2 is deliberately narrow: extracting arbitrary notebook literals from
+// test sources and validating them is a parsing problem of its own, and a
+// half-working extractor would give the same false confidence this file was
+// criticised for. What it can do honestly is check the one field that was
+// missing in nine places.
 
 import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -22,7 +35,11 @@ import { parseNotebook, findStructuralProblem } from '../../src/core/parse.js';
 import { hasher } from '../../src/hash.js';
 import { nbformatAvailable, validateNotebook } from './nbformat-validator.js';
 
-/** Every notebook literal the integration suite uses as a starting point. */
+/**
+ * Representative notebook literals: the shapes the write paths must be able to
+ * produce and read back. Not an exhaustive list of the suite's fixtures — see
+ * the header for what the second layer covers.
+ */
 const FIXTURES: ReadonlyArray<{ name: string; notebook: unknown }> = [
   {
     name: 'code-cell-with-stream-output',
@@ -135,19 +152,43 @@ describe('[FID-1] every notebook fixture is valid nbformat', () => {
     expect(files.length).toBeGreaterThan(5);
     const offenders: string[] = [];
     for (const file of files) {
-      const text = await readFile(file, 'utf8');
-      // `kernelspec: { name: 'x', display_name: 'Python 3' }` with no display_name on the same line or the
-      // two that follow it.
-      const lines = text.split('\n');
-      lines.forEach((line, index) => {
-        if (!/kernelspec:\s*\{[^}]*name:/.test(line)) {
-          return;
+      const raw = await readFile(file, 'utf8');
+      // Strip comments first: prose about kernelspecs (including this very
+      // explanation) is not a fixture, and matching it produced a self-inflicted
+      // offender the first time this scan ran.
+      const text = raw
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/(^|[^:])\/\/[^\n]*/g, '$1');
+      // Every `kernelspec: { ... }` literal must carry `display_name`; nbformat
+      // rejects a kernelspec without it (nine of them did, before the v4 round).
+      // The scan reads the whole object, including objects split across lines,
+      // rather than a fixed number of following lines.
+      const marker = /kernelspec:\s*\{/g;
+      let match = marker.exec(text);
+      while (match !== null) {
+        const from = match.index + match[0].length - 1;
+        // Walk braces to find this object's end (nested objects are unlikely in
+        // a kernelspec, but a wrong end would only ever widen the window).
+        let depth = 0;
+        let end = from;
+        for (let index = from; index < text.length; index += 1) {
+          if (text[index] === '{') {
+            depth += 1;
+          } else if (text[index] === '}') {
+            depth -= 1;
+            if (depth === 0) {
+              end = index;
+              break;
+            }
+          }
         }
-        const window = lines.slice(index, index + 2).join(' ');
-        if (!/kernelspec[\s\S]*display_name|\}/.test(window) || !window.includes('display_name')) {
-          offenders.push(`${path.relative(process.cwd(), file)}:${index + 1}`);
+        const literal = text.slice(from, end + 1);
+        const line = text.slice(0, match.index).split('\n').length;
+        if (!literal.includes('display_name')) {
+          offenders.push(`${path.relative(process.cwd(), file)}:${line}`);
         }
-      });
+        match = marker.exec(text);
+      }
     }
     expect(offenders).toEqual([]);
   });

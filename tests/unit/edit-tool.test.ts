@@ -226,6 +226,152 @@ describe('[U9][D3] set_cell_type to markdown through the tool layer', () => {
   });
 });
 
+describe('[GATE-1] pre-existing content cannot lock the notebook', () => {
+  // The v4 gate judged the whole DOCUMENT, which made it judge the user's INPUT
+  // as well as our output. A file that already contained something we would not
+  // write — a `display_data` without `metadata`, exactly what third-party tools
+  // and older versions emit — made every edit and every run fail forever with
+  // `selfcheck_failed` naming a cell the caller never touched. Refusing to write
+  // protects the file but destroys the product (review v5 GATE-1).
+
+  /** A notebook whose cell 1 is something we would never write ourselves. */
+  async function writeQuirky(name: string): Promise<string> {
+    const target = path.join(workspace, name);
+    await writeFile(target, JSON.stringify({
+      nbformat: 4,
+      nbformat_minor: 5,
+      metadata: { kernelspec: { name: 'python3', display_name: 'Python 3', language: 'python' } },
+      cells: [
+        { cell_type: 'code', id: 'c0', metadata: {}, source: 'x = 1', outputs: [], execution_count: null },
+        {
+          cell_type: 'code', id: 'c1', metadata: {}, source: 'y = 2', execution_count: 1,
+          // No `metadata`: legal in nbformat, but nbformat's own schema for
+          // display_data requires it, so this is the shape that used to lock the
+          // whole file. (`data` present, `metadata` absent.)
+          outputs: [{ output_type: 'display_data', data: { 'text/plain': 'no metadata' } }],
+        },
+      ],
+    }));
+    return target;
+  }
+
+  it('editing an UNRELATED cell succeeds and leaves the quirk untouched', async () => {
+    const nb = await writeQuirky('gate1-unrelated.ipynb');
+    const before = await readFile(nb, 'utf8');
+    const { isError, body } = await runEdit({
+      path: nb,
+      ops: [{ op: 'replace_source', cell_index: 0, expected_text: 'x = 1', new_text: 'x = 42' }],
+    });
+    expect(isError, `the edit was blocked: ${JSON.stringify(body)}`).toBeUndefined();
+    expect(body['applied']).toBe(1);
+    // And the caller is TOLD the file already contained something we would not
+    // write, in the same warnings channel notebook_run uses — a log line alone
+    // would inform the operator while the model, the actual consumer, went on
+    // believing the file was clean.
+    const warnings = body['warnings'] as Array<Record<string, unknown>>;
+    expect(warnings.some((warning) => warning['code'] === 'notebook_preexisting_content')).toBe(true);
+    expect(String(warnings.find((w) => w['code'] === 'notebook_preexisting_content')?.['message'])).toContain(
+      'output_metadata_missing',
+    );
+
+    const written = JSON.parse(await readFile(nb, 'utf8')) as { cells: Array<Record<string, unknown>> };
+    expect(written.cells[0]!['source']).toEqual(['x = 42']);
+    // The quirk is carried forward verbatim rather than "fixed" or rejected:
+    // the caller asked to change cell 0, and that is all this tool may do.
+    const quirk = (written.cells[1]!['outputs'] as Array<Record<string, unknown>>)[0]!;
+    expect(quirk['output_type']).toBe('display_data');
+    expect('metadata' in quirk).toBe(false);
+    expect(before).not.toBe(await readFile(nb, 'utf8'));
+  });
+
+  it('an edit to the QUIRKY cell itself still fails (we answer for what we touch)', async () => {
+    const nb = await writeQuirky('gate1-touched.ipynb');
+    const original = await readFile(nb, 'utf8');
+    const { isError, body } = await runEdit({
+      path: nb,
+      ops: [{ op: 'replace_source', cell_index: 1, expected_text: 'y = 2', new_text: 'y = 3' }],
+    });
+    // Rewriting that cell's source leaves its invalid output in place, so the
+    // document we would write still carries the problem we are responsible for.
+    expect(isError).toBe(true);
+    expect(body['code']).toBe('selfcheck_failed');
+    expect(await readFile(nb, 'utf8')).toBe(original);
+  });
+
+  it('clearing the quirky cell\'s outputs is allowed (that write removes the problem)', async () => {
+    const nb = await writeQuirky('gate1-cleared.ipynb');
+    const { isError, body } = await runEdit({
+      path: nb,
+      ops: [{ op: 'clear_outputs', cell_index: 1 }],
+    });
+    // The touched cell is clean once its outputs are gone, so nothing is left to
+    // refuse — the gate must not punish a write for a problem it just removed.
+    expect(isError, `clearing was blocked: ${JSON.stringify(body)}`).toBeUndefined();
+    const written = JSON.parse(await readFile(nb, 'utf8')) as { cells: Array<Record<string, unknown>> };
+    expect(written.cells[1]!['outputs']).toEqual([]);
+  });
+
+  it('[GATE-2] an unrecognized output type stays acceptable for a newer minor', async () => {
+    const { findStructuralProblem, parseNotebook } = await import('../../src/core/parse.js');
+    const build = (minor: number, output: Record<string, unknown>): ReturnType<typeof parseNotebook> =>
+      parseNotebook(new TextEncoder().encode(JSON.stringify({
+        nbformat: 4,
+        nbformat_minor: minor,
+        metadata: {},
+        cells: [{ cell_type: 'code', id: 'c0', metadata: {}, source: 'x = 1', execution_count: 1, outputs: [output] }],
+      })), hasher);
+
+    const unknownOutput = { output_type: 'update_display_data', data: {}, metadata: {} };
+    // nbformat's validator relaxes the output-type oneOf beyond the schema it
+    // implements, so a file from a future minor version is VALID there. Rejecting
+    // it here is a false positive that GATE-1 turned into a permanent lockout.
+    expect(findStructuralProblem(build(6, unknownOutput).doc)).toBeNull();
+    // Within the schema we implement, the whitelist still applies.
+    expect(findStructuralProblem(build(5, unknownOutput).doc)).toMatchObject({
+      rule: 'unknown_output_type',
+    });
+
+    // And the same relaxation applies to cell kinds... except that the PARSER
+    // rejects an unknown cell_type long before the gate sees it. That is a
+    // different, honest boundary: this tool cannot read such a notebook at all
+    // (a `parse_failed`, with the file untouched), rather than reading it and
+    // then refusing to write it back. Recorded here so the difference is a
+    // decision on the record rather than an accident.
+    expect(() =>
+      parseNotebook(new TextEncoder().encode(JSON.stringify({
+        nbformat: 4,
+        nbformat_minor: 6,
+        metadata: {},
+        cells: [{ cell_type: 'someday', id: 'f0', metadata: {}, source: '' }],
+      })), hasher),
+    ).toThrow(/invalid cell_type/);
+  });
+
+  it('[GATE-3] execute_result.execution_count must be an integer or null', async () => {
+    const { findStructuralProblem, parseNotebook } = await import('../../src/core/parse.js');
+    const withCount = (count: unknown): Record<string, unknown> => ({
+      output_type: 'execute_result', data: { 'text/plain': '1' }, metadata: {}, execution_count: count,
+    });
+    const doc = (output: Record<string, unknown>) => parseNotebook(new TextEncoder().encode(JSON.stringify({
+      nbformat: 4,
+      nbformat_minor: 5,
+      metadata: {},
+      cells: [{ cell_type: 'code', id: 'c0', metadata: {}, source: '1', execution_count: 1, outputs: [output] }],
+    })), hasher).doc;
+
+    expect(findStructuralProblem(doc(withCount(3)))).toBeNull();
+    expect(findStructuralProblem(doc(withCount(null)))).toBeNull();
+    // Presence alone let `"3"` and `true` through, both of which nbformat
+    // rejects: the gate was looser than the authority it claims to mirror.
+    expect(findStructuralProblem(doc(withCount('3')))).toMatchObject({
+      rule: 'execute_result_execution_count_not_an_integer',
+    });
+    expect(findStructuralProblem(doc(withCount(1.5)))).toMatchObject({
+      rule: 'execute_result_execution_count_not_an_integer',
+    });
+  });
+});
+
 describe('[U12][D3] tool-level optimistic lock on expected_content_hash', () => {
   it('a stale expected_content_hash raises file_changed with expected/actual in detail', async () => {
     const nb = await writeNb('u12-tool.ipynb', [codeCell('x = 1', 'c0')]);

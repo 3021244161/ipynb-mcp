@@ -61,11 +61,11 @@ export class NdjsonFramer {
    */
   #staging: Buffer = Buffer.alloc(0);
   /**
-   * Valid bytes at the front of `#staging`. The buffer itself is reused (its
-   * capacity only ever grows), because allocating a fresh one per line cost more
-   * than the copies it was meant to avoid: a 64 MiB payload of small lines
-   * allocated 65 537 buffers and took 27 s, slower than the implementation this
-   * replaced.
+   * Valid bytes at the front of `#staging`. The buffer is REUSED across lines
+   * (its capacity only ever grows) because a fresh allocation per line costs more
+   * than the copies it avoids: the first draft of this design allocated one
+   * buffer per line and was measurably slower than the implementation it
+   * replaced, which is why the length is tracked separately from the capacity.
    */
   #stagingLength = 0;
 
@@ -81,14 +81,15 @@ export class NdjsonFramer {
     }
     const lines: string[] = [];
     let consumed = 0;
-    /** Bytes of the CURRENT line held in \#staging\. */
+    /** Bytes of the CURRENT line held in the staging buffer. */
     let pending = this.#stagingLength;
     let newlineIndex = chunk.indexOf(0x0a);
     while (newlineIndex >= 0) {
       // Checked BEFORE copying: an over-long complete line must be rejected
-      // without materialising it (SPEC 5.8).
+      // without materialising it (SPEC §5.8).
       if (pending + (newlineIndex - consumed) > MAX_LINE_BYTES) {
-        throw new ProtocolFramingError('sidecar line exceeds ' + MAX_LINE_BYTES + ' bytes (protocol error)');
+        this.#discard();
+        throw new ProtocolFramingError(`sidecar line exceeds ${MAX_LINE_BYTES} bytes (protocol error)`);
       }
       lines.push(decodeLine(this.#lineWith(chunk.subarray(consumed, newlineIndex), pending)));
       // That line is complete. The loop continues INSIDE the same chunk, where
@@ -120,12 +121,24 @@ export class NdjsonFramer {
     // thing that can still grow into an over-long single line (a chunk holding
     // many complete small lines legitimately exceeds it, review A21).
     if (pending > MAX_LINE_BYTES) {
-      throw new ProtocolFramingError('sidecar line exceeds ' + MAX_LINE_BYTES + ' bytes (protocol error)');
+      // Reset before throwing (review v5 FRAME-3): leaving the rejected bytes in
+      // the staging buffer made `pendingBytes` lie and made every later push
+      // throw again, so the object was quietly single-use. The transport kills
+      // the sidecar on a protocol error, but a wedged framer is a trap for
+      // whoever instantiates the next one.
+      this.#discard();
+      throw new ProtocolFramingError(`sidecar line exceeds ${MAX_LINE_BYTES} bytes (protocol error)`);
     }
     return lines;
   }
 
-  /** \#staging's pending bytes + \segment\, without copying when one side is empty. */
+  /** Return to the initial state; used by the protocol-error paths (FRAME-3). */
+  #discard(): void {
+    this.#staging = Buffer.alloc(0);
+    this.#stagingLength = 0;
+  }
+
+  /** The staging bytes + segment, without copying when either side is empty. */
   #lineWith(segment: Buffer, pending: number): Buffer {
     if (pending === 0) {
       return segment;

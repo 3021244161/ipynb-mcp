@@ -17,8 +17,13 @@ export function validateNotebook(path: string, interpreter: string): { ok: boole
   const script = [
     'import sys',
     'import nbformat',
-    // validate() with the version argument checks the file's OWN nbformat
-    // major.minor, which is what the writer claims to produce.
+    // `as_version=4` UPGRADES a lower-minor file before validating it (nbformat
+    // fills in cell ids etc.), and `validate` then checks against the version it
+    // received — i.e. 4.5 after the upgrade. That is exactly the write
+    // direction's contract: everything this tool writes is 4.5, so what matters
+    // is that the result is accepted as 4.5. It is NOT a byte-level validator for
+    // arbitrary input, which is the precision the first comment lacked
+    // (review v5 TEST-2).
     'nb = nbformat.read(sys.argv[1], as_version=4)',
     'nbformat.validate(nb)',
   ].join('\n');
