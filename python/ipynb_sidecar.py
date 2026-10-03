@@ -81,6 +81,53 @@ class KernelEntry:
             pass  # already gone, or unlinkable: nothing left to do
 
 
+# Prefix `tempfile.mkstemp` gives our connection files, so a later run can recognise
+# its own leftovers.
+CONNECTION_PREFIX = "ipynb-mcp-"
+
+# A connection file older than this cannot belong to a live kernel: every path that
+# ends a kernel deletes its own file, so anything this old was orphaned by a crash
+# or a hard kill.
+ORPHAN_CONNECTION_AGE_SECONDS = 3600
+
+
+def sweep_orphan_connection_files() -> int:
+    """Delete our own stale connection files from the temp directory.
+
+    The files carry the kernel's HMAC key, so leaving them behind is a (small) leak
+    of a credential. Every graceful path already deletes its own file; this exists
+    for the paths that cannot — a SIGKILLed sidecar, a host crash, a CI job torn
+    down mid-run, which is where the 45 files the v7 review found came from.
+
+    Deliberately narrow: only files matching our own name prefix, only in the
+    interpreter's temp directory, only when older than an hour, and never fatal —
+    a sweep that fails must not stop kernels from working.
+    """
+    removed = 0
+    try:
+        temp_dir = tempfile.gettempdir()
+        if not os.path.isdir(temp_dir):
+            return 0
+        cutoff = time.time() - ORPHAN_CONNECTION_AGE_SECONDS
+        for name in os.listdir(temp_dir):
+            if not (name.startswith(CONNECTION_PREFIX) and name.endswith(".json")):
+                continue
+            candidate = os.path.join(temp_dir, name)
+            try:
+                if os.path.getmtime(candidate) > cutoff:
+                    continue
+                os.unlink(candidate)
+                removed += 1
+            except OSError:
+                continue
+    except Exception as exc:  # pragma: no cover - the sweep must never be fatal
+        send_log("warn", f"orphan connection-file sweep failed: {exc}")
+        return removed
+    if removed:
+        send_log("info", f"removed {removed} orphaned connection file(s) from {tempfile.gettempdir()}")
+    return removed
+
+
 KERNELS: dict[str, KernelEntry] = {}
 KERNELS_LOCK = threading.Lock()
 STDOUT_LOCK = threading.Lock()
@@ -520,6 +567,11 @@ def handle_request(request: dict) -> None:
 
 def main() -> int:
     send_log("info", "sidecar ready")
+    # Before starting any kernel: clear the connection files an earlier crashed or
+    # SIGKILLed run could not delete. Doing it at startup rather than at exit is
+    # deliberate — the runs that leak are exactly the ones that never reach an exit
+    # path, so only a later run can clean up after them (review v7 P1-c).
+    sweep_orphan_connection_files()
     workers: list[threading.Thread] = []
     for line in sys.stdin:
         stripped = line.strip()

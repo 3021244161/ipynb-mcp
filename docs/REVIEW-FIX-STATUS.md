@@ -14,7 +14,7 @@
 > 第五轮则出现**漏列**（18 条只列 8 条）。**因此未做或未验证的条目一律 ⬜ / ⚠️ 并写明原因。**
 >
 > **门禁实测（第六轮整改后）**：`pnpm typecheck` 0 错 / `pnpm lint` 0 警（oxlint + `check-format` + `check-indent`）/
-> 单测 **286（全绿，23 文件）** / 集成 **46/46**（6 文件）/ `pnpm smoke` **19/19** /
+> 单测 **287（286 passed + 1 skipped）**，25 文件 / 集成 **46/46**（6 文件）/ `pnpm smoke` **19/19** /
 > `pnpm pack --dry-run` 133 文件 / 全树 LF / **Linux（WSL Ubuntu + Node 22）单测全绿** /
 > **CI 全绿**（第七轮之前最后一次：run `37136146902`，9 个 job；本轮新增 `nbformat` 安装与 `IPYNB_REQUIRE_NBFORMAT=1`，需以新 run 为准）。
 > 集成用到的解释器与三平台默认根见 `COMPATIBILITY.md`。

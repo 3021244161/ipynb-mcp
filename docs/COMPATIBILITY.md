@@ -21,9 +21,9 @@
 
 | 平台 | Node | Python | unit | integration |
 |---|---|---|---|---|
-| Windows 11 x64 | 22.22.2 | 3.10.14（base anaconda：ipykernel 6.25.2 / jupyter_client 8.3.1 / pyzmq 25.1.1） | **286（全绿）**，23 文件 | **46/46**，6 文件全绿（`kernel.test.ts` / `run.test.ts` 自动回退到 base 解释器，见下） |
+| Windows 11 x64 | 22.22.2 | 3.10.14（base anaconda：ipykernel 6.25.2 / jupyter_client 8.3.1 / pyzmq 25.1.1） | **287（286 passed + 1 skipped）**，25 文件 | **46/46**，6 文件全绿（`kernel.test.ts` / `run.test.ts` 自动回退到 base 解释器，见下） |
 | Windows 11 x64 | 22.22.2 | 3.11.11（测试 venv，base conda env 内含 **pyzmq 26.2.0**） | 同上 | **该解释器无法启动 kernel**：sidecar 以 `0xC0000409`（`STATUS_STACK_BUFFER_OVERRUN`）退出，stderr 为 `Bad file descriptor (epoll.cpp:73)` |
-| **WSL Ubuntu 22.04（本机实跑）** | **v22.22.0** | 3.x（无 ipykernel → U20 显式 skip） | **265 passed + 1 skipped**，23 文件 | 未在本机跑（需真实 kernel，见下） |
+| **WSL Ubuntu 22.04（本机实跑）** | **v22.22.0** | 3.x（无 ipykernel → U20 显式 skip） | **287（286 passed + 1 skipped）**，25 文件 | 未在本机跑（需真实 kernel，见下） |
 | ubuntu-latest | 22 / 24 | 3.10 / 3.12 | CI | CI（`pip install ipykernel jupyter_client nbformat` + `IPYNB_REQUIRE_NBFORMAT=1`） |
 | windows-latest | 22 / 24 | 3.x | CI | CI |
 | macos-latest | **22 only** | — | CI | **不跑 integration**（见下） |
