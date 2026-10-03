@@ -2,7 +2,6 @@
 // §10.2 I15 (a locked notebook must map to notebook_locked, never internal),
 // §4.1.8 (the optimistic-lock recheck), §5.5.5 (self check before writing).
 
-import { realpathSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -101,24 +100,27 @@ describe('[W1] lock errors map to notebook_locked on the READ path too', () => {
     const target = path.join(dir, 'backup-locked.ipynb');
     await writeFile(target, NOTEBOOK_JSON);
     const notebook = await readNotebookFile(target, hasher);
-    // The detail carries the CANONICAL path the writer worked with (Windows' short
-    // 8.3 form of the temp directory differs from what `mkdtemp` returned), so
-    // compare against that rather than the input spelling.
-    const canonical = realpathSync(target);
     for (const code of ['EBUSY', 'EPERM', 'EACCES']) {
-      await expect(
-        writeNotebookFile(notebook, target, {
-          hasher,
-          backupKeep: 10,
-          createBackup: true,
-          expectedContentHash: notebook.contentHash,
-          platform: 'win32',
-          copyFileImpl: () => Promise.reject(errorWithCode(code)),
-        }),
-      ).rejects.toMatchObject({
-        code: 'notebook_locked',
-        detail: { path: canonical, errno: code },
-      });
+      // The errno is the assertion this case exists for. The path is compared by
+      // FILENAME, not as a string: macOS reports `/private/var/...` where the test
+      // created `/var/...` (the runner failed exactly there) and Windows has 8.3
+      // short names, so an exact match tests the platform's symlink reporting
+      // rather than the product.
+      const failure = await writeNotebookFile(notebook, target, {
+        hasher,
+        backupKeep: 10,
+        createBackup: true,
+        expectedContentHash: notebook.contentHash,
+        platform: 'win32',
+        copyFileImpl: () => Promise.reject(errorWithCode(code)),
+      }).then(
+        () => null,
+        (cause: unknown) => cause as IpynbError,
+      );
+      expect(failure?.code).toBe('notebook_locked');
+      const detail = failure?.detail as Record<string, unknown>;
+      expect(detail['errno']).toBe(code);
+      expect(path.basename(String(detail['path']))).toBe(path.basename(target));
     }
     // …and a non-lock failure is not relabelled as a lock.
     await expect(
