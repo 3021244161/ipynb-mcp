@@ -311,27 +311,32 @@ export interface MapOutputsOptions {
 const TRACEBACK_TAIL_LINES = 20;
 
 /**
- * A stored `application/json` value as the model should see it, plus whether it is
- * still JSON at all.
+ * A stored json-mime value as the model should see it: exactly as stored.
  *
- * nbformat's schema puts no type constraint on a `json` mime's value, so a file may
- * legally hold an array, an object, a number, `null` or a boolean, and the read
- * direction must hand those back unchanged (review v7 V7-1 — `[1,2,3]` used to
- * reach the model as `123`, and objects/numbers/null/booleans vanished entirely).
+ * nbformat puts NO type constraint on a json mime's value, so a file may legally
+ * hold `null`, a boolean, a number, a STRING, an array or an object. The read
+ * direction must hand back the value itself, never a re-interpretation of it.
  *
- * A STRING is parsed, because that is the shape the sidecar delivers and what SPEC
- * §5.4 row 7 describes; a string that is not valid JSON degrades to `text`, which is
- * row 7's documented fallback — hence the flag rather than a guess.
+ * Two rounds got this wrong in two different ways, which is why the rule is now
+ * "no conversion at all" rather than a set of special cases:
+ *   - v6 and earlier ran every value through `String()` and then `JSON.parse`:
+ *     `[1,2,3]` reached the model as the number 123 (v7 V7-1);
+ *   - v7 fixed the non-string half and kept parsing strings, so a stored
+ *     `"123"` — a JSON STRING, which nbformat is perfectly happy with — reached the
+ *     model as the number 123, and `"hello"` lost its mime entirely and came back
+ *     as `text/plain` (v8 V8-2).
+ *
+ * Both are the same failure: the model was shown a value the file does not contain.
+ * A string that happens to look like JSON is still a string, and the kernel's own
+ * value for a json mime is already typed (the sidecar passes `content['data']`
+ * straight through), so there is nothing to parse on either path.
+ *
+ * SPEC §5.4 row 7's "parse failure degrades to `text`" is about a value that cannot
+ * be represented as json at all; that case no longer arises here, because every JSON
+ * value is now emittable as-is.
  */
-function jsonValueOf(value: unknown): { parsed: true; value: JsonValue } | { parsed: false; text: string } {
-  if (typeof value !== 'string') {
-    return { parsed: true, value: (value === undefined ? null : value) as JsonValue };
-  }
-  try {
-    return { parsed: true, value: JSON.parse(value) as JsonValue };
-  } catch {
-    return { parsed: false, text: value };
-  }
+function jsonValueOf(value: unknown): JsonValue {
+  return (value === undefined ? null : value) as JsonValue;
 }
 
 export function mapRawOutputs(rawOutputs: readonly RawOutput[], options: MapOutputsOptions): MapOutputsResult {
@@ -417,7 +422,11 @@ export function mapRawOutputs(rawOutputs: readonly RawOutput[], options: MapOutp
         });
         continue;
       }
-      const base64 = rawImage;
+      // A `data:` URL is what people paste and what some tools emit. Jupyter cannot
+      // render one either (`base64.b64decode` fails on the prefix), so this is not
+      // legal data being dropped — but the prefix is unambiguous and stripping it is
+      // both cheap and what the user meant (review v8 V8-3).
+      const base64 = stripDataUrlPrefix(rawImage, imageMediaType);
       // Cheap pre-check on the ENCODED length before decoding: base64 is 4/3 of
       // the payload, so an obviously oversized image never needs the decode
       // (which itself costs ~2.5x the image in transient copies) nor the
@@ -445,7 +454,10 @@ export function mapRawOutputs(rawOutputs: readonly RawOutput[], options: MapOutp
       const fallback = mimeText(data['text/plain']) ?? '';
       if (decoded === null) {
         // Decoding failed: stays kind:"image" with nulls; caller warns
-        // image_materialize_failed (SPEC §4.4).
+        // image_materialize_failed (SPEC §4.4). The REASON goes in the fallback text
+        // because `bytes: 0` plus a null artifact is exactly what an empty image
+        // looks like, and a model that cannot tell "broken" from "empty" will
+        // overwrite the output (review v8 V8-3).
         items.push({
           kind: 'image',
           media_type: imageMediaType,
@@ -454,7 +466,7 @@ export function mapRawOutputs(rawOutputs: readonly RawOutput[], options: MapOutp
           bytes: 0,
           artifact_path: null,
           image_index: null,
-          text_fallback: fallback,
+          text_fallback: fallback === '' ? imageDecodeProblem(rawImage) : fallback,
         });
         extractedImages.push({
           outputIndex: items.length - 1,
@@ -503,20 +515,20 @@ export function mapRawOutputs(rawOutputs: readonly RawOutput[], options: MapOutp
       });
       continue;
     }
-    // 7. json (SPEC §5.4 row 7: parse failure degrades to text)
+    // 7. json
     //
-    // The stored value is emitted as it is. nbformat puts no type constraint on a
-    // json mime, so the old `JSON.parse(String(value))` was both wrong (it
-    // re-parsed a converted string, turning a legal `[1,2,3]` into the number 123)
-    // and lossy (an object became `[object Object]`, failed to parse, and was pushed
-    // into a `text: string` field as garbage) — review v7 V7-1.
-    if (data['application/json'] !== undefined) {
-      const json = jsonValueOf(data['application/json']);
-      items.push(
-        json.parsed
-          ? { kind: 'json', value: json.value }
-          : { kind: 'text', media_type: 'text/plain', text: json.text },
-      );
+    // The KEY is found with nbformat's own json rule (`isJsonMime`), the same one
+    // the write gate uses to decide the value is storable. Looking up only the
+    // literal `application/json` meant every `application/<x>+json` value was legal
+    // on disk (the write side kept it) and invisible to the model (the read side
+    // reported `unsupported`), with nothing to say so (review v8 V8-1).
+    //
+    // The VALUE is emitted as it is, with no conversion at all: see
+    // {@link jsonValueOf}. SPEC §5.4 row 7's "parse failure degrades to `text`" no
+    // longer has a case to apply to, because every JSON value is now emittable.
+    const jsonKey = Object.keys(data).find((key) => isJsonMime(key));
+    if (jsonKey !== undefined) {
+      items.push({ kind: 'json', value: jsonValueOf(data[jsonKey]) });
       continue;
     }
     // 8. text
@@ -526,7 +538,16 @@ export function mapRawOutputs(rawOutputs: readonly RawOutput[], options: MapOutp
     }
     // 9. unsupported
     const firstMime = Object.keys(data)[0] ?? 'unknown';
-    items.push({ kind: 'unsupported', mime_type: firstMime, message: 'unsupported output type' });
+    items.push({
+      kind: 'unsupported',
+      mime_type: firstMime,
+      // "The value is still in the file" is the part the model needs: a bare
+      // "unsupported output type" reads as "this output is empty", and a model that
+      // believes an output is empty will happily rewrite the cell and destroy it
+      // (review v8 V8-1). This tool never drops a stored output, so saying so is
+      // simply true.
+      message: `unsupported output type; the value is preserved in the file unchanged (mime: ${firstMime})`,
+    });
   }
 
   return { items, extractedImages };
@@ -534,8 +555,34 @@ export function mapRawOutputs(rawOutputs: readonly RawOutput[], options: MapOutp
 
 // ---------------------------------------------------------------------------
 
+/**
+ * The base64 payload of an image value, accepting the `data:` URL form.
+ *
+ * Only the exact shape `data:<anything>;base64,<payload>` is stripped, and only when
+ * the payload actually follows; anything else is returned untouched so the normal
+ * decode failure path still reports it.
+ */
+function stripDataUrlPrefix(value: string, mediaType: 'image/png' | 'image/jpeg'): string {
+  const match = /^data:([^;,]*);base64,(.*)$/s.exec(value);
+  if (match === null) {
+    return value;
+  }
+  // The declared type is ignored rather than enforced: the mime KEY is what the
+  // notebook says this data is, and a mismatch there is the file's problem, not a
+  // reason to refuse to render an image the user can see.
+  void mediaType;
+  return match[2] ?? '';
+}
+
 function decodeBase64(base64: string): Uint8Array | null {
   const cleaned = base64.replace(/\s+/g, '');
+  // Reject anything that is not base64 before handing it to `atob`, so the failure
+  // can say WHICH way it is wrong. `atob` throws a bare "Invalid character" that
+  // reaches the model as a zero-byte image, which reads as "the image is empty"
+  // rather than "this value is not base64" (review v8 V8-3).
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(cleaned) || cleaned.length % 4 !== 0) {
+    return null;
+  }
   try {
     const binary = atob(cleaned);
     const bytes = new Uint8Array(binary.length);
@@ -546,6 +593,23 @@ function decodeBase64(base64: string): Uint8Array | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Why an image value could not be materialized, in the model's words.
+ *
+ * The distinction that matters: "empty" and "broken" look identical in the response
+ * (`bytes: 0`, `artifact_path: null`), so the reason has to be explicit or a model
+ * will treat a malformed value as an absent one.
+ */
+function imageDecodeProblem(value: string): string {
+  if (value.trim() === '') {
+    return 'image value is empty';
+  }
+  if (/^data:/i.test(value.trim())) {
+    return 'image value is a data: URL that could not be decoded (expected data:<mime>;base64,<payload>)';
+  }
+  return 'image value is not valid base64';
 }
 
 /**

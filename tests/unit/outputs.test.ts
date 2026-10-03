@@ -131,14 +131,28 @@ describe('[step6] mapRawOutputs ordered dispatch (SPEC §5.4)', () => {
     ]);
     expect(items[0]).toMatchObject({ kind: 'markdown', text: '# hi' });
     expect(items[1]).toMatchObject({ kind: 'html', html: '<p>x</p>', text_fallback: 'x' });
-    expect(items[2]).toMatchObject({ kind: 'json', value: { a: 1 } });
+    // The stored value IS the string `{"a":1}` — nbformat puts no type constraint on
+    // a json mime, so emitting `{a: 1}` would show the model a value the file does
+    // not contain. This assertion used to require the parsed object, which is the
+    // behaviour v8 V8-2 identified as silently rewriting data.
+    expect(items[2]).toMatchObject({ kind: 'json', value: '{"a":1}' });
     expect(items[3]).toMatchObject({ kind: 'text', text: '42' });
-    expect(items[4]).toMatchObject({ kind: 'unsupported', mime_type: 'application/vnd.foo+json' });
+    // `+json` is a json mime by nbformat's own rule (`^application/(.*\+)?json$`),
+    // the same rule the write side uses to keep the value. Reporting it as
+    // `unsupported` meant a value that was written to the file could not be read
+    // back — and this assertion used to PIN that behaviour (review v8 V8-1).
+    expect(items[4]).toMatchObject({ kind: 'json', value: '{}' });
   });
 
-  it('degrades unparseable application/json to text', () => {
+  it('emits a json-mime value unchanged, including one that is not valid JSON text', () => {
+    // SPEC §5.4 row 7's "parse failure degrades to text" described a value that
+    // cannot be represented as json. There is no such value: every JSON value is now
+    // emittable as-is, so a string that merely LOOKS like broken JSON is still a
+    // string and must survive as one. Degrading it to `text/plain` also rewrote the
+    // mime, which is how `{'application/json': 'hello'}` lost its type entirely
+    // (review v8 V8-2).
     const { items } = mapOutputs([{ outputType: 'execute_result', data: { 'application/json': '{broken' } }]);
-    expect(items[0]).toMatchObject({ kind: 'text', text: '{broken' });
+    expect(items[0]).toStrictEqual({ kind: 'json', value: '{broken' });
   });
 
   it('parses png/jpeg dimensions from headers, metadata takes priority', () => {
@@ -481,26 +495,53 @@ describe('[GATE-5][CRASH-1] values nbformat cannot store', () => {
   });
 });
 
-describe('[V7-1] the READ direction preserves legal application/json values', () => {
-  // nbformat's schema puts no type constraint on a json mime, so all of these are
-  // legal on disk. The read path used to run every value through String() and then
-  // JSON.parse: `[1,2,3]` reached the model as the number 123, and an object,
-  // number, null or boolean was dropped entirely as `unsupported, mime_type:
-  // "unknown"` — with `warnings: []`. Legal data, wrong answer, no signal
-  // (review v7 V7-1, independently reproduced by the reviewer).
-  const LEGAL: ReadonlyArray<readonly [string, unknown]> = [
-    ['array of numbers', [1, 2, 3]],
-    ['array of strings', ['a', 'b']],
-    ['nested object', { a: [1, 2, 3], b: { c: true } }],
-    ['number', 5],
+describe('[V8-2][V8-1] the READ direction preserves EVERY legal value for every mime', () => {
+  // The hard rule this round adds (AGENTS §9): when a data shape is fixed, the
+  // matrix of ALL its legal types comes with it, and each entry is proven to fail
+  // before the fix. v7 fixed `application/json` for non-string values and stopped
+  // there, so the string half of the same contract stayed broken (V8-2) and the
+  // `+json` family was never touched (V8-1) — the reviewer's own re-verification
+  // made the same mistake, which is why the rule is written down for both sides.
+  //
+  // nbformat puts NO type constraint on a json mime's value, so every one of these
+  // is legal on disk and must reach the model unchanged:
+  const JSON_TYPES: ReadonlyArray<readonly [string, unknown]> = [
     ['null', null],
     ['true', true],
     ['false', false],
-    ['empty object', {}],
+    ['integer', 5],
+    ['negative integer', -7],
+    ['float', 2.5],
+    ['empty string', ''],
+    // A JSON STRING: the value the file holds is the string. Parsing it would turn
+    // `"123"` into the NUMBER 123 — a different value, not a degradation (V8-2).
+    ['numeric string', '123'],
+    ['plain string', 'hello'],
+    ['JSON-looking string', '{"k":1}'],
+    ['string with newline', 'a\nb'],
     ['empty array', []],
+    ['array of numbers', [1, 2, 3]],
+    ['array of strings', ['a', 'b']],
+    ['array of mixed types', [1, 'a', null, { b: true }]],
+    ['empty object', {}],
+    ['object', { k: 'v' }],
+    ['nested object', { a: [1, 2, 3], b: { c: true } }],
   ];
 
-  it.each(LEGAL)('round-trips %s unchanged, with no warning', async (_label, value) => {
+  // Every mime nbformat treats as JSON (`patternProperties` is
+  // `^application/(.*\+)?json$`), which is the SAME rule the write side already
+  // uses through `isJsonMime`.
+  const JSON_MIMES = [
+    'application/json',
+    'application/x+json',
+    'application/vnd.custom+json',
+    'application/x/y+json',
+    'application/+json',
+  ];
+
+  const options = { maxImageBytes: 20_971_520, inlineTextChars: 20000, hasher };
+
+  function project(mime: string, value: unknown): unknown {
     const doc = parseNotebook(new TextEncoder().encode(JSON.stringify({
       nbformat: 4,
       nbformat_minor: 5,
@@ -511,40 +552,84 @@ describe('[V7-1] the READ direction preserves legal application/json values', ()
         metadata: {},
         source: 'x',
         execution_count: 1,
-        outputs: [{ output_type: 'display_data', data: { 'application/json': value }, metadata: {} }],
+        outputs: [{ output_type: 'display_data', data: { [mime]: value }, metadata: {} }],
       }],
     })), hasher).doc;
     const cell = (doc.cells as readonly unknown[])[0] as Parameters<typeof rawOutputsOfCell>[0];
-    const mapped = mapRawOutputs(rawOutputsOfCell(cell), {
-      maxImageBytes: 20_971_520,
-      inlineTextChars: 20000,
-      hasher,
+    return mapRawOutputs(rawOutputsOfCell(cell), options).items[0];
+  }
+
+  for (const mime of JSON_MIMES) {
+    it.each(JSON_TYPES)(`${mime} with a %s value round-trips unchanged`, (label, value) => {
+      // `toStrictEqual` on the whole item: `kind`, `value`, and the absence of any
+      // other field. A weaker matcher would let the projection add a `text`/`mime`
+      // field and still pass, which is how the mime rewrite went unnoticed.
+      expect(project(mime, value), `${mime} / ${label}`).toStrictEqual({ kind: 'json', value });
     });
-    // The MIME must survive too: it used to be rewritten to text/plain for string
-    // arrays, which meant the model could not tell what the file actually held.
-    expect(mapped.items).toHaveLength(1);
-    expect(mapped.items[0]).toMatchObject({ kind: 'json', value: value ?? null });
+  }
+
+  it('a non-json mime still reports unsupported, not json', () => {
+    // The mirror of the rule: widening `isJsonMime` must not swallow everything.
+    expect(project('application/octet-stream', 'x')).toMatchObject({ kind: 'unsupported' });
+    expect(project('text/x-custom', 'x')).toMatchObject({ kind: 'unsupported' });
   });
 
-  it('still degrades an unparseable json STRING to text (SPEC §5.4 row 7)', () => {
-    // A stored string that is not JSON is the one case row 7 sends to `text`. This
-    // is the contract that a blanket "pass the value through" would have broken.
-    const mapped = mapRawOutputs(
-      [{ outputType: 'display_data', data: { 'application/json': '{broken' }, metadata: {} }],
-      { maxImageBytes: 20_971_520, inlineTextChars: 20000, hasher },
-    );
-    expect(mapped.items[0]).toMatchObject({ kind: 'text', media_type: 'text/plain', text: '{broken' });
-  });
-
-  it('parses a json STRING that is valid JSON (the sidecar delivers strings)', () => {
-    const mapped = mapRawOutputs(
-      [{ outputType: 'display_data', data: { 'application/json': '{"k":1}' }, metadata: {} }],
-      { maxImageBytes: 20_971_520, inlineTextChars: 20000, hasher },
-    );
-    expect(mapped.items[0]).toEqual({ kind: 'json', value: { k: 1 } });
+  it('an unsupported mime says the value is still in the file', () => {
+    // V8-1: legal data the model cannot see must at least be reported as PRESERVED,
+    // otherwise the model concludes the output is empty and rewrites the cell.
+    const item = project('application/x-custom-binary', { k: 'v' }) as Record<string, unknown>;
+    expect(item['kind']).toBe('unsupported');
+    expect(String(item['message'])).toMatch(/preserved|kept|unchanged/i);
   });
 });
 
+describe('[V8-3] an image value the tool cannot decode says WHY', () => {
+  const options = { maxImageBytes: 20_971_520, inlineTextChars: 20000, hasher };
+  const PNG_1PX = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+
+  function imageItem(value: string): Record<string, unknown> {
+    const doc = parseNotebook(new TextEncoder().encode(JSON.stringify({
+      nbformat: 4,
+      nbformat_minor: 5,
+      metadata: {},
+      cells: [{
+        cell_type: 'code',
+        id: 'c0',
+        metadata: {},
+        source: 'x',
+        execution_count: 1,
+        outputs: [{ output_type: 'display_data', data: { 'image/png': value }, metadata: {} }],
+      }],
+    })), hasher).doc;
+    const cell = (doc.cells as readonly unknown[])[0] as Parameters<typeof rawOutputsOfCell>[0];
+    const result = mapRawOutputs(rawOutputsOfCell(cell), options);
+    return { ...(result.items[0] as Record<string, unknown>), __decodeFailed: result.extractedImages[0]?.decodeFailed };
+  }
+
+  it('plain base64 materializes (the control)', () => {
+    const item = imageItem(PNG_1PX);
+    expect(item).toMatchObject({ kind: 'image', bytes: expect.any(Number) });
+    expect(item['bytes'] as number).toBeGreaterThan(0);
+    expect(item['__decodeFailed']).toBe(false);
+  });
+
+  it('a data-URL is accepted by stripping the prefix (it is what users paste)', () => {
+    // Jupyter cannot render `data:image/png;base64,...` either, but a user CAN paste
+    // it into a cell and it is unambiguous. Refusing it produced a zero-byte image
+    // with only "materialize failed" as an explanation (review v8 V8-3).
+    const item = imageItem(`data:image/png;base64,${PNG_1PX}`);
+    expect(item).toMatchObject({ kind: 'image' });
+    expect(item['bytes'] as number).toBeGreaterThan(0);
+    expect(item['__decodeFailed']).toBe(false);
+  });
+
+  it('a value that is neither says so, instead of implying an empty image', () => {
+    const item = imageItem('not base64 at all!!');
+    expect(item).toMatchObject({ kind: 'image', bytes: 0, artifact_path: null });
+    // The model must be able to tell "this is broken" from "this is empty".
+    expect(JSON.stringify(item)).toMatch(/decode|invalid|not valid|characters/i);
+  });
+});
 describe('[P1-b] text-bearing mimes are narrowed before they reach the model', () => {
   // The write direction narrows a mime value before storing it; the response
   // contract did not, so `display({'text/plain': 5}, raw=True)` came back as
