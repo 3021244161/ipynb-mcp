@@ -6,7 +6,6 @@ import { existsSync, realpathSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
@@ -16,12 +15,7 @@ import { KernelRegistry } from '../../src/kernel/registry.js';
 import { pythonPrefix } from '../../src/kernel/interpreter.js';
 import { runNotebook, type RunDeps } from '../../src/run.js';
 import { createLogger } from '../../src/log.js';
-
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const VENV_DIR = path.join(REPO_ROOT, 'tests', '.venv-test');
-const WINDOWS = process.platform === 'win32';
-const VENV_PY = WINDOWS ? path.join(VENV_DIR, 'Scripts', 'python.exe') : path.join(VENV_DIR, 'bin', 'python');
-const BASE_PYTHON = process.env['IPYNB_TEST_PYTHON'] ?? (WINDOWS ? 'python' : 'python3');
+import { BASE_PYTHON, VENV_PY, VENV_DIR } from './test-venv.js';
 
 let workspace: string;
 let registry: KernelRegistry;

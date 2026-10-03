@@ -25,7 +25,6 @@ import { existsSync, realpathSync, writeFileSync } from 'node:fs';
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
@@ -37,12 +36,9 @@ import { PathFence } from '../../src/fs/fence.js';
 import { createLogger } from '../../src/log.js';
 import { handleNotebookEdit } from '../../src/mcp/tools/edit.js';
 import { toCallToolResult } from '../../src/mcp/tools/result.js';
+import { BASE_PYTHON, VENV_DIR, VENV_PY } from './test-venv.js';
 
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const VENV_DIR = path.join(REPO_ROOT, 'tests', '.venv-test');
 const WINDOWS = process.platform === 'win32';
-const VENV_PY = WINDOWS ? path.join(VENV_DIR, 'Scripts', 'python.exe') : path.join(VENV_DIR, 'bin', 'python');
-const BASE_PYTHON = process.env['IPYNB_TEST_PYTHON'] ?? (WINDOWS ? 'python' : 'python3');
 
 let workspace: string;
 let registry: KernelRegistry;
@@ -76,6 +72,7 @@ FILE_ATTRIBUTE_NORMAL = 0x80
 
 path, seconds = sys.argv[1], float(sys.argv[2])
 trigger = sys.argv[3] if len(sys.argv) > 3 else ''
+release = sys.argv[4] if len(sys.argv) > 4 else ''
 
 if trigger:
     deadline = time.time() + 30
@@ -94,28 +91,48 @@ if handle == INVALID_HANDLE_VALUE or handle is None:
     sys.exit(1)
 try:
     print(json.dumps({"ok": True}), flush=True)
-    time.sleep(seconds)
+    if release:
+        # Wait for the RELEASE file instead of a timeout, so the test decides when
+        # the handle closes. Killing the child does not do it: SIGTERM does not
+        # interrupt Python's sleep on Windows, so the handle stayed open and the
+        # verification read failed with EBUSY — a test failure that looked like a
+        # product failure (the same confusion as the two earlier versions of this
+        # case).
+        deadline = time.time() + 30
+        while not os.path.exists(release):
+            if time.time() > deadline:
+                sys.exit(3)
+            time.sleep(0.01)
+    else:
+        time.sleep(seconds)
 finally:
     ctypes.windll.kernel32.CloseHandle(handle)
+    print(json.dumps({"released": True}), flush=True)
 `;
 
 interface Holder {
   readonly child: ReturnType<typeof spawn>;
   readonly exited: Promise<number | null>;
+  /** Path whose appearance tells the holder to close the handle. */
+  readonly release: string;
 }
 
 /**
  * Starts the exclusive handle and resolves only once it reports that it is HELD.
  *
- * Waiting for the report is the whole point: the previous version slept and hoped,
- * so a holder that failed to take the handle left the case passing against an
- * unlocked file.
+ * Waiting for the report is the whole point: an earlier version slept and hoped, so
+ * a holder that failed to take the handle left the case passing against an unlocked
+ * file.
  */
 async function startHolder(target: string, seconds: number, trigger?: string): Promise<Holder> {
+  const release = path.join(workspace, `release-${path.basename(target)}`);
   const args = ['-c', PYTHON_HOLDER, target, String(seconds)];
   if (trigger !== undefined) {
     args.push(trigger);
+  } else {
+    args.push('');
   }
+  args.push(release);
   const child = spawn(VENV_PY, args, { stdio: ['ignore', 'pipe', 'pipe'] });
   const exited = new Promise<number | null>((resolve) => {
     child.once('exit', (code) => resolve(code));
@@ -145,12 +162,26 @@ async function startHolder(target: string, seconds: number, trigger?: string): P
     await exited;
     throw new Error(`the exclusive holder never took the lock: ${stdout.trim()} ${stderr.trim()}`);
   }
-  return { child, exited };
+  return { child, exited, release };
 }
 
+/**
+ * Closes the holder's handle and waits for the process to be gone.
+ *
+ * `child.kill()` alone is not enough: on Windows SIGTERM does not interrupt
+ * Python's `time.sleep`, so the handle stayed open and the verification read threw
+ * EBUSY — a test failure wearing the costume of a product failure.
+ */
 async function stopHolder(holder: Holder): Promise<void> {
-  holder.child.kill();
-  await holder.exited;
+  writeFileSync(holder.release, 'release');
+  const gone = await Promise.race([
+    holder.exited,
+    new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 30_000)),
+  ]);
+  if (gone === 'timeout') {
+    holder.child.kill();
+    await holder.exited;
+  }
 }
 
 function toolContext(): Parameters<typeof handleNotebookEdit>[0] {

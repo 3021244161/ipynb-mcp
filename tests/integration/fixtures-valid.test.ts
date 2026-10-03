@@ -34,6 +34,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { parseNotebook, findStructuralProblem } from '../../src/core/parse.js';
 import { hasher } from '../../src/hash.js';
 import { nbformatAvailable, nbformatSkipReason, validateNotebook } from './nbformat-validator.js';
+import { TEST_VENV_PY } from './test-venv.js';
 
 /**
  * Representative notebook literals: the shapes the write paths must be able to
@@ -85,7 +86,7 @@ beforeAll(async () => {
   const { existsSync } = await import('node:fs');
   const candidates = [
     process.env['IPYNB_TEST_PYTHON'],
-    path.join(process.cwd(), 'tests', '.venv-test', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python'),
+    TEST_VENV_PY,
     process.platform === 'win32' ? 'python' : 'python3',
   ].filter((entry): entry is string => typeof entry === 'string' && entry !== '');
   for (const candidate of candidates) {

@@ -28,6 +28,22 @@ function fixFile(file) {
     const at = (p) => source.getLineAndCharacterOfPosition(p);
     const fixes = [];
 
+    /**
+     * Whether this line starts with nothing but whitespace before the given
+     * node — i.e. re-indenting it moves only that node.
+     *
+     * A legal `case 1: return 1;` puts two constructs on one line, and moving
+     * the line to satisfy one of them makes the other wrong: the fixer pushed
+     * the whole line deeper for the statement, then the checker wanted the label
+     * back where it started, and 25 rounds later the file failed `pnpm lint`
+     * (review v7 V7-3). Neither can be fixed without rewriting the line, so
+     * neither is touched.
+     */
+    const ownsLine = (node) => {
+      const where = at(node.getStart(source, true));
+      return where.character === /^[ \t]*/.exec(lines[where.line])[0].length;
+    };
+
     const fixLine = (line, target) => {
       const current = /^[ \t]*/.exec(lines[line] ?? '')[0].length;
       if (current === target) {
@@ -49,10 +65,7 @@ function fixFile(file) {
       const own = indent(text, open.line);
       for (const statement of block.statements) {
         const where = at(statement.getStart(source, true));
-        // Only touch a line whose first non-space character is this statement:
-        // a statement sharing a line with other syntax cannot be re-indented
-        // without rewriting the line.
-        if (where.character === /^[ \t]*/.exec(lines[where.line])[0].length) {
+        if (ownsLine(statement)) {
           if (fixLine(where.line, own + 2)) {
             fixes.push(where.line + 1);
           }
@@ -92,14 +105,13 @@ function fixFile(file) {
       } else if (ts.isSwitchStatement(node)) {
         const caseColumn = indent(text, at(node.caseBlock.getStart(source, true)).line) + 2;
         for (const clause of node.caseBlock.clauses) {
-          const where = at(clause.getStart(source, true));
-          if (fixLine(where.line, caseColumn)) {
-            fixes.push(where.line + 1);
+          if (ownsLine(clause) && fixLine(at(clause.getStart(source, true)).line, caseColumn)) {
+            fixes.push(at(clause.getStart(source, true)).line + 1);
           }
           for (const statement of clause.statements) {
             if (ts.isBlock(statement)) {
               handleBlock(statement, caseColumn);
-            } else {
+            } else if (ownsLine(statement)) {
               const at2 = at(statement.getStart(source, true));
               if (fixLine(at2.line, caseColumn + 2)) {
                 fixes.push(at2.line + 1);

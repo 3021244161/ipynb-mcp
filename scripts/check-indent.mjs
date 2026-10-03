@@ -80,6 +80,20 @@ function report(context, line, actual, expected) {
   problems.push(`${context}: line ${line + 1} is indented ${actual}, expected ${expected}`);
 }
 
+/**
+ * Whether this node's line begins with nothing but whitespace before it.
+ *
+ * A statement sharing a line with other syntax has no indentation of its own to
+ * measure. `checkStatements` REPORTS that case (it once hid two collapsed lines);
+ * the `switch` branches use this to SKIP it, because a legal `case 1: return 1;`
+ * puts two constructs on one line and neither the label nor the statement can be
+ * satisfied without rewriting the line. The fixer skips exactly the same nodes, so
+ * the two tools cannot disagree (review v7 V7-3).
+ */
+function ownsLine(text, where) {
+  return (linesOf(text)[where.line] ?? '').slice(0, where.character).trim() === '';
+}
+
 function checkStatements(source, text, statements, column, context) {
   for (const statement of statements) {
     const where = at(source, statement.getStart(source, true));
@@ -88,7 +102,7 @@ function checkStatements(source, text, statements, column, context) {
     // line with its block header (`() => {  it('...', () => {`) has no
     // indentation to measure at all — and this is exactly how an earlier bulk
     // edit collapsed two lines into one and went unnoticed.
-    if ((linesOf(text)[where.line] ?? '').slice(0, where.character).trim() !== '') {
+    if (!ownsLine(text, where)) {
       report(
         `${context} [${ts.SyntaxKind[statement.kind]} is not on its own line]`,
         where.line,
@@ -173,9 +187,16 @@ function walk(source, text, node, context) {
     const caseColumn = blockColumn(source, text, node.caseBlock) + 2;
     for (const clause of node.caseBlock.clauses) {
       const where = at(source, clause.getStart(source, true));
-      const actual = indentAt(text, where.line);
-      if (actual !== caseColumn) {
-        report(`${context} switch case`, where.line, actual, caseColumn);
+      // `case 1: return 1;` is legal TypeScript and puts the label and a statement
+      // on ONE line. Neither can be judged by indentation — moving the line
+      // satisfies one and breaks the other — so the label is skipped and each
+      // statement is skipped by `checkStatements` below. Reporting it here made
+      // the checker and the fixer contradict each other (review v7 V7-3).
+      if (ownsLine(text, where)) {
+        const actual = indentAt(text, where.line);
+        if (actual !== caseColumn) {
+          report(`${context} switch case`, where.line, actual, caseColumn);
+        }
       }
       // A clause body is EITHER a `{ … }` block (whose own rule is its opening
       // line's indentation, so recursing checks it properly) or a list of
@@ -185,6 +206,9 @@ function walk(source, text, node, context) {
           checkBlock(source, text, statement, `${context} switch case`, owner);
         } else {
           const at2 = at(source, statement.getStart(source, true));
+          if (!ownsLine(text, at2)) {
+            continue;
+          }
           const actual2 = indentAt(text, at2.line);
           if (actual2 !== caseColumn + 2) {
             report(
@@ -276,6 +300,21 @@ const CLEAN_SAMPLE = [
   '  recover();',
   '} finally {',
   '  done();',
+  '}',
+  '',
+  // A legal `case` sharing its line with a statement. This must produce NOTHING:
+  // reporting it made the checker contradict the fixer, and the two of them
+  // rewrote the file for 25 rounds until it failed `pnpm lint` (review v7 V7-3).
+  // It is in the CLEAN sample rather than a mis-indented one because the correct
+  // verdict is "no problem", and a self-test that only checks detection cannot
+  // catch a false positive.
+  'switch (kind) {',
+  '  case 1: return 1;',
+  "  case 2: {",
+  '    return 2;',
+  '  }',
+  '  default:',
+  '    return 0;',
   '}',
   '',
 ].join('\n');

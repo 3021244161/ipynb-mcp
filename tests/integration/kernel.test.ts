@@ -8,22 +8,13 @@ import { existsSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { createLogger } from '../../src/log.js';
 import { KernelRegistry } from '../../src/kernel/registry.js';
 import { SidecarTransport } from '../../src/kernel/sidecar-transport.js';
-
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const VENV_DIR = path.join(REPO_ROOT, 'tests', '.venv-test');
-const WINDOWS = process.platform === 'win32';
-const VENV_PY = WINDOWS
-  ? path.join(VENV_DIR, 'Scripts', 'python.exe')
-  : path.join(VENV_DIR, 'bin', 'python');
-
-const BASE_PYTHON = process.env['IPYNB_TEST_PYTHON'] ?? (WINDOWS ? 'python' : 'python3');
+import { BASE_PYTHON, VENV_PY, VENV_DIR } from './test-venv.js';
 
 let workspace: string;
 let notebookPath: string;
@@ -288,7 +279,6 @@ describe('[I11] no orphan sidecar/kernel processes after shutdown', () => {
     }
   }, 120_000);
 });
-
 
 describe('[A12] a kernel killed mid-run fails fast with kernel_died', () => {
   it('reports kernel_died within the iopub poll interval, not the full timeout', async () => {

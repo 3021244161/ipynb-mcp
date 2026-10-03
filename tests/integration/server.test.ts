@@ -21,12 +21,9 @@ import { RunStore } from '../../src/mcp/run-store.js';
 import { PathFence } from '../../src/fs/fence.js';
 import { createLogger } from '../../src/log.js';
 import { createServer } from '../../src/server.js';
+import { BASE_PYTHON, VENV_PY, VENV_DIR } from './test-venv.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const VENV_DIR = path.join(REPO_ROOT, 'tests', '.venv-test');
-const WINDOWS = process.platform === 'win32';
-const VENV_PY = WINDOWS ? path.join(VENV_DIR, 'Scripts', 'python.exe') : path.join(VENV_DIR, 'bin', 'python');
-const BASE_PYTHON = process.env['IPYNB_TEST_PYTHON'] ?? (WINDOWS ? 'python' : 'python3');
 
 let workspace: string;
 let client: Client;

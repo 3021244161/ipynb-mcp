@@ -7,7 +7,6 @@ import { existsSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
@@ -24,12 +23,9 @@ import { RunStore } from '../../src/mcp/run-store.js';
 import { PathFence } from '../../src/fs/fence.js';
 import { nbformatSkipReason, validateNotebook } from './nbformat-validator.js';
 import { createLogger } from '../../src/log.js';
+import { BASE_PYTHON, VENV_PY, VENV_DIR } from './test-venv.js';
 
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const VENV_DIR = path.join(REPO_ROOT, 'tests', '.venv-test');
 const WINDOWS = process.platform === 'win32';
-const VENV_PY = WINDOWS ? path.join(VENV_DIR, 'Scripts', 'python.exe') : path.join(VENV_DIR, 'bin', 'python');
-const BASE_PYTHON = process.env['IPYNB_TEST_PYTHON'] ?? (WINDOWS ? 'python' : 'python3');
 // An interpreter that exists but CANNOT import ipykernel (I17). If absent on
 // this machine we synthesize a stub executable instead.
 
@@ -661,7 +657,6 @@ describe('[I17] candidate chain degradation (D23)', () => {
     expect(resolution.warnings.map((warning) => warning.code)).toContain('kernelspec_mismatch');
   }, 300_000);
 });
-
 
 describe('[I-replay-fresh] mode=replay rebuilds state on a NEW kernel (review A4)', () => {
   it('variables from a previous run are gone after replay', async () => {
