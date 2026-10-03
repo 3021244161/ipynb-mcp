@@ -107,6 +107,11 @@ export interface WriteOptions {
    */
   readonly touchedCellIndexes?: ReadonlySet<number>;
   /**
+   * Cells whose outputs this write emptied. See
+   * {@link SelfCheckScope.clearedOutputCellIndexes} for why the gate needs to know.
+   */
+  readonly clearedOutputCellIndexes?: ReadonlySet<number>;
+  /**
    * The parsed document as it was before this write. Used to tell a refusal
    * apart from a carried-forward problem, so the error can say which one it is
    * (review v6 SCOPE-REFUSE-HINT).
@@ -224,6 +229,9 @@ async function writeNotebookFileUnlocked(
   // (review v5 GATE-1).
   selfCheckNotebook(serialized, options.hasher, {
     touchedCellIndexes: options.touchedCellIndexes,
+    ...(options.clearedOutputCellIndexes === undefined
+      ? {}
+      : { clearedOutputCellIndexes: options.clearedOutputCellIndexes }),
     ...(options.originalDoc === undefined ? {} : { originalDoc: options.originalDoc }),
     ...(options.touchedCellIndexes === undefined
       ? {}

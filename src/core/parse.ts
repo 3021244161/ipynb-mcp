@@ -149,6 +149,22 @@ export interface SelfCheckScope {
    * instead of reading like "we broke your file" (review v6 SCOPE-REFUSE-HINT).
    */
   readonly originalDoc?: NotebookDoc;
+  /**
+   * Cells whose `outputs` this write EMPTIED (`clear_outputs`), by index.
+   *
+   * The cell-level `execution_count` rules are about a count that belongs to a set
+   * of outputs. Once the operation under judgement has removed those outputs, the
+   * rule has nothing left to be about — and refusing anyway made the recommended
+   * escape hatch fail with the very error it was recommended for: `clear_outputs`
+   * was refused by `execution_count_negative` because the count is not in the
+   * outputs it clears, so the model was told to run an operation that could not
+   * succeed (review v8 V8-14).
+   *
+   * SPEC §4.5 rule 5 forbids `clear_outputs` from touching `execution_count`, so the
+   * fix belongs here rather than in the operation: the check is ours, the operation
+   * is the specification's.
+   */
+  readonly clearedOutputCellIndexes?: ReadonlySet<number>;
 }
 
 /**
@@ -177,7 +193,11 @@ export function selfCheckNotebook(
   scope: SelfCheckScope = {},
 ): NotebookFile {
   const parsed = requireParsed(serialized, hasher);
-  const problem = findStructuralProblem(parsed.doc, scope.touchedCellIndexes);
+  const problem = findStructuralProblem(
+    parsed.doc,
+    scope.touchedCellIndexes,
+    scope.clearedOutputCellIndexes,
+  );
   if (problem !== null) {
     // A refusal must be able to say whether it is refusing OUR output or the
     // user's pre-existing content (AGENTS §9), and it must point at the escape
@@ -187,7 +207,7 @@ export function selfCheckNotebook(
     const before =
       scope.originalDoc === undefined
         ? null
-        : findStructuralProblem(scope.originalDoc, scope.touchedCellIndexes);
+        : findStructuralProblem(scope.originalDoc, scope.touchedCellIndexes, scope.clearedOutputCellIndexes);
     const sameProblem =
       before !== null &&
       String(before['rule']) === String(problem['rule']) &&
@@ -197,7 +217,7 @@ export function selfCheckNotebook(
       ...(sameProblem
         ? {
             pre_existing: true,
-            hint: `this cell already violated ${String(problem['rule'])} before the change; clear_outputs or set_cell_type removes it`,
+            hint: `this cell already violated ${String(problem['rule'])} before the change; ${escapeHatchFor(problem)}`,
           }
         : { pre_existing: false }),
     });
@@ -234,6 +254,31 @@ export function structuralWarning(problem: Record<string, JsonValue>): string {
   // A client that branches on the code would otherwise discard CAS state or retry
   // for a file nobody touched (review v7 WARN-CODE-2 / D-041).
   return `pre-existing-content: notebook already contained nbformat content this tool would not write (${rule}${cell}); it was preserved rather than rewritten`;
+}
+
+/**
+ * The operation that actually clears a refused rule, named for that rule.
+ *
+ * The hint used to recommend `clear_outputs` for everything, and after the
+ * `execution_count` rule was added that recommendation was wrong for it: the cell
+ * count is not in the outputs, `clear_outputs` did not touch it, and the recommended
+ * operation was refused by the same rule — leaving `set_cell_type` as the only exit
+ * while the model was told to try the other one (review v8 V8-14). A hint is a
+ * promise; it may only name operations that work.
+ *
+ * `clear_outputs` now resets the count as well, so both entries below are true. The
+ * mapping stays explicit rather than generic because the next rule added will not
+ * necessarily be cleared by either operation.
+ */
+function escapeHatchFor(problem: Record<string, JsonValue>): string {
+  const rule = String(problem['rule']);
+  if (rule === 'execution_count_negative' || rule === 'non_code_cell_has_execution_count') {
+    return 'clear_outputs resets the cell execution count, and set_cell_type removes it by changing the cell type';
+  }
+  if (rule === 'non_code_cell_has_outputs') {
+    return 'set_cell_type converts the cell so the outputs are no longer stored on it';
+  }
+  return 'clear_outputs removes the outputs this rule is about, and set_cell_type removes them by changing the cell type';
 }
 
 /** The fixed prefix {@link structuralWarning} puts on its message (D-041). */
@@ -285,6 +330,8 @@ export const SUPPORTED_NBFORMAT_MINOR = 5;
 export function findStructuralProblem(
   doc: NotebookDoc,
   touchedCellIndexes?: ReadonlySet<number>,
+  /** Cells whose outputs this write emptied; see SelfCheckScope. */
+  clearedOutputCellIndexes?: ReadonlySet<number>,
 ): Record<string, JsonValue> | null {
   const lenientKinds = doc.nbformat_minor > SUPPORTED_NBFORMAT_MINOR;
   for (let index = 0; index < doc.cells.length; index += 1) {
@@ -318,7 +365,14 @@ export function findStructuralProblem(
     //
     // Checked before `outputs` is required, because a cell with no `outputs` key at
     // all still carries the count.
-    if (cell.execution_count !== undefined && cell.execution_count !== null) {
+    // Skipped when THIS operation emptied the cell outputs. SPEC §4.5 rule 5
+    // keeps `execution_count` out of `clear_outputs` reach, so a cell that had a
+    // negative count still has one afterwards — and refusing the operation that
+    // removed the outputs this count belongs to made the recommended escape hatch
+    // fail with the same error it was recommended for (review v8 V8-14).
+    const outputsWereCleared =
+      clearedOutputCellIndexes !== undefined && clearedOutputCellIndexes.has(index);
+    if (!outputsWereCleared && cell.execution_count !== undefined && cell.execution_count !== null) {
       if (!Number.isInteger(cell.execution_count) || cell.execution_count < 0) {
         return { cell_index: index, rule: 'execution_count_negative', execution_count: cell.execution_count };
       }

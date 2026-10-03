@@ -318,6 +318,13 @@ export function applyEditOps(
           checkTextAnchor(notebook, cell, text, cellSource(cell), 'line_text', opIndex, options);
         }
         cell.outputs = [];
+        // NOTE: `execution_count` is deliberately NOT touched — SPEC §4.5 rule 5 is
+        // explicit ("clear_outputs 只清 outputs，不动 execution_count、不动源码"), so
+        // the v8 V8-14 fix lives in the GATE instead: a cell whose outputs this
+        // operation just removed is not judged by the cell-level `execution_count`
+        // rule, because that rule and the outputs it belongs to are gone. Nulling the
+        // count here would have been the smaller diff and the wrong one — it changes
+        // an operation SPEC §4.5 pins, in order to satisfy a check that is ours.
         clearedOutputs.add(cell);
         touchedCell = cell;
         break;

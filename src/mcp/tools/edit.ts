@@ -126,6 +126,14 @@ export async function handleNotebookEdit(
           // The pre-edit document, so a refusal can say whether it is refusing
           // OUR output or content that was already there.
           originalDoc: structuredClone(notebook.doc),
+          // Cells whose outputs this edit emptied. The cell-level `execution_count`
+          // rules are not applied to them: `clear_outputs` is the documented escape
+          // hatch for an output-shaped problem, and SPEC §4.5 rule 5 keeps the count
+          // out of its reach, so judging the count afterwards made the recommended
+          // operation fail with the error it was recommended for (review v8 V8-14).
+          clearedOutputCellIndexes: new Set(
+            editResult.changedCells.filter((cell) => cell.outputs_cleared).map((cell) => cell.cell_index),
+          ),
           // Carried-forward content is reported to the caller as a warning (the
           // same channel notebook_run uses) AND to the log. A bare log line would
           // tell the operator while leaving the model — the actual consumer —

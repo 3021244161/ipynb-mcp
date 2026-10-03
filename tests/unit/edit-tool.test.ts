@@ -443,3 +443,137 @@ describe('[D7] ops boundary: exactly 32 is accepted, 33 is not (SPEC §4.5)', ()
     expect(body['code']).toBe('invalid_arguments');
   });
 });
+
+describe('[V8-14] the refusal must recommend an operation that actually works', () => {
+  // The reviewer ran this four-step session and found step 2 impossible: the hint
+  // said "clear_outputs or set_cell_type removes it", and `clear_outputs` was refused
+  // by the same rule — because a cell-level count is not in the outputs that
+  // operation clears. So the only exit was an operation the model was never told
+  // about, and a model following the hint loops (SPEC §4.1.11: a failure must be
+  // retryable in one step).
+
+  /** A code cell with a legal shape except for its negative execution count. */
+  async function negativeCountNotebook(name: string): Promise<string> {
+    const nb = path.join(workspace, name);
+    await writeFile(nb, JSON.stringify({
+      nbformat: 4,
+      nbformat_minor: 5,
+      metadata: { kernelspec: { name: 'python3', display_name: 'Python 3', language: 'python' } },
+      cells: [
+        {
+          cell_type: 'code',
+          id: 'c0',
+          metadata: {},
+          source: 'x = 1',
+          outputs: [{ output_type: 'stream', name: 'stdout', text: 'stale\n' }],
+          execution_count: -1,
+        },
+        { cell_type: 'code', id: 'c1', metadata: {}, source: 'y = 2', outputs: [], execution_count: null },
+      ],
+    }));
+    return nb;
+  }
+
+  it('step 1: rewriting the cell is refused, and the hint names what works', async () => {
+    const nb = await negativeCountNotebook('v814-a.ipynb');
+    const { isError, body } = await runEdit({
+      path: nb,
+      ops: [{ op: 'replace_source', cell_index: 0, expected_text: 'x = 1', new_text: 'x = 2' }],
+    });
+    expect(isError).toBe(true);
+    expect(body['code']).toBe('selfcheck_failed');
+    const detail = body['detail'] as Record<string, unknown>;
+    expect(detail['problem']).toMatchObject({ rule: 'execution_count_negative' });
+    // The hint must name an operation that clears THIS rule. It used to say
+    // "clear_outputs or set_cell_type" for every rule.
+    const hint = String(detail['hint'] ?? '');
+    expect(hint).toContain('execution_count_negative');
+    expect(hint).toContain('clear_outputs');
+  });
+
+  it('step 2: the recommended clear_outputs SUCCEEDS and leaves a valid file', async () => {
+    const nb = await negativeCountNotebook('v814-b.ipynb');
+    const { isError, body } = await runEdit({
+      path: nb,
+      ops: [{ op: 'clear_outputs', cell_index: 0 }],
+    });
+    expect(body['code'], `clear_outputs was refused: ${JSON.stringify(body)}`).toBeUndefined();
+    expect(isError).toBeUndefined();
+    expect((body['changed_cells'] as Array<Record<string, unknown>>)[0]).toMatchObject({
+      outputs_cleared: true,
+    });
+
+    // SPEC §4.5 rule 5: the count is NOT touched by this operation…
+    const written = JSON.parse(await readFile(nb, 'utf8')) as {
+      cells: Array<Record<string, unknown>>;
+    };
+    expect(written.cells[0]!['outputs']).toEqual([]);
+    expect(written.cells[0]!['execution_count']).toBe(-1);
+    // …and the file is still not valid nbformat, which is the honest outcome: the
+    // count is a pre-existing defect this operation is specified not to fix. What
+    // must NOT happen is the operation being refused.
+  });
+
+  it('step 3: the other recommended operation (set_cell_type) also works', async () => {
+    const nb = await negativeCountNotebook('v814-c.ipynb');
+    const { isError, body } = await runEdit({
+      path: nb,
+      ops: [{ op: 'set_cell_type', cell_index: 0, cell_type: 'markdown', expected_text: 'x = 1' }],
+    });
+    expect(isError).toBeUndefined();
+    expect((body['changed_cells'] as Array<Record<string, unknown>>)[0]).toMatchObject({ cell_index: 0 });
+    const written = JSON.parse(await readFile(nb, 'utf8')) as { cells: Array<Record<string, unknown>> };
+    // A markdown cell cannot carry a count, so the rule is gone with the cell type.
+    expect('execution_count' in written.cells[0]!).toBe(false);
+  });
+
+  it('step 4: an unrelated cell is never blocked by it (the control)', async () => {
+    const nb = await negativeCountNotebook('v814-d.ipynb');
+    const { isError } = await runEdit({
+      path: nb,
+      ops: [{ op: 'replace_source', cell_index: 1, expected_text: 'y = 2', new_text: 'y = 3' }],
+    });
+    expect(isError).toBeUndefined();
+  });
+
+  it('the count rule still refuses a write that is NOT clearing those outputs', async () => {
+    // The gate must not have been disabled wholesale: the same cell, edited in a way
+    // that leaves the outputs in place, is still refused.
+    const nb = await negativeCountNotebook('v814-e.ipynb');
+    const { isError, body } = await runEdit({
+      path: nb,
+      ops: [{ op: 'replace_lines', cell_index: 0, start_line: 1, end_line: 1, new_text: 'x = 9', expected_text: 'x = 1' }],
+    });
+    expect(isError).toBe(true);
+    expect(body['code'], JSON.stringify(body)).toBe('selfcheck_failed');
+    expect((body['detail'] as Record<string, unknown>)['problem']).toMatchObject({
+      rule: 'execution_count_negative',
+    });
+  });
+
+  it('the skip is scoped to the cleared cell, not to the whole request', async () => {
+    // A request that clears ONE cell's outputs while rewriting another: the rewritten
+    // cell keeps its outputs, so the count rule still applies to it. Without this the
+    // implementation could pass everything above by skipping the rule whenever any
+    // cell was cleared.
+    const nb = await negativeCountNotebook('v814-f.ipynb');
+    const doc = JSON.parse(await readFile(nb, 'utf8')) as { cells: Array<Record<string, unknown>> };
+    doc.cells[1]!['execution_count'] = -5;
+    await writeFile(nb, JSON.stringify(doc));
+
+    const { isError, body } = await runEdit({
+      path: nb,
+      ops: [
+        { op: 'clear_outputs', cell_index: 0 },
+        { op: 'replace_source', cell_index: 1, expected_text: 'y = 2', new_text: 'y = 3' },
+      ],
+    });
+    expect(isError).toBe(true);
+    expect(body['code']).toBe('selfcheck_failed');
+    // The refusal points at cell 1 — the one that was NOT cleared.
+    expect((body['detail'] as Record<string, unknown>)['problem']).toMatchObject({
+      rule: 'execution_count_negative',
+      cell_index: 1,
+    });
+  });
+});
