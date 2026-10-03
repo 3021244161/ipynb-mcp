@@ -1,0 +1,39 @@
+test: make the guards prove they can fail
+
+The review's method this round was to treat the repository's own tests as the
+subject: mutate the product and see whether the test notices. It immediately
+found one that was watching nothing.
+
+FRAME-1 — `[NEW-3]` counted `indexOf` calls by defining `indexOf` as an OWN
+property on a parent Buffer, then fed the framer `parent.subarray(...)`.
+`subarray` does not inherit own properties, so the counter never ran and
+`expect(inspected).toBeLessThanOrEqual(cap * 1.1)` was satisfied by ANY
+implementation. The review replaced `push` with the quadratic shape and the case
+stayed green — while that shape takes 36 s here against 0.6 s for the real one.
+The counter now lives on `Buffer.prototype` (restored in a `finally`), and an
+explicit `expect(calls).toBeGreaterThan(0)` makes "the probe never ran" a
+failure instead of a silent pass. A wall-clock bound is the decisive assertion;
+the comment records which mutation each assertion catches, and I re-ran the
+mutation to confirm the case goes red.
+
+FRAME-3 — a rejected over-long line left the staging buffer holding the rejected
+bytes: `pendingBytes` lied and every later push threw again, so the framer was
+quietly single-use. The error paths now reset the state.
+
+SMOKE-1 — the smoke script never called `notebook_edit` at all, so a failure
+mode that lives only on the edit path (the write gate refusing an edit it should
+allow) was invisible to it, and its round-trip assertion counted outputs rather
+than checking their content. It now performs a CAS-anchored edit, checks the edit
+reached the file, reads the written TEXT back, runs a `timeout_seconds=2`
+`time.sleep(30)` cell and asserts `exec_timeout` plus a prompt return plus the
+cell keeping its pre-run state, and shuts the kernel down to assert no kernel
+remains: 11 -> 18 checks.
+
+TEST-1 — `fixtures-valid.test.ts` said "every notebook fixture the integration
+suite writes" while checking two hand-written literals. It is now honest about
+its two layers, and the static sweep reads whole (possibly multi-line)
+`kernelspec` objects after stripping comments — the previous window matched a
+comment, which made it report the file that documents it. Its teeth were checked
+by pointing it at a fixture with the field removed.
+
+Verified: 233 unit (1 skipped), 44 integration, `pnpm smoke` 18/18.

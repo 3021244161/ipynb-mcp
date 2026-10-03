@@ -74,12 +74,16 @@ export class KernelRegistry {
   /** normalized notebook path -> run abort sinks (see onRunAbort). */
   readonly #runAborts = new Map<string, Set<() => void>>();
   /**
-   * normalized path (for one known spelling) -> resolved reuse key. `#norm` runs
+   * notebook path (as spelled by a caller) -> resolved `realpath`. `#norm` runs
    * `realpathSync`, a real filesystem call, and every session lookup used to make
    * one call per session plus one for the query — so a run of N cells did N
-   * synchronous stat chains on the hot path (review v4 NEW-4). The paths a
-   * process works with are a small, stable set, so memoizing them is safe: the
-   * entry is dropped whenever the session it came from is removed.
+   * synchronous stat chains on the hot path (review v4 NEW-4).
+   *
+   * The entry records the spelling it came from, and `#removeSession` drops
+   * entries whose value resolves under that session's path. That matters because
+   * a `realpath` answer is only valid while the filesystem agrees: a symlink
+   * repointed between sessions would otherwise leave a stale mapping that can
+   * make two different identities collide (review v5 MISC-3).
    */
   readonly #normCache = new Map<string, string>();
   readonly #idleSeconds: number;
@@ -704,12 +708,13 @@ export class KernelRegistry {
     if (this.#kernels.get(session.kernelId) === session) {
       this.#kernels.delete(session.kernelId);
     }
-    // Drop the memoized realpath for this notebook: the path may be recreated
-    // (or turned into a different file) between sessions, and holding a stale
-    // resolution would key the next session to the wrong identity.
-    this.#normCache.delete(session.notebookPath);
+    // Drop the memoized realpath for THIS notebook. Matching on the normalized
+    // value (rather than only the exact spelling the session used) also clears
+    // the entries created by other spellings of the same file, so a repointed
+    // symlink cannot leave a stale identity behind (review v5 MISC-3).
+    const sessionNormalized = normalizeForCompare(session.notebookPath, this.#platform);
     for (const [spelling, normalized] of this.#normCache) {
-      if (normalized === normalizeForCompare(session.notebookPath, this.#platform)) {
+      if (normalized === sessionNormalized || spelling === session.notebookPath) {
         this.#normCache.delete(spelling);
       }
     }

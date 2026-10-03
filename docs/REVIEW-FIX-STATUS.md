@@ -12,21 +12,56 @@
 > ② 个别条目标了 ✅ 但只有"改过"、没有"验证过"（`prepack` 从未在无 pnpm 的前提下跑过）。
 > **因此本轮起，未做或未验证的条目一律标 ⬜ / ⚠️ 并在正文写明原因，不再标 ✅。**
 >
-> **门禁实测（第四轮整改后）**：`pnpm typecheck` 0 错 / `pnpm lint` 0 警（59 文件 99 规则 + `check-format` + `check-indent`）/
-> 单测 **227（226 passed + 1 skipped）** / 集成 **44/44**（6 文件全绿）/ `pnpm smoke` **11/11** /
+> **门禁实测（第五轮整改后）**：`pnpm typecheck` 0 错 / `pnpm lint` 0 警（59 文件 99 规则 + `check-format` + `check-indent`）/
+> 单测 **233（232 passed + 1 skipped）** / 集成 **44/44**（6 文件全绿）/ `pnpm smoke` **18/18** /
 > `npm pack --dry-run` 133 文件（`prepack` 在无 pnpm 前提下重建 `lib/` 验证）/ 全树 LF。
 > 唯一 skip 是 U20（本机无法起 kernel，已记录原因并区分"环境不足"与"start_kernel 回归"）。集成用到的解释器见 `COMPATIBILITY.md`。
 
 ---
 
-## 〇、第四轮（`ipynb-mcp-code-review-v4.md`，本轮）
+## 〇、第五轮（`ipynb-mcp-code-review-v5.md`，本轮）
+
+> 该轮的核查方式是"**把仓库自己的新测试当被测对象做变异实测**"，于是立刻抓到两件事：
+> 上一轮的 🔴 修复是**真的**（写回合法、分帧 39 ms、超时提前返回，逐条有变异证据），
+> 但新加的写前闸门**审错了范围**，以及本轮唯一的性能守卫**没有判别力**。
+
+### 0.1 🔴
+
+| # | 结论 | 修复要点 | 验证 |
+|---|---|---|---|
+| **GATE-1** | ✅ | 闸门原来校验**整份文档**，于是它同时审了用户的**输入**：文件里任何一处它不认可的历史输出（第三方工具写的 `display_data` 缺 `metadata`、`update_display_data`）都会让**所有**编辑与运行永久失败于 `selfcheck_failed`，错误位置还指向调用方从未触碰的 cell。现在闸门的范围 = **本次写入负责的 cell**（edit 传 `changedCells`，run 传 `executedCellsSet`）；历史内容原样带过，并以**warning**（`notebook_preexisting_content`，走 `notebook_run` 同一条 warnings 通道 + 日志）告知模型，绝不阻止写入 | `[GATE-1]` ×3（无关 cell 可编辑且 quirk 原样保留 + warning 到达调用方；被触碰的 cell 仍拒绝；清空该 cell 输出则**允许**——闸门不惩罚一个刚刚修好问题的写入）。**已做变异验证**：把 `touchedCellIndexes` 去掉，第一条立刻变红 |
+| **FRAME-1** | ✅ | `[NEW-3]` 的计数器**一次都没被调用**：它把 `indexOf` 挂在父 Buffer 的**自有属性**上，而喂给 framer 的是 `observed.subarray(...)`——`subarray` 不继承自有属性，于是 `0 <= cap*1.1` 恒真，二次实现（实测 36 s）也能全绿。计数器改挂 `Buffer.prototype`（`try/finally` 还原），并加 `expect(calls).toBeGreaterThan(0)`（计数器没跑就必须失败）与一条墙钟上界 | 变异实测：把 `push` 换成**行为等价**的二次实现（保留全部 cap/CRLF/pendingBytes 语义），其余 10 条用例照旧全绿，只有 `[NEW-3][FRAME-1]` 变红（`expected 35988 to be less than 5000`） |
+
+### 0.2 🟠 / 🟡
+
+| # | 结论 | 修复要点 |
+|---|---|---|
+| **GATE-2** | ✅ | 闸门把 4.5 的 `output_type` 白名单当永久真理，而 `nbformat.validator` 对 `nbformat_minor` 高于本地 schema 的文件会放宽 `additionalProperties` 并接受 `unrecognized_output`。现在 `nbformat_minor > 5` 时未知 `output_type` 不判错（与权威对齐，消除"拒绝合法文件"）。未知 `cell_type` 仍是 `parse_failed`——**读不了**而不是"读了不写"，这条不同边界在用例里明确记录 |
+| **GATE-3** | ✅ | `execute_result.execution_count` 原来只查**存在性**，于是 `"3"` 被放行。现在要求 integer 或 null。README 的措辞同时收窄：闸门是"本实现可能写坏的形状"，**不是合法性判定** |
+| **TIMEOUT-2** | ✅ | README 两句与实测不符，已改：① 关闭 kernel 是**异步**的——响应先返回，进程可能要到被打断的 cell 自然结束才消失（秒级到分钟级，期间管理命令已报告无 kernel，不会留孤儿）；② 超时响应是 `timeout_seconds` + **约 10 s**（实测 2 s 预算 → 10.2 s），不是"加几秒"。D-033 补记"关闭与返回解耦" |
+| **TEST-1** | ✅ | `fixtures-valid.test.ts` 的 "every notebook fixture" 是**硬编码两本**。文件改成两层并如实命名：① 代表性字面量（同时过自家闸门与真 nbformat）；② 静态扫描 `tests/**/*.ts`——但它只保证**一条**规则（kernelspec 必须有 `display_name`），因为"从测试源码里提取任意 notebook 字面量"是另一件需要解析器的事，半吊子提取器只会制造同一种虚假信心。扫描改为按大括号配对读取整个对象并先剥离注释（第一版会匹配到自己注释里的 `kernelspec: {`） |
+| **SMOKE-1** | ✅ | smoke 补三个缺口：① 加一条 CAS 锚定的 `notebook_edit`（它此前**从没调用过 edit**，所以"编辑被闸门挡住"这类故障它看不见）；② 加一条 `timeout_seconds=2` 的 `time.sleep(30)` cell，断言 `exec_timeout` **且**响应及时（< 25 s）**且**该 cell 保持运行前状态；③ round-trip 改成内容断言（原先只数条数，对"内容错了但条数对"是绿的）；另加 `kernel shutdown` + `status` 断言无残留。11 → **18 项** |
+| **MISC-2** | ✅ | 两处注释修正：`cell_selector` 上限对应的编号改为 v4 **NEW-2**；删掉"27 s"那句（属未发布的中间设计，读者在历史提交里找不到） |
+| **MISC-3** | ✅ | `#normCache` 的失效改为按**规范化值**匹配（并保留字面拼写匹配），于是同一文件其他拼写的陈旧条目也被清掉——被重指向的 symlink 不再可能留下会让两个身份碰撞的映射 |
+| **TEST-2/TEST-3/TEST-4 的精度提示** | ✅ | `nbformat-validator.ts` 的注释改为准确描述（`as_version=4` 会**升级**后再校验，因此它校验 4.5 的契约而不是字节级）；`[W1]` 第二条补注它走的是"延迟数组耗尽"分支 |
+
+### 0.3 本轮的方法学收获（已写进 AGENTS §9）
+
+评审把**测试当被测对象**做变异，比评审读测试名有效得多。本轮因此把"守卫必须自己证明有判别力"变成显式规则：新增/修改任何守卫型断言时，必须能指出**在什么变异下它会红**；做不到就说明它守不住任何东西。`[GATE-1]`、`[NEW-3][FRAME-1]` 都按这条做了变异实验并记录在案。
+
+---
+
+## 〇-A、第四轮（`ipynb-mcp-code-review-v4.md`）
+
+> **门禁实测（第四轮整改后）**：`pnpm typecheck` 0 错 / `pnpm lint` 0 警 / 单测 227 / 集成 44（6 文件）/
+> `pnpm smoke` 11/11 / `npm pack --dry-run` 133 文件 / 全树 LF。
 
 > 该报告的核查方式变了：主审起了**真 stdio server + 真 SDK 客户端 + 真实历史 notebook** 做 E2E，
 > 并用 **Python `nbformat.validate`** 当外部权威。结论是 v3 的整改**大部分真实有效**，但发现了一个
 > 四轮评审都没抓到的 🔴 —— 原因值得记住：**写入方与测试用同一套私有字段名**，于是整套用例都在
 > 验证一个错误的世界观。本轮的整改因此分成"修问题"和"修发现问题的能力"两部分。
 
-### 0.1 🔴 / 系统性
+### 4.1 🔴 / 系统性
 
 | # | 结论 | 修复要点 | 验证 |
 |---|---|---|---|
@@ -35,7 +70,7 @@
 | **FID-4** | ✅ | **加一道结构自检**：`selfCheckNotebook` 除重新解析外，还检查 nbformat 结构规则（非 code cell 不得有 `outputs`/`execution_count`、`output_type` 必须存在、`stream`/`error`/`execute_result`/`data` 的必要字段）。违反 → `selfcheck_failed` 中止写入。这让"不会静默改坏"变成对**结果**的承诺，而不只是对解析器的承诺 | 单测 `[FID-4]`（协议形状与 markdown 残留各一例）；它当场抓出 3 个**本身就不合法**的测试 fixture（stale 两条 + `nbformat-validator` 报的 `display_name` 缺失） |
 | **QUAL-1** | ✅ | 同类事故第三次出现（整块缩进浅一级），我上一轮**方法错误地**判为已修。这次不再手改：新增 `scripts/check-indent.mjs`，用 TypeScript parser 校验"块内直接语句同列 + 闭合括号与开启行列相同"，接进 `pnpm lint`；并用同一个 AST 驱动把 `src/run.ts` 全部块收敛到一致（含 7 个语句 + 6 个闭合括号） | `pnpm lint` 现在会跑它，全仓 0 违规；该检查器正是发现并修正本轮这处缺陷的工具 |
 
-### 0.2 🟡
+### 4.2 🟡
 
 | # | 结论 | 修复要点 |
 |---|---|---|
@@ -55,7 +90,7 @@
 | **H-2/H-3/H-6/H-7** | ✅ | `probe-framer.mjs` 等根目录残留清除；`.gitignore` 补 `ipynb-mcp-*.json`/`__pycache__`/`commit-msg.txt`；全树 LF（`git ls-files --eol` 0 CRLF / 0 mixed） |
 | **本轮零依赖** | ✅ | 新增的两个检查器（`check-indent.mjs`、`e2e-smoke.mjs`）与 `nbformat-validator.ts` 只用已有的 TypeScript 与 SDK —— 未新增任何依赖（AGENTS §11） |
 
-### 0.3 "发现问题的能力"（本轮真正的主要交付）
+### 4.3 "发现问题的能力"（v4 的主要交付）
 
 四轮评审的教训不是"又漏了一个 bug"，而是**评审与测试共享了错误的前提**。因此本轮把三件事固化进 `pnpm lint` / `pnpm test*`：
 
@@ -63,7 +98,7 @@
 2. **fixture 也要合规**：`fixtures-valid.test.ts` 对每个 notebook 字面量同时跑"自己的结构检查"与"真 nbformat"，另有零依赖静态检查禁止新增缺 `display_name` 的 kernelspec。
 3. **真客户端冒烟**：`scripts/e2e-smoke.mjs`（`pnpm smoke`）拉起 `lib/bin.js`，用 SDK Client 走完整 JSON-RPC，断言 11 项（含 nbformat 校验与 round-trip），**并已用变异验证**它能在 FID-1 复现时变红。
 
-## 〇-A、第三轮（`ipynb-mcp-code-review-v3.md`）
+## 〇-B、第三轮（`ipynb-mcp-code-review-v3.md`）
 
 > 该报告对 v2 的闭环核查结论是"四道门禁全部真实通过、逐字吻合"（本项目第一次），
 > 同时给出 5 条 🟠 与若干 🟡/🟢。逐条状态：

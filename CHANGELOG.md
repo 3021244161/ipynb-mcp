@@ -2,6 +2,35 @@
 
 本项目的接口变更遵循 D22 兼容承诺（工具名与参数名在 1.x 内不删不改；新增参数一律可选带默认值；返回字段只增不删）。
 
+## [Unreleased] 0.1.0 — 第五轮代码复核整改（未发布）
+
+> 来源：`docs/review/ipynb-mcp-code-review-v5.md`。**无工具名/参数名变更**；一处**行为修正**
+> （写前闸门的范围从"整份文档"收窄到"本次写入的 cell"）与一处**新增 warning**
+> （`notebook_preexisting_content`，走既有的 warnings 通道）。
+
+### Fixed — 写前闸门审错了范围（本轮最重要的一项）
+
+- **一处历史遗留的不合规输出不再让整本 notebook 永久只读。** 上一轮引入的结构闸门校验的是**整份文档**，等于同时审了用户的**输入**：文件里只要有一处它不认可的内容（第三方工具写的 `display_data` 缺 `metadata`、`update_display_data` 等），**所有** `notebook_edit` 与 `notebook_run` 都会永久失败于 `selfcheck_failed`，而且错误位置指向调用方从未触碰的 cell —— "读得到、改不动"，与"安全地编辑本地 notebook"直接冲突。现在闸门只判**本次写入负责的 cell**（edit 用 `changedCells`，run 用 `executedCellsSet`）；历史内容原样带过，并以 warning `notebook_preexisting_content` 告知调用方。被触碰的 cell 若仍带着问题则照旧拒绝（我们只为自己的输出负责），而**清空**该 cell 的输出是被允许的 —— 闸门不惩罚一个刚刚修好问题的写入。
+- **闸门不再拒绝 nbformat 认为合法的文件。** `nbformat.validator` 对 `nbformat_minor` 高于本地 schema 的文件会放宽 `additionalProperties` 并接受 `unrecognized_output`；此前我们一律按 4.5 的白名单拒绝，属误伤。现在 `nbformat_minor > 5` 时未知 `output_type` 不判错（未知 `cell_type` 仍是 `parse_failed`：读不了，而不是读了不写）。
+- **闸门不再放行它声称能防的东西**：`execute_result.execution_count` 此前只查"键存在"，`"3"` 也能通过；现在要求 integer 或 null。README 的措辞同步收窄为"本实现可能写坏的形状"，而不是"合法性判定"（D-037，收窄 D-032）。
+
+### Fixed — 测试可信度
+
+- **性能守卫恢复判别力。** `[NEW-3]` 的计数器挂在父 Buffer 的**自有属性**上，而被测代码拿到的是 `subarray` 结果（不继承自有属性）：计数器恒为 0、断言恒真，把分帧器换成二次实现（实测 **36 s** vs 现在的 0.6 s）它照样全绿。计数器改挂 `Buffer.prototype` 并加"探针确实跑过"的断言；另加一条墙钟上界作为决定性判据。
+- **分帧器抛协议错误后不再卡死**：状态复位，`pendingBytes` 不再说谎，对象可复用（FRAME-3）。
+- **`pnpm smoke` 从 11 项扩到 18 项**：补上 `notebook_edit`（此前**从没调用过 edit**，所以"编辑被闸门挡住"这类故障它看不见）、`timeout_seconds=2` 的超时用例（断言 `exec_timeout`、响应及时、该 cell 保持运行前状态）、内容级 round-trip（原先只数条数）以及 kernel 关闭后无残留。
+- `fixtures-valid.test.ts` 的 "every fixture" 名不副实（实际只覆盖两本手写 notebook），已改为如实分层：代表性字面量 + 一条静态扫描（只保证 kernelspec 有 `display_name`，且现在按大括号配对读整个对象并先剥离注释）。
+
+### Docs
+
+- README 两句与实测不符已修正：关闭 kernel 是**异步**的（响应先返回，进程可能要到被打断的 cell 自然结束才消失，期间不会留孤儿）；超时响应是 `timeout_seconds` + **约 10 s**（实测 2 s 预算 → 10.2 s），不是"加几秒"。
+- AGENTS §9 新增两条规则："守卫必须自己证明有判别力"与"闸门的范围要等于它的责任范围"。
+- 两处注释的引用编号与不可考据的数字修正（MISC-2）；`#normCache` 的失效改为按规范化值匹配，消除重指向 symlink 可能留下的陈旧映射（MISC-3）。
+
+### Deviations
+
+- 见 `docs/DEVIATIONS.md` **D-001 ~ D-037**（本轮新增 D-037，并收窄 D-032）。
+
 ## [Unreleased] 0.1.0 — 第四轮代码复核整改（未发布）
 
 > 来源：`docs/review/ipynb-mcp-code-review-v4.md`。**无工具名/参数名变更**；一处**修正**（status 的

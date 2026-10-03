@@ -66,7 +66,7 @@ export async function handleNotebookRun(
       // through a string: the parse error echoes the selector back, so a 10 MB
       // selector produced a 10 MB error detail. The bound is generous next to any
       // real selector ("0-4,7,9" is 8 characters) and is reported without
-      // echoing the value, so the failure cannot be amplified (review v4 NEW-3).
+      // echoing the value, so the failure cannot be amplified (review v4 NEW-2).
       if (value.length > MAX_SELECTOR_LENGTH) {
         throw new IpynbError(
           'invalid_arguments',
