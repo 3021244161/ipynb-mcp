@@ -84,6 +84,7 @@ export async function handleNotebookEdit(
     if (options?.signal?.aborted) {
       throw new IpynbError('cancelled', 'edit aborted by the client before writing', {});
     }
+    const structuralWarnings: string[] = [];
     if (!dryRun) {
       let writeResult;
       try {
@@ -94,6 +95,18 @@ export async function handleNotebookEdit(
           expectedContentHash,
           signal: options?.signal,
           platform: ctx.platform,
+          // The gate judges the cells THIS edit changed, so a pre-existing
+          // quirk elsewhere in the user's file cannot make the notebook
+          // permanently read-only (review v5 GATE-1).
+          touchedCellIndexes: new Set(editResult.changedCells.map((cell) => cell.cell_index)),
+          // Carried-forward content is reported to the caller as a warning (the
+          // same channel notebook_run uses) AND to the log. A bare log line would
+          // tell the operator while leaving the model — the actual consumer —
+          // believing the file is clean.
+          onStructuralWarning: (message) => {
+            structuralWarnings.push(message);
+            ctx.logger.warn(message);
+          },
           // Cleanup/diagnostics go through the logger, not raw stderr (C6g).
           onCleanupError: (message) => ctx.logger.warn(message),
         });
@@ -124,7 +137,12 @@ export async function handleNotebookEdit(
         outputs_cleared: cell.outputs_cleared,
       })),
       markdown_issues: editResult.markdownIssues,
-      warnings: editResult.warnings.map((warning: Warning) => ({ code: warning.code, message: warning.message })),
+      warnings: [
+        ...editResult.warnings.map((warning: Warning) => ({ code: warning.code, message: warning.message })),
+        // `notebook_preexisting_content` is not a new error code: warnings are a
+        // free-form channel (SPEC §4.8), and this is not an error at all.
+        ...structuralWarnings.map((message) => ({ code: 'notebook_preexisting_content', message })),
+      ],
     };
     return { payload: payload as JsonValue };
   });

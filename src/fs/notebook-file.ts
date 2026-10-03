@@ -12,6 +12,7 @@ import {
   parseNotebook,
   selfCheckNotebook,
   serializeNotebook,
+  structuralWarning,
   type Hasher,
   type NotebookFile,
 } from '../core/parse.js';
@@ -81,6 +82,16 @@ export interface WriteOptions {
   readonly onCleanupError?: (message: string) => void;
   /** Test injection point for corrupt serializers (U10). */
   readonly serialize?: (notebook: NotebookFile) => string;
+  /**
+   * Cells this write is responsible for. The structural self check only judges
+   * these, so content that was already in the user's file (written by another
+   * tool, or by an older version) cannot turn the notebook into a permanently
+   * unwritable document (review v5 GATE-1). Omit only when the caller is
+   * creating the document rather than editing one.
+   */
+  readonly touchedCellIndexes?: ReadonlySet<number>;
+  /** Warning sink for pre-existing problems the write deliberately preserves. */
+  readonly onStructuralWarning?: (message: string) => void;
 }
 
 export interface WriteResult {
@@ -183,7 +194,20 @@ async function writeNotebookFileUnlocked(
   const serialize = options.serialize ?? serializeNotebook;
   const serialized = serialize(notebook);
   // Self check before any byte lands on disk (SPEC §5.5.5); throws selfcheck_failed.
-  selfCheckNotebook(serialized, options.hasher);
+  // The scope is the cells this write changed, and content that was already
+  // there is reported instead of refused — otherwise one historical quirk
+  // anywhere in the file would make every edit and every run fail forever
+  // (review v5 GATE-1).
+  selfCheckNotebook(serialized, options.hasher, {
+    touchedCellIndexes: options.touchedCellIndexes,
+    ...(options.touchedCellIndexes === undefined
+      ? {}
+      : {
+          onPreExistingProblem: (problem) => {
+            options.onStructuralWarning?.(structuralWarning(problem));
+          },
+        }),
+  });
 
   let backupPath: string | null = null;
   if (options.createBackup) {

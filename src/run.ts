@@ -657,6 +657,11 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
             // Diagnostics belong on the injected logger, not on atomic.ts's raw
             // stderr fallback: --log-level must be able to silence them (review W9).
             onCleanupError: (message) => deps.logger?.warn(message),
+            // Only the cells this run executed are ours to answer for; content
+            // that was already in the file must not block the write-back
+            // (review v5 GATE-1).
+            touchedCellIndexes: executedCellsSet,
+            onStructuralWarning: (message) => deps.logger?.warn(message),
           });
         } catch (cause) {
           if (isAbortError(cause, effectiveReq.abort?.signal)) {
@@ -861,6 +866,9 @@ async function writeBackCompleted(
       // when a run dies), so an already-aborted signal must not block it.
       platform,
       onCleanupError: (message) => deps.logger?.warn(message),
+      // Same scope rule as the main write-back (review v5 GATE-1).
+      touchedCellIndexes: executedCellsSet,
+      onStructuralWarning: (message) => deps.logger?.warn(message),
     });
     return { performed: true, backup_path: partialWrite.backupPath };
   } catch (cause) {

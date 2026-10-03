@@ -127,22 +127,80 @@ export function serializeNotebook(notebook: NotebookFile): string {
   return `${JSON.stringify(notebook.doc, null, 1)}\n`;
 }
 
+/** Which cells a write is responsible for (review v5 GATE-1). */
+export interface SelfCheckScope {
+  /**
+   * Cells this write actually changed, by index in the document being written.
+   * `undefined` means "the whole document", which is only correct when the
+   * caller is creating the document rather than editing an existing one.
+   */
+  readonly touchedCellIndexes?: ReadonlySet<number>;
+  /**
+   * Called with a problem that was ALREADY in the document, i.e. one this write
+   * is carrying forward rather than introducing. Reporting it instead of failing
+   * is what keeps a file with historical quirks editable (review v5 GATE-1).
+   */
+  readonly onPreExistingProblem?: (problem: Record<string, JsonValue>) => void;
+}
+
 /**
- * Pre-write self check (SPEC §5.5.5): re-parse the bytes we are about to
- * write with the same parser. Any failure aborts the write (selfcheck_failed).
+ * Pre-write self check (SPEC §5.5.5): re-parse the bytes we are about to write
+ * with the same parser, then check the structural rules for the cells this write
+ * changed. Any failure aborts the write (selfcheck_failed).
  *
  * The re-parse alone is NOT enough, and that is not a theoretical gap: it
  * accepted `outputType`-shaped outputs and markdown cells carrying
- * `execution_count`, so two independent write paths silently produced files
- * that `nbformat.validate` rejects — with `write_back.performed: true` and no
- * warning (review v4 FID-1/FID-3/FID-4). The structural gate below runs on the
- * same bytes that are about to land, so "不会静默改坏" is a statement about the
- * RESULT rather than about the parser (SPEC §6 R2/R9).
+ * `execution_count`, so two independent write paths silently produced files that
+ * `nbformat.validate` rejects — with `write_back.performed: true` and no warning
+ * (review v4 FID-1/FID-3/FID-4).
+ *
+ * The SCOPE is equally load-bearing (review v5 GATE-1). Checking the whole
+ * document means the gate judges the user's INPUT as well as our output, and a
+ * file that already contains something we dislike — a `display_data` without
+ * `metadata`, written years ago by another tool — makes every edit and every run
+ * fail forever with `selfcheck_failed` naming a cell the caller never touched.
+ * Refusing to write protects the file but destroys the product, so the gate is
+ * limited to cells this write is responsible for, and pre-existing problems are
+ * reported as a warning instead (see `structuralWarning`).
  */
-export function selfCheckNotebook(serialized: string, hasher: Hasher): NotebookFile {
-  let parsed: NotebookFile;
+export function selfCheckNotebook(
+  serialized: string,
+  hasher: Hasher,
+  scope: SelfCheckScope = {},
+): NotebookFile {
+  const parsed = requireParsed(serialized, hasher);
+  const problem = findStructuralProblem(parsed.doc, scope.touchedCellIndexes);
+  if (problem !== null) {
+    throw new IpynbError('selfcheck_failed', 'serialized notebook failed the nbformat structure check', {
+      problem: problem as JsonValue,
+    });
+  }
+  if (scope.onPreExistingProblem !== undefined) {
+    // Same bytes, second look, wider scope: the caller already paid for the
+    // parse, so reporting carried-forward content costs one scan and not a
+    // second parse.
+    const preExisting = findStructuralProblem(parsed.doc);
+    if (preExisting !== null) {
+      scope.onPreExistingProblem(preExisting);
+    }
+  }
+  return parsed;
+}
+
+/**
+ * A pre-existing structural problem, as a warning rather than a refusal
+ * (review v5 GATE-1 suggestion ③). The model is told the file has content this
+ * tool would not have written, without being locked out of editing it.
+ */
+export function structuralWarning(problem: Record<string, JsonValue>): string {
+  const cell = typeof problem['cell_index'] === 'number' ? ` at cell ${String(problem['cell_index'])}` : '';
+  const rule = String(problem['rule']);
+  return `notebook contains nbformat content this tool would not write (${rule}${cell}); it was left untouched and the requested change was applied`;
+}
+
+function requireParsed(serialized: string, hasher: Hasher): NotebookFile {
   try {
-    parsed = parseNotebook(new TextEncoder().encode(serialized), hasher);
+    return parseNotebook(new TextEncoder().encode(serialized), hasher);
   } catch (cause) {
     if (cause instanceof IpynbError && cause.code === 'nbformat_unsupported') {
       throw new IpynbError('selfcheck_failed', 'serialized notebook failed self check', { cause: cause.code });
@@ -151,30 +209,56 @@ export function selfCheckNotebook(serialized: string, hasher: Hasher): NotebookF
       cause: String(cause),
     });
   }
-  const problem = findStructuralProblem(parsed.doc);
-  if (problem !== null) {
-    throw new IpynbError('selfcheck_failed', 'serialized notebook failed the nbformat structure check', {
-      problem: problem as JsonValue,
-    });
-  }
-  return parsed;
 }
 
 /**
- * The smallest set of nbformat structural rules this codebase can actually
- * violate. Deliberately not a full schema validation (that is nbformat's job
- * and would need a dependency): every rule corresponds to a file shape that
- * the write paths have produced or could produce.
- *
- * Returns a JSON-safe detail object, or null when the document is acceptable.
+ * The nbformat minor version whose schema this project implements (4.5). Above
+ * it, nbformat's validator relaxes `additionalProperties` and accepts
+ * unrecognized output and cell types, and this gate follows suit so it never
+ * rejects what the authority accepts (review v5 GATE-2).
  */
-export function findStructuralProblem(doc: NotebookDoc): Record<string, JsonValue> | null {
+export const SUPPORTED_NBFORMAT_MINOR = 5;
+
+/**
+ * The smallest set of nbformat structural rules this codebase can actually
+ * violate. Deliberately not a schema validator: every rule corresponds to a
+ * file shape the write paths produce or could produce, and it reports the FIRST
+ * problem it finds.
+ *
+ * Two boundaries, both of which the first version got wrong (review v5
+ * GATE-1/2/3) and which the README now states out loud:
+ *
+ *  - **Scope comes from the caller.** This function looks at the whole document
+ *    because it cannot know what a write touched; `selfCheckNotebook` decides
+ *    which cells that answer applies to. Checking every cell of the INPUT turned
+ *    a pre-existing quirk anywhere in the user's file into a permanently
+ *    read-only notebook: every edit and every run failed with `selfcheck_failed`
+ *    pointing at a cell the caller never touched.
+ *  - **nbformat's own leniency is part of the rules.** For `nbformat_minor`
+ *    above the schema this project targets, `nbformat.validator` relaxes
+ *    `additionalProperties` and adds `unrecognized_output` / `unrecognized_cell`
+ *    to its oneOf — "notebooks from the future" are valid. Rejecting what the
+ *    authority accepts is a false positive that GATE-1 then turns into a
+ *    permanent lockout.
+ */
+export function findStructuralProblem(
+  doc: NotebookDoc,
+  touchedCellIndexes?: ReadonlySet<number>,
+): Record<string, JsonValue> | null {
+  const lenientKinds = doc.nbformat_minor > SUPPORTED_NBFORMAT_MINOR;
   for (let index = 0; index < doc.cells.length; index += 1) {
+    // GATE-1: only the cells this write is responsible for can fail the write.
+    if (touchedCellIndexes !== undefined && !touchedCellIndexes.has(index)) {
+      continue;
+    }
     const cell = doc.cells[index];
     if (cell === undefined) {
       continue;
     }
     if (cell.cell_type !== 'code') {
+      if (lenientKinds) {
+        continue;
+      }
       // nbformat: markdown/raw cells have NEITHER outputs NOR execution_count.
       if (cell.outputs !== undefined) {
         return { cell_index: index, rule: 'non_code_cell_has_outputs', cell_type: cell.cell_type };
@@ -207,7 +291,7 @@ export function findStructuralProblem(doc: NotebookDoc): Record<string, JsonValu
           saw: 'outputType' in record ? 'outputType' : 'missing',
         };
       }
-      const problem = outputProblem(outputType, record, index, position);
+      const problem = outputProblem(outputType, record, index, position, lenientKinds);
       if (problem !== null) {
         return problem;
       }
@@ -221,6 +305,7 @@ function outputProblem(
   record: Record<string, unknown>,
   cellIndex: number,
   outputIndex: number,
+  lenientKinds: boolean,
 ): Record<string, JsonValue> | null {
   const where = { cell_index: cellIndex, output_index: outputIndex, output_type: outputType };
   switch (outputType) {
@@ -247,16 +332,24 @@ function outputProblem(
     }
     case 'execute_result': {
       // nbformat requires execution_count HERE and only here: this is the rule
-      // a bare `outputType` -> `output_type` rename would still violate.
+      // a bare `outputType` -> `output_type` rename would still violate. Its
+      // TYPE matters too — presence alone accepted `"3"`, which nbformat
+      // rejects, so the gate was looser than the authority (GATE-3).
       if (!('execution_count' in record)) {
         return { ...where, rule: 'execute_result_execution_count_missing' };
+      }
+      const count = record['execution_count'];
+      if (count !== null && !Number.isInteger(count)) {
+        return { ...where, rule: 'execute_result_execution_count_not_an_integer' };
       }
       return dataProblem(record, where);
     }
     case 'display_data':
       return dataProblem(record, where);
     default:
-      return { ...where, rule: 'unknown_output_type' };
+      // nbformat accepts unrecognized output types for minor versions beyond the
+      // schema it validated against (GATE-2).
+      return lenientKinds ? null : { ...where, rule: 'unknown_output_type' };
   }
 }
 
