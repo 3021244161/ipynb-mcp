@@ -140,6 +140,30 @@ describe('[U8][D3] dry_run computes everything and writes nothing', () => {
     expect(await readFile(nb)).toEqual(before);
   });
 
+  it('[TST-4] the same guard holds on the REAL write path, not only under dry_run', async () => {
+    // The case above runs with `dry_run: true`, where "nothing was written" is
+    // guaranteed by the mode rather than by the markdown gate — so it cannot show
+    // that the gate stops a WRITE. The review's point exactly: the tool-layer
+    // `markdown_invalid` guard had no real-write coverage (v5 TST-4, still open in
+    // v6 and v7). Here dry_run is absent, the markdown is broken, and the file must
+    // come back byte-identical.
+    const nb = await writeNb('u8-write.ipynb', [
+      { cell_type: 'markdown', id: 'md-0', metadata: {}, source: '# Good' },
+    ]);
+    const before = await readFile(nb);
+    const { isError, body } = await runEdit({
+      path: nb,
+      ops: [{ op: 'replace_source', cell_index: 0, expected_text: '# Good', new_text: '# Title\n\n```python\nprint(1)' }],
+    });
+    expect(isError).toBe(true);
+    expect(body['code']).toBe('markdown_invalid');
+    // Byte-identical, not merely "the source is unchanged": a partial write or a
+    // rewritten-but-equivalent file would pass the weaker assertion.
+    expect(await readFile(nb)).toEqual(before);
+    // And the edit is not reported as applied.
+    expect(body['applied']).toBeUndefined();
+  });
+
   it('warning-severity markdown issues appear in the dry-run payload without writing', async () => {
     const nb = await writeNb('u8-warn.ipynb', [
       { cell_type: 'markdown', id: 'md-0', metadata: {}, source: '# Good' },

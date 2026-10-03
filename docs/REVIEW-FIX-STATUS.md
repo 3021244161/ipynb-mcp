@@ -14,11 +14,57 @@
 > 第五轮则出现**漏列**（18 条只列 8 条）。**因此未做或未验证的条目一律 ⬜ / ⚠️ 并写明原因。**
 >
 > **门禁实测（第六轮整改后）**：`pnpm typecheck` 0 错 / `pnpm lint` 0 警（oxlint + `check-format` + `check-indent`）/
-> 单测 **252（全绿）** / 集成 **46/46**（6 文件）/ `pnpm smoke` **19/19** /
+> 单测 **286（全绿，23 文件）** / 集成 **46/46**（6 文件）/ `pnpm smoke` **19/19** /
 > `pnpm pack --dry-run` 133 文件 / 全树 LF / **Linux（WSL Ubuntu + Node 22）单测全绿** /
-> **CI 全绿**（run `37136146902`，9 个 job：unit ×7 + integration ×4 中的 9 项；本机无 Python 的 job 按设计跳过 U20 并记录原因）。
+> **CI 全绿**（第七轮之前最后一次：run `37136146902`，9 个 job；本轮新增 `nbformat` 安装与 `IPYNB_REQUIRE_NBFORMAT=1`，需以新 run 为准）。
 > 集成用到的解释器与三平台默认根见 `COMPATIBILITY.md`。
 ---
+
+## 〇-0、第七轮（`ipynb-mcp-code-review-v7.md`，本轮）
+
+> 第七轮的核查对象是**读方向**、**守卫之间的一致性**，以及**文档与代码是否相符**。
+> 它给出的三条 TOP：V7-1（读方向把合法的 `application/json` 静默改写/丢弃）、P0-a（唯一的外部权威在唯一的自动化环境里恒缺席）、
+> V7-3 + V7-2（fixer 与 checker 对合法一行 `case` 结论相反；`output_truncated` 一次发 2–3 条）。三条都已修复并做了变异验证。
+
+### 7.1 本轮条目（完整清单）
+
+| 条目 | 状态 | 处置 |
+|---|---|---|
+| **V7-1** 🔴 读方向静默改写/丢弃合法 json | ✅ | `RawOutput.data` 放宽为 `Record<string, unknown>`，json mime 的值原样保留、json 分支直接产出；9 种合法形态（数组/对象/数字/null/布尔/嵌套/空）逐一断言"原样 + 无警告"；不可解析的**字符串**仍按 §5.4 第 7 行降级为 `text`。**D-044** |
+| **P1-b** 🟠 响应侧 `text` 可以不是字符串 | ✅ | 每个文本类 mime 经 `mimeText()` 窄化；`text/plain: 5` 不再产出 `text: 5`（与盘上 `data: {}` 一致） |
+| **V7-4** 🟠 探针 stdout 注入 `install_command` | ✅ | stdout 截断到 4 KiB 且必须**整体等于**白名单里的模块名，否则退化为固定清单。**注意**："取第一个空白分隔的 token" 这类更弱的规则**仍然放行**注入串（注入串恰以真模块名开头），这正是第一版修法失败的原因，已写成注释与用例 |
+| **V7-6** 🟠 不存在的解释器被报成缺 ipykernel | ✅ | `ProbeResult.status` 恢复；`not-found` 的 reason 是 `not found`，且**不给** `install_command`（SPEC §5.2 要求命令取自"存在但缺模块"的候选） |
+| **P0-a** 🔴 外部权威在 CI 恒缺席且绿灯无痕 | ✅ | 两条断言不再被 `if` 挡住；用例缺权威时 `context.skip(原因)`；CI 装 `nbformat` + `IPYNB_REQUIRE_NBFORMAT=1`。两向变异验证。**D-043** |
+| **P1-a** 🟠 cell 级 `execution_count < 0` 未进闸门 | ✅ | 闸门在要求 `outputs` **之前**检查 cell 自身的计数（计数在 cell 上）；run 侧对内核计数与恢复的保存计数都做归一化（`representableExecutionCount`） |
+| **V7-2** 🟠 `output_truncated` 一次发 2–3 条 | ✅ | run 路径去重（与读路径一致）；保留的那条是"带 cell 与 mime"的信息性消息。**D-042** |
+| **V7-8** 🟡 `exec_timeout` 的 detail 缺 `warnings` | ✅ | 与 `failedRunError` 同形，把已收集的警告带进失败详情 |
+| **P1-c** 🟠 连接文件残留 + env 整体替换 | ✅ | `env` 改为与父环境**合并**（此前整体替换，导致 sidecar/kernel/cell 没有 PATH/TEMP/HOME）；sidecar 显式传 `dir=` 且拒绝 `gettempdir()` 的点号回退。清理了仓库根 45 个含 HMAC key 的连接文件 + 15 个 `tmp*.json` + `%TEMP%` 里 50 个 |
+| **V7-3** 🟠 fixer 与 checker 自相矛盾 | ✅ | 两者共用 `ownsLine`：fixer 跳过同行节点，checker 在 switch 分支也跳过（在 `checkStatements` 仍**报告**，那是另一回事）；合法的单行 `case` 进入 checker 的 CLEAN 自测样例 |
+| **V7-5** 🟠 集成测试仍在仓库里建 18.3 MB venv | ✅ | `tests/integration/test-venv.ts` 统一决定位置，5 个文件改为导入；仓库里那份已删除；README/COMPATIBILITY/CHANGELOG 口径统一 |
+| **V7-9** 🟡 `absolutePath` 的 `platform` 是死参数 | ✅ | 去掉参数，并把"任一方言绝对即保留"这条**宿主无关**规则与其后果写清楚 |
+| **V7-10** 🟡 `JSON_MIME` 比 nbformat 严 | ✅ | 改用 nbformat 自己的 `patternProperties`：`^application/(.*\+)?json$`（`application/x/y+json`、`application/+json` 此前被丢/拒） |
+| **V7-11** 🟡 新增同款重复 `lockErrno`/`errnoCode` | ✅ | 合并为 `fs/atomic.ts` 的 `lockErrno`，`notebook-file.ts` 改为导入 |
+| **V7-13** 🟡 `rm -rf "$WORK"` 无校验 | ✅ | 拒绝 `/tmp`、`/var/tmp`、`/` 与其外的任何路径 |
+| **V7-14** 🟡 环境变量驱动的 `rmSync` | ✅ | 归属标记文件（`.ipynb-mcp-test-venv`）：只删自己建的，拒绝时打印原因，并在 `afterAll` 也清理 |
+| **V7-12** 🟡 每次写入无条件 `structuredClone` | ⚠️ **登记未改** | 该拷贝只在"拒绝"路径被读，但惰性化需要把 thunk 穿过写入路径；评审自己定性为性能提示而非缺陷。保留在"剩余事项"，与下一次接口变更同批做 |
+| **WARN-CODE-2** 🟡 语义借用未登记 | ✅ | 登记 **D-041**，并给 message 加固定前缀 `pre-existing-content: `，客户端不必从码推断含义 |
+| **TRUNC-CODE** 🟡 语义借用未登记 | ✅ | 登记 **D-042**，message 带 dropped 计数与 mime，并写明"若 v3.1 愿新增专用码，改一处即可" |
+| **NEW-2** 🟠 分工漂移 | ✅ | `mode` 不再是 schema enum（它会让 SDK 抢答 -32602），四个枚举型参数统一为"schema 声明形状 + 工具层校验值"；新增用例断言不合法的 mode 返回 `invalid_arguments`。变异验证 |
+| **H-7** 🟡 R3 的 `cellInFlight` 未登记 | ✅ | 登记为 D-045 |
+| **TST-4** 🟡 工具层 `markdown_invalid` 真写守卫 | ✅ | 新增**非 dry_run** 用例：坏 markdown 必须让文件字节不变且 `applied` 不出现；变异（关掉闸门）验证会红 |
+| **V7-15** 🟡 两文档数字互斥 | ✅ | 以实测为准统一（见门禁段），并写明两份文档由同一次验收同时更新 |
+| **工作树未提交** 🟡 hygiene | ✅ | `AGENTS.md` 的改动已随本轮提交入库 |
+| **NEW-6** 🟢 stderr 尾巴挂到无关失败上 | ⚠️ **仍未收口** | 第六轮那行是虚报（只改了 `!this.alive` 一支）；本轮如实标 ⚠️ 并保留，因为"哪次失败与 stderr 有关"需要先定义，属设计判断而非机械修改 |
+| **D-033 措辞** | ✅ | 已订正（见 DEVIATIONS） |
+
+### 7.2 本轮的验证方式
+
+- 每个新守卫都做了**变异**：V7-4（退回"取第一个 token"→ 红）、V7-6（无条件给命令 → 红）、NEW-2（退回 schema enum → 红）、
+  TST-4（关掉 markdown 闸门 → 红）、P0-a 两向（required → 失败；optional → 可见 skip）。
+- V7-1 用**九种** nbformat 合法的 json 形态逐一断言，而不是只复查评审举的那一种。
+- `analyze-op` 的两条失败最终查明是**测试自身的缓存污染**：模块级 `probeCache` 按候选路径作键，前一个用例的结论替后一个用例的假世界作答 ——
+  于是"实现明明已修"却始终为红。改用每条用例一个空缓存后立刻转绿；这条经验（被测世界与缓存必须同生命周期）写进了注释。
+- 本轮**没有**再出现"声称已修但代码里没有"：三条第六轮虚报逐条订正为真实状态，其中两条在本轮真正做完，一条如实标 ⚠️。
 
 ## 〇、第六轮（`ipynb-mcp-code-review-v6.md`）
 
