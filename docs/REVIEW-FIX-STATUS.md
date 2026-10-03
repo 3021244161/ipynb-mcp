@@ -16,7 +16,9 @@
 > **门禁实测（第六轮整改后）**：`pnpm typecheck` 0 错 / `pnpm lint` 0 警（oxlint + `check-format` + `check-indent`）/
 > 单测 **287（286 passed + 1 skipped）**，25 文件 / 集成 **46/46**（6 文件）/ `pnpm smoke` **19/19** /
 > `pnpm pack --dry-run` 133 文件 / 全树 LF / **Linux（WSL Ubuntu + Node 22）单测全绿** /
-> **CI 全绿**（第七轮之前最后一次：run `37136146902`，9 个 job；本轮新增 `nbformat` 安装与 `IPYNB_REQUIRE_NBFORMAT=1`，需以新 run 为准）。
+> **CI 全绿并且外部权威真的跑了**：run `37143775026`，9 个 job 全部通过；integration job 的步骤含
+> `pip install ipykernel jupyter_client nbformat`，日志里 `[FID-1]`/`[FID-3]`/`[FID-1 fixtures]` **三条均为 ✓ 而非 skip** ——
+> 这正是 P0-a 要的结果：在唯一会自动运行的环境里，产物合法性**确实被外部权威检查过**（此前 `nbformat` 不在依赖闭包里，三条断言被 `if` 静默跳过而套件仍全绿）。
 > 集成用到的解释器与三平台默认根见 `COMPATIBILITY.md`。
 ---
 

@@ -43,7 +43,7 @@
   **该文件现在只有一个解释器决策**：`beforeAll` 里的 `prepareTestVenv()` 先验证既有 venv 能否运行 sidecar，不能就删除；只在基础解释器能服务时才新建 venv 并再次验证；否则直接用基础解释器。此前"探针问的是 `interpreter()`、用例却自己建 venv"导致同一个 commit 在 CI 上先过后败（run `37134640458`）—— 留下的 venv 让第二次运行的探针看到了另一个解释器。
 - **macOS 仅通过 unit 层验证**（SPEC §9 CI 矩阵的既定决策：macOS 不跑 integration；其 kernel 生命周期语义与 Linux 一致，unit 层覆盖其平台特有分支——路径规范化、缓存目录、`.venv/bin/python`）。
 - 集成测试在 vitest 下**按文件串行**（`fileParallelism: false`）：真实 kernel 的时序敏感用例（I16）在并行文件下不稳定，串行是准确性优先的取舍。
-- **CI 全绿**（2026-10-03，run `37136146902`）。首次运行（`37130350485`）10 个 job 里 8 个失败，全部在非 Windows 上；
+- **CI 全绿且外部权威真的跑了**（2026-10-04，run `37143775026`，9 个 job）：integration job 装 `nbformat` 并设 `IPYNB_REQUIRE_NBFORMAT=1`，日志里三条 nbformat 断言均为 ✓ 而非 skip。首次运行（`37130350485`）10 个 job 里 8 个失败，全部在非 Windows 上；
   四类根因（平台假设写死在用例里、探针与 sidecar 真实依赖不一致、`I15`/`U20` 两个用例的自身相位与解释器选择问题）逐条修复，
   过程见 `CHANGELOG.md` 与本文件上方矩阵。**本机 Linux 复现由 `scripts/linux-check.sh` 承担** —— 这些失败在 Windows 上全都看不到。
   CI 上设 `IPYNB_TEST_REQUIRE_VENV=1`：解释器回退会直接失败，避免环境问题被"更绿"的表象掩盖（TST-1）。
