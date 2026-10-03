@@ -13,7 +13,7 @@
 
 ## 运行时矩阵（本地实测）
 
-> **计数更新（2026-10-04，第七轮复核整改后）**：数字按**文件**给出，因为它们并不一致 —— 见"已知缺口"。
+> **计数更新（2026-10-04，第八轮复核整改后）**：数字按**文件**给出，因为它们并不一致 —— 见"已知缺口"。
 > 第六轮的主要变化是**验证能力**：Linux 从"只在 CI 上跑"变成"本机可复现"（`scripts/linux-check.sh`），
 > 因为 CI 首次运行的 8 个失败全在非 Windows 上，而 Windows 上一直是绿的。
 > 第七轮补上了另一半：**CI 现在真的装 `nbformat`**（外部权威）并设 `IPYNB_REQUIRE_NBFORMAT=1`，
@@ -21,9 +21,9 @@
 
 | 平台 | Node | Python | unit | integration |
 |---|---|---|---|---|
-| Windows 11 x64 | 22.22.2 | 3.10.14（base anaconda：ipykernel 6.25.2 / jupyter_client 8.3.1 / pyzmq 25.1.1） | **287（286 passed + 1 skipped）**，25 文件 | **46/46**，6 文件全绿（`kernel.test.ts` / `run.test.ts` 自动回退到 base 解释器，见下） |
+| Windows 11 x64 | 22.22.2 | 3.10.14（base anaconda：ipykernel 6.25.2 / jupyter_client 8.3.1 / pyzmq 25.1.1） | **381（全绿）**，25 文件 | **46/46**，6 文件全绿（`kernel.test.ts` / `run.test.ts` 自动回退到 base 解释器，见下） |
 | Windows 11 x64 | 22.22.2 | 3.11.11（测试 venv，base conda env 内含 **pyzmq 26.2.0**） | 同上 | **该解释器无法启动 kernel**：sidecar 以 `0xC0000409`（`STATUS_STACK_BUFFER_OVERRUN`）退出，stderr 为 `Bad file descriptor (epoll.cpp:73)` |
-| **WSL Ubuntu 22.04（本机实跑）** | **v22.22.0** | 3.x（无 ipykernel → U20 显式 skip） | **287（286 passed + 1 skipped）**，25 文件 | 未在本机跑（需真实 kernel，见下） |
+| **WSL Ubuntu 22.04（本机实跑）** | **v22.22.0** | 3.x（无 ipykernel → U20 显式 skip） | **381（全绿）**，25 文件 | 未在本机跑（需真实 kernel，见下） |
 | ubuntu-latest | 22 / 24 | 3.10 / 3.12 | CI | CI（`pip install ipykernel jupyter_client nbformat` + `IPYNB_REQUIRE_NBFORMAT=1`） |
 | windows-latest | 22 / 24 | 3.x | CI | CI |
 | macos-latest | **22 only** | — | CI | **不跑 integration**（见下） |

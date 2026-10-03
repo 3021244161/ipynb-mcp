@@ -2,6 +2,39 @@
 
 本项目的接口变更遵循 D22 兼容承诺（工具名与参数名在 1.x 内不删不改；新增参数一律可选带默认值；返回字段只增不删）。
 
+## [Unreleased] 0.1.0 — 第八轮代码复核整改（未发布）
+
+> 来源：`docs/review/ipynb-mcp-code-review-v8.md`。
+> **无工具名/参数名变更**；无新增返回字段。
+
+### Fixed — 读方向（本轮的重点）
+
+- **`application/json` 的字符串值被静默改写**（🔴）：`display({'application/json': '123'}, raw=True)` 盘上是 JSON **字符串**，模型拿到的是**数字 123**；`'hello'` 更被降级成 `text/plain`（**mime 也被改写**），全程零提示。见 D-044。修法是"不做任何转换"：nbformat 对 json mime 的值**没有类型约束**，值就是值。
+- **`+json` 一族读不回**（🟠）：键查找只认字面量 `application/json`，而写方向用 `isJsonMime`。`application/x+json` 等**写进文件后读回来是 `unsupported`**。现在两侧同一条规则。
+- **`unsupported` 的提示改为说明"值原样保留在文件里"**：原来的 "unsupported output type" 读起来像"这个输出是空的"，而模型相信自己看到空输出就会重写 cell。
+- **data-URL 图片**（🟡）：`data:image/png;base64,…` 现在被接受（此前解码失败 → 0 字节图片）；解不出来时 fallback 文本说明原因，"空"与"坏"可以区分。
+
+### Fixed — 守卫与报告
+
+- **三个"不能失败"的守卫**（🟠）被替换：一个自己重演了产品的 `if`，两个断言**源码字符串**（把行挪进注释也能过）。规则下沉到 `core/outputs.ts` 以便直接驱动；复跑评审的六个变异全部变红。
+- **拒绝时推荐的出路本身被拒**（🟠）：`clear_outputs` 被同一条 `execution_count_negative` 拒绝。**没有改 `clear_outputs`**（SPEC §4.5 规则 5 明写它不动 `execution_count`），改的是我们的闸门：本次操作清空输出的 cell 不再受 cell 级计数规则约束。hint 改为按规则生成。
+- **`output_truncated` 一条 message 携带两个计数**（🟡）：丢弃与截断此前会互相顶掉，模型只被告知其一。
+
+### Fixed — 打包、测试环境与卫生
+
+- **发布产物带 `.pyc`**（🟠）：`files` 从 `"python"` 改为 `python/*.py`；新增 `pnpm check:package` 断言产物形状，并接入 CI。`pnpm smoke` 也进了 CI。
+- **测试 venv 只有一个决策点**：`prepareVenv()` 承担建/校验/回退，五个集成文件全部改为调用（此前是常量集中、逻辑五份，新 helper 零调用）。
+- **连接文件清扫按 pid 判活**（🟠）：此前只看年龄 —— 跑超过一小时的 kernel 的文件会被误删，而在上次 sidecar 启动之后被遗弃的文件永远扫不到。判不了 pid 的平台退化为"无 pid 且超过一周"（Windows 上"一小时"不算证据）。登记 D-046。
+- **`linux-check.sh` 的 `WORK` 守卫可被 `..` 绕过**（🟡）：先拒绝含 `..` 的值，再归一化后判前缀。
+- README / 注释 / 状态表与实现对齐；三个被跟踪的草稿脚本删除；`.gitignore` 补全家族。
+
+### Tests
+
+- **新增硬规则**（`AGENTS.md` §9）：修数据形状缺陷必须补该字段**全部合法类型的矩阵**，并**逐项先红后绿**；复验按**等价类**而不是"上轮点名的那一格"。本轮 19 类型 × 5 个 json mime = 95 条，**改代码前 79 条红**。
+- 新增 `scripts/check-package.mjs`（产物形状）与 `scripts/check-connection-sweep.py`（清扫边界，两平台实测：Linux 删 2、Windows 删 1）。
+- 本轮所有新守卫都做了变异：六个（V8-1/V8-2/V8-4/P1-c）+ 三个（V8-14）+ 一个（产物含 `.pyc`）。
+- 真实 kernel cell 复现 V8-2/V8-1：四次 `display(..., raw=True)` 的响应与盘上内容逐字节一致。
+
 ## [Unreleased] 0.1.0 — 第六轮代码复核整改 + CI 首次运行修复（未发布）
 
 > 来源：`docs/review/ipynb-mcp-code-review-v6.md` 与 GitHub issue #1（CI 首次运行，10 个 job 中 8 个失败）。

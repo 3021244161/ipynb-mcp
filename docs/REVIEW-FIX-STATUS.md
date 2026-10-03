@@ -14,7 +14,7 @@
 > 第五轮则出现**漏列**（18 条只列 8 条）。**因此未做或未验证的条目一律 ⬜ / ⚠️ 并写明原因。**
 >
 > **门禁实测（第六轮整改后）**：`pnpm typecheck` 0 错 / `pnpm lint` 0 警（oxlint + `check-format` + `check-indent`）/
-> 单测 **287（286 passed + 1 skipped）**，25 文件 / 集成 **46/46**（6 文件）/ `pnpm smoke` **19/19** /
+> 单测 **381（全绿，25 文件）** / 集成 **46/46**（6 文件）/ `pnpm smoke` **19/19** / `pnpm check:package` **ok（132 文件，无 .pyc）** /
 > `pnpm pack --dry-run` 133 文件 / 全树 LF / **Linux（WSL Ubuntu + Node 22）单测全绿** /
 > **CI 全绿并且外部权威真的跑了**：run `37143775026`，9 个 job 全部通过；integration job 的步骤含
 > `pip install ipykernel jupyter_client nbformat`，日志里 `[FID-1]`/`[FID-3]`/`[FID-1 fixtures]` **三条均为 ✓ 而非 skip** ——
@@ -22,7 +22,55 @@
 > 集成用到的解释器与三平台默认根见 `COMPATIBILITY.md`。
 ---
 
-## 〇-0、第七轮（`ipynb-mcp-code-review-v7.md`，本轮）
+## 〇、第八轮（`ipynb-mcp-code-review-v8.md`，本轮）
+
+> 第八轮的两条 TOP 都指向同一件事：**v7 的修复只覆盖了等价类的一半，而 v7 的复验也只跑了上一轮点名的那一格**。
+> 因此本轮把"修数据形状缺陷 = 补该字段全部合法类型的矩阵 + 逐项先红后绿"写进 `AGENTS.md` §9（见"新增硬规则"一节），
+> 并且**先写矩阵、眼见 79 条红**，再动实现。
+
+### 8.1 本轮条目（完整清单）
+
+| 条目 | 状态 | 处置 |
+|---|---|---|
+| **V8-2** 🔴 `application/json` 的**字符串值**被静默改写 | ✅ | `jsonValueOf` 不再做任何转换：`"123"` 保持字符串、`"hello"` 不再被降级成 `text/plain`、mime 不再被改写。**真实 kernel cell 复现并验证**（4 次 `display(..., raw=True)`，盘上与响应逐字节一致）。矩阵 19 类型 × 5 个 json mime = 95 条，**改代码前 79 条红** |
+| **V8-1** 🟠 `+json` 一族读不回 | ✅ | 键查找改用 `isJsonMime`（与写方向同一条规则）；`unsupported` 的 message 现在说明"值原样保留在文件里"，因为"unsupported output type"读起来像"这个输出是空的" |
+| **V8-4** 🟠 本轮新增的守卫**不能失败** | ✅ | 三个假守卫全部换掉：不再"自己演一遍产品的 if"，不再断言**源码字符串**（把行挪进注释也能过），不再用与标题无关的用例充数。规则下沉到 `core/outputs.ts`（`outputTruncatedWarning` / `countTruncatedCells`）以便直接驱动；sidecar env 用例改为构造真实 `SidecarTransport` 并读它实际传给子进程的 env。**复跑评审的 M1/M1b/M4/M6/M7/M8 六个变异，全部变红**（M1/M4 此前是绿的） |
+| **V8-14** 🟠 拒绝时推荐的出路本身被拒 | ✅ | `clear_outputs` 曾被同一条 `execution_count_negative` 拒绝。**没有改 `clear_outputs`**：SPEC §4.5 规则 5 明写它不动 `execution_count`，所以改的是**我们的**闸门 —— `SelfCheckScope` 增 `clearedOutputCellIndexes`，被本次操作清空输出的 cell 不再受 cell 级计数规则约束（规则与它所属的 outputs 一起消失）。hint 改为按规则生成（`escapeHatchFor`）。四步会话 + 两条"没有放水"用例；三个变异（关掉 skip、把 skip 放宽到整个请求、恢复通用 hint）全部变红 |
+| **V8-9** 🟠 发布产物带 `.pyc` | ✅ | `files` 从 `"python"` 改为 `python/*.py`（133→132 文件）；新增 `scripts/check-package.mjs` 断言**产物形状**（不含编译产物/源码/测试/内部文档/草稿脚本，且入口、server、sidecar 都在），接入 `pnpm check:package` 与 CI。**我前两版断言写错了**（把 source map 与 bin 的可执行位当缺陷），已删掉而不是留成永久噪音 |
+| **V8-6** 🟠 清扫只按年龄 | ✅ | 改为按**文件名里的 pid** 判活（`mkstemp` 的 prefix 就带着它）；判不了 pid 的平台退化为"无 pid 且超过一周"。另一个 bug 一并修：一个判不了的文件会中断整轮扫描却仍报部分计数 |
+| **V8-7** 🟠 sidecar 越界未登记 | ✅ | 登记 **D-046**（含"为什么不放到 Node 层"：Node 看不见连接文件路径） |
+| **V8-5** ⚠️→✅ 新 helper 零调用 | ✅ | `prepareVenv()` 真正承担"建/校验/回退/不留下不可用 venv/尊重 `IPYNB_TEST_REQUIRE_VENV`"，五个集成文件全部改为调用，各自不再建 venv |
+| **V8-11** 🟡 权威问错解释器 | ✅ | `nbformatSkipReason` 改为问**搜索实际选中的那个**解释器 |
+| **V8-3** 🟡 data-URL 图片与含糊诊断 | ✅ | 接受 `data:<mime>;base64,` 前缀；解不出来时 fallback 文本说明原因（"空"与"坏"必须能区分） |
+| **V8-10** 🟡 一条 message 两个计数 | ✅ | 丢弃与截断共用一条 `output_truncated`，message 同时给出两个计数 |
+| **V8-8** 🟡 `..` 绕过 WORK 守卫 | ✅ | 先拒绝任何含 `..` 的值，再 `readlink -m` 归一化后判前缀。WSL 实测：`/tmp/../etc`、`/`、`/tmp`、`/var/tmp`、`$HOME`、`/home/x/notebooks` 全拒，`/tmp/ok-check` 放行 |
+| **V8-12** 🟡 共享 venv 生命周期文档不实 | ✅ | `test-venv.ts` 头部改为描述**实际**行为（健康的 venv 作为缓存保留，只有不可用的才删），并说明为什么 |
+| **V8-13** 🟡 跟踪的草稿脚本 | ✅ | 删掉三个被跟踪的 probe/patch 脚本；`.gitignore` 补上整个家族（第五次同类事故） |
+| **V8-15** 🟡 注释/文档不实 | ✅ | README 的集成 venv 路径改为事实（临时目录 + `IPYNB_TEST_VENV` 覆盖）；`analyze-op` 的 `afterAll` 注释改为描述真实行为 |
+| **V8-16** 🟡 v5 表遗留 ✅ 与 v6/v7 段冲突 | ✅ | 两行改为删除线 + 指向撤回处 |
+| **V8-17** 🟡 `disableConsoleIntercept`/守卫标注 | ✅ | 见 §8.3（记录为"未做，原因"） |
+| **D-044 措辞超前** | ✅ | 范围改为"v7 写下时只有字面量 key 的非字符串值成立" |
+
+### 8.2 新增硬规则（`AGENTS.md` §9）
+
+> **修数据形状缺陷 = 补该字段的「全部合法类型」矩阵 + 逐项先红后绿。**
+> **等价类是复验的单位，不是"上轮点名的那一格"。**
+
+这两条是本轮最贵的产出：v7 修了 `application/json` 的非字符串值就收工，v8 在**字符串值**与 `+json` 上又栽一次；
+而 v7 的复验只跑了自己点名过的那几个形状，所以同族的未修分支活过了一整轮。规则对实现者与复验者**同时**成立。
+
+判据写得很硬：**如果新增的矩阵项在改代码之前就是绿的，那它没有覆盖任何缺陷**。本轮 95 条里 79 条先红，满足这条判据。
+
+### 8.3 未做，与原因
+
+- **V8-17**（`disableConsoleIntercept` 未登记、守卫标注）：本轮**未改**。它属于"sidecar 与 ipykernel 的交互细节"，
+  需要先确认该选项在我们的启动路径上是否真的被设置为有意义的值；在没有实测证据前改注释只会把一种不准确换成另一种。
+  与本轮的 D-046 同族（都是 sidecar 边界），建议与下一次 sidecar 变更同批做。
+- **V8-12 的另一半**（"共享 venv 的生命周期"）：`test-venv.ts` 已经承担建/校验/回退，vi 的 `globalSetup` 级别复用
+  需要先决定"哪个进程拥有这个 venv"，属设计判断；本轮的注释已经如实描述现状，不再声称不存在的安排。
+
+
+## 〇-0、第七轮（`ipynb-mcp-code-review-v7.md`）
 
 > 第七轮的核查对象是**读方向**、**守卫之间的一致性**，以及**文档与代码是否相符**。
 > 它给出的三条 TOP：V7-1（读方向把合法的 `application/json` 静默改写/丢弃）、P0-a（唯一的外部权威在唯一的自动化环境里恒缺席）、
@@ -68,7 +116,7 @@
   于是"实现明明已修"却始终为红。改用每条用例一个空缓存后立刻转绿；这条经验（被测世界与缓存必须同生命周期）写进了注释。
 - 本轮**没有**再出现"声称已修但代码里没有"：三条第六轮虚报逐条订正为真实状态，其中两条在本轮真正做完，一条如实标 ⚠️。
 
-## 〇、第六轮（`ipynb-mcp-code-review-v6.md`）
+## 〇-A、第六轮（`ipynb-mcp-code-review-v6.md`）
 
 > 本轮的核查对象是**仓库自己的测试与脚本**（把守卫当被测对象做变异），加上 **CI 首次真跑**的失败
 > （GitHub issue #1）。结论：v5 的修复是真的，但新加的写前闸门、缩进检查器与几处测试本身有缺陷，
@@ -114,7 +162,7 @@
 
 - **Linux 实跑**（`scripts/linux-check.sh`）：本机是 Windows，而 CI 的失败全在非 Windows 上。该脚本把 tracked 文件复制到 WSL 的 Linux 文件系统、按 lockfile 安装、跑 typecheck/lint/单测。本轮四次 Linux 全绿（最近一次 **239 passed + 1 skipped，20 文件**），CI 的两个 P0 因此有本机可复现的验证，而不是"改完希望它对"。
 - **缩进检查器自测**：`check-indent.mjs` 每次运行都会对 11 个构造的错位样本 + 1 个干净样本做自测，"某个构造不再受检"会直接失败——这正是 `if` 覆盖死掉两轮却没有信号的原因。
-## 〇-A、第五轮（`ipynb-mcp-code-review-v5.md`）—— 完整条目清单
+## 〇-B、第五轮（`ipynb-mcp-code-review-v5.md`）—— 完整条目清单
 
 > 第六轮指出这一轮只列了 8 条、漏了 10 条（其中 INDENT-HOLE 是它 TOP-3 的第 3 条）。
 > 下表补齐全部 18 条及其**本轮（第六轮）的处置**。
@@ -171,7 +219,7 @@
 评审把**测试当被测对象**做变异，比评审读测试名有效得多。本轮因此把"守卫必须自己证明有判别力"变成显式规则：新增/修改任何守卫型断言时，必须能指出**在什么变异下它会红**；做不到就说明它守不住任何东西。`[GATE-1]`、`[NEW-3][FRAME-1]` 都按这条做了变异实验并记录在案。
 
 ---
-## 〇-B、第四轮（`ipynb-mcp-code-review-v4.md`）
+## 〇-C、第四轮（`ipynb-mcp-code-review-v4.md`）
 
 > **门禁实测（第四轮整改后）**：`pnpm typecheck` 0 错 / `pnpm lint` 0 警 / 单测 227 / 集成 44（6 文件）/
 > `pnpm smoke` 11/11 / `npm pack --dry-run` 133 文件 / 全树 LF。
@@ -218,7 +266,7 @@
 2. **fixture 也要合规**：`fixtures-valid.test.ts` 对每个 notebook 字面量同时跑"自己的结构检查"与"真 nbformat"，另有零依赖静态检查禁止新增缺 `display_name` 的 kernelspec。
 3. **真客户端冒烟**：`scripts/e2e-smoke.mjs`（`pnpm smoke`）拉起 `lib/bin.js`，用 SDK Client 走完整 JSON-RPC，断言 11 项（含 nbformat 校验与 round-trip），**并已用变异验证**它能在 FID-1 复现时变红。
 
-## 〇-C、第三轮（`ipynb-mcp-code-review-v3.md`）
+## 〇-D、第三轮（`ipynb-mcp-code-review-v3.md`）
 
 > 该报告对 v2 的闭环核查结论是"四道门禁全部真实通过、逐字吻合"（本项目第一次），
 > 同时给出 5 条 🟠 与若干 🟡/🟢。逐条状态：
