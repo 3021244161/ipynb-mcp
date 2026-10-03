@@ -7,16 +7,20 @@
 
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
 import { createLogger } from '../../src/log.js';
 import { SidecarTransport } from '../../src/kernel/sidecar-transport.js';
 
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const VENV_DIR = path.join(REPO_ROOT, 'tests', '.venv-test');
+// The venv used to live at `<repo>/tests/.venv-test`, i.e. inside the working
+// tree: a test run created it there, left it behind, and any tool that globs the
+// repository saw a virtualenv (review v5 TST-5). It lives in the temp directory
+// now, so the repository is never a side effect of running the suite; override
+// with IPYNB_TEST_VENV to reuse one across runs.
+const VENV_DIR = process.env['IPYNB_TEST_VENV'] ?? path.join(tmpdir(), 'ipynb-mcp-test-venv');
 const WINDOWS = process.platform === 'win32';
 const VENV_PY = WINDOWS ? path.join(VENV_DIR, 'Scripts', 'python.exe') : path.join(VENV_DIR, 'bin', 'python');
 const BASE_PYTHON = process.env['IPYNB_TEST_PYTHON'] ?? (WINDOWS ? 'python' : 'python3');
@@ -159,7 +163,6 @@ describe('[U20][D2] non-Python kernels report method skipped', () => {
     const { KernelRegistry } = await import('../../src/kernel/registry.js');
     const { runNotebook } = await import('../../src/run.js');
     const { mkdtemp, mkdir, rm, writeFile } = await import('node:fs/promises');
-    const { tmpdir } = await import('node:os');
     const { realpathSync } = await import('node:fs');
     const { hasher } = await import('../../src/hash.js');
 

@@ -394,16 +394,79 @@ describe('[I18] a timeout never wipes outputs of cells that did not run', () => 
 
 describe('[I18b] the executed cell re-executes over seeded outputs', () => {
   it('clear_outputs_before=true clears only the cell about to run', async () => {
+    // The title only means something with a cell that is NOT run and carries
+    // seeded output: with a one-cell notebook "clears only the cell about to run"
+    // is indistinguishable from "clears everything", which is the defect this
+    // case exists to catch (review v5 TST-3). Three cells, the middle one not
+    // executed, and every assertion says which cell it is about.
     const nb = await writeNb('i18b.ipynb', [
-      codeCell('print("fresh")', 'c0', { outputs: [{ output_type: 'stream', name: 'stdout', text: ['STALE\n'] }], execution_count: 3 }),
+      codeCell('print("fresh")', 'c0', {
+        outputs: [{ output_type: 'stream', name: 'stdout', text: ['STALE\n'] }],
+        execution_count: 3,
+      }),
+      codeCell('print("untouched")', 'c1', {
+        outputs: [{ output_type: 'stream', name: 'stdout', text: ['KEEP-ME\n'] }],
+        execution_count: 7,
+      }),
+      codeCell('print("also fresh")', 'c2', {
+        outputs: [{ output_type: 'stream', name: 'stdout', text: ['STALE-2\n'] }],
+        execution_count: 5,
+      }),
     ]);
-    const outcome = await runNotebook(request(nb, { cellSelector: 'all' }), deps());
-    expect(outcome.executed[0]!.status).toBe('ok');
+    const outcome = await runNotebook(request(nb, { cellSelector: '0,2' }), deps());
+    expect(outcome.executed.map((cell) => cell.status)).toEqual(['ok', 'ok']);
+
     const cells = await readCells(nb);
-    const outputs = cells[0]!['outputs'] as Array<Record<string, unknown>>;
-    expect(JSON.stringify(outputs)).toContain('fresh');
-    expect(JSON.stringify(outputs)).not.toContain('STALE');
+    const first = JSON.stringify(cells[0]!['outputs']);
+    const middle = JSON.stringify(cells[1]!['outputs']);
+    const last = JSON.stringify(cells[2]!['outputs']);
+
+    expect(first).toContain('fresh');
+    expect(first).not.toContain('STALE');
+    expect(last).toContain('also fresh');
+    expect(last).not.toContain('STALE-2');
+    // The untouched cell keeps BOTH its seeded output and its execution count:
+    // clearing more than the cells about to run is the failure this asserts.
+    expect(middle).toContain('KEEP-ME');
+    expect(cells[1]!['execution_count']).toBe(7);
     expect(cells[0]!['execution_count']).toBe(1);
+    expect(cells[2]!['execution_count']).toBe(2);
+  }, 120_000);
+});
+
+describe('[TST-2] a run takes the registry run-level lock', () => {
+  it('runNotebook acquires and releases it around the whole run', async () => {
+    // The case above proves the LOCK works. Nothing proved the run USES it, so
+    // deleting the `acquireRun` call from run.ts would have kept the suite green
+    // (review v5 TST-2). It is observable behaviour, not an implementation detail:
+    // without it, a concurrent call on the same notebook interleaves with this
+    // run instead of getting `kernel_busy`.
+    const nb = await writeNb('tst2-lock.ipynb', [codeCell('print("locked")', 'c0')]);
+    const acquired: string[] = [];
+    let released = 0;
+    // A real `KernelRegistry` subclass, not a Proxy: private fields (`#sessions`)
+    // are per-class and a Proxy's receiver is not an instance of the class, so the
+    // proxy approach throws "Cannot read private member #sessions". Everything
+    // except the two asserted calls goes to `super`.
+    class SpyingRegistry extends KernelRegistry {
+      override acquireRun(path: string): () => void {
+        acquired.push(path);
+        const release = super.acquireRun(path);
+        return () => {
+          released += 1;
+          release();
+        };
+      }
+    }
+    const spying = new SpyingRegistry({ idleSeconds: 3600, logger: createLogger('error') });
+    try {
+      const outcome = await runNotebook(request(nb, { cellSelector: 'all' }), { ...deps(), registry: spying });
+      expect(outcome.executed[0]!.status).toBe('ok');
+      expect(acquired).toEqual([nb]);
+      expect(released).toBe(1);
+    } finally {
+      await spying.shutdownAll();
+    }
   }, 120_000);
 });
 
