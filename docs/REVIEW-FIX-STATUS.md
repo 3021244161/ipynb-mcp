@@ -299,10 +299,11 @@
 | # | 事项 | 归属 |
 |---|---|---|
 | 1 | **E1–E9 手工端到端**（DoD 最后一项）：清单见 `docs/E2E-CHECKLIST.md`，需真实第三方 MCP 客户端（Claude Code / Cursor）。**本轮已补上自动化的那一半**：`pnpm smoke` 用真 SDK 客户端驱动真 stdio server 并断言 11 项，但它不是第三方客户端，不能替代 E1–E9 | **boss** |
-| 2 | **CI 首次真跑**：仓库无 `git remote`，`ci.yml` 的 12 个矩阵组合从未执行。已修掉三处**必然失败**的配置（pnpm 版本双重声明；integration job 未跑单测；`IPYNB_TEST_REQUIRE_VENV=1` 缺失导致解释器回退掩盖环境问题），并新增 `pnpm smoke` 可在 CI 上跑（需 build + ipykernel）——但结论仍以真实 runner 为准 | **boss** |
+| 2 | ~~CI 首次真跑~~ **已完成**：`37130350485` 首次运行 10 个 job 里 8 个失败（全在非 Windows 上），逐条修复后 **`37136146902` 与 `37136528728` 全绿**。这是本轮最有价值的一步：它证明了"本机 Windows 全绿"从来不是完成标准 | **done** |
 | 3 | **本机 venv 的 pyzmq 26.2.0 缺口**：该解释器起不了 kernel（详见 `COMPATIBILITY.md`）。集成文件已能自动探测并回退，**未修改任何解释器环境**（R5） | 环境 |
 | 4 | npm 发布与 `dsh-ipynb-mcp` bundle 发布（OPEN_QUESTIONS Q5/Q6）：按默认先不发布 | **boss** |
-| 5 | **NEW-5 未做**：终态可被二次翻转 / 与 §4.8 顺序语义的冲突是 **SPEC 缺口**（v4 报告自己也标"建议补 SPEC"）。改它会动 §4.8 的对外契约，故本轮只登记、不改行为；若要收紧，需要先由人类确认 §4.8 的预期顺序语义 | 人类 / 下一轮 |
-| 6 | **结构重构类建议未做**（AGENTS §10 禁止"顺手重构"，且当前无行为风险点）：ARCH-4（`applyEditOps` 219 行）、ARCH-6 剩余部分（`executeCells`/`materializeRunImages`/`computeStaleReport` 抽取）、ARCH-7（`shouldReturnImages` 迁到 `core/outputs.ts`）、NEW-2 的广播枚举（与 U27 的 `invalid_arguments` 要求冲突，需 SPEC 先裁决）。建议与下一次接口变更同批做 | 下一轮 |
+| 5 | ~~**NEW-5 未做**~~ **已在第六轮实现**（`RunStore.settle()` 单写者 + `progress.completed` 收口 + 写回前 abort 复查，用例 `tests/unit/run-store.test.ts`）。剩下的**只有 SPEC 侧的措辞**：§4.8 没有写明"终态只能由第一个写者决定"，实现按最不意外的语义做了并登记 D-039，若要写进 SPEC 仍需人类确认 | 人类 / 下一轮（仅文档） |
+| 6 | **结构重构类建议未做**（AGENTS §10 禁止"顺手重构"，且当前无行为风险点）：ARCH-4（`applyEditOps` 219 行）、ARCH-6 剩余部分（`executeCells`/`materializeRunImages`/`computeStaleReport` 抽取）、ARCH-7（`shouldReturnImages` 迁到 `core/outputs.ts`）。建议与下一次接口变更同批做 | 下一轮 |
+| 6b | **NEW-2 的广播枚举**（`notebook_run.mode` / `images` 等按值校验）：**需要 SPEC 裁决**——放进 JSON schema 的 `enum` 会让 SDK 在到达处理器之前返回协议错误，而 U27 要求枚举违规返回 `invalid_arguments`（§4.1.12 / §4.6.3 的分工）。当前实现是类型级校验（`timeout_seconds` 用 `.int()`），枚举仍在工具层 | 人类 / 下一轮 |
 | 7 | **格式化器**：仍没有引入 prettier（新增依赖需先问人类，AGENTS §11）。替代方案是两个零依赖检查器（`check-format.mjs` + `check-indent.mjs`），后者用 TypeScript parser 覆盖了 QUAL-1 那一类事故。若人类同意引入格式化器，可删掉这两个脚本 | 人类 |
 | 8 | SPEC v3.1 建议修订：D14 判定式量纲、R6 豁免措辞（含 artifact 默认根与 sidecar connection file）、§5.8 上限公式/分帧与 `failedCellIndexes` 字段名、§4.1.12 与 §4.6.3 的"未知参数"分工（D-024）、§5.2 的运行期降级语义（D-030）、**§4.1.1 的写入方向边界（D-032，本轮最贵的一课）**、Windows 中断不可用对 §4.7 规则 5-6 的影响（D-033）、§4.8 的终态顺序语义（NEW-5） | 人类 / 下一轮 |
