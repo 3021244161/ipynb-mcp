@@ -164,8 +164,19 @@ def op_start_kernel(params: dict) -> dict:
         # alone would leave a window in which a predictable name in a shared
         # /tmp is someone else's file (review v4 SEC-TOCTOU). jupyter_client
         # overwrites the contents, so an empty placeholder is fine.
+        #
+        # The directory is passed EXPLICITLY, and a temp dir that does not exist
+        # fails the whole block rather than falling back: `tempfile.gettempdir()`
+        # silently returns `'.'` when TEMP/TMPDIR are unset, which is how 45
+        # connection files — each carrying an HMAC key — ended up in the user's
+        # working directory (review v7 P1-c). Temp files belong in a temp
+        # directory, and a missing one is a real environment problem worth warning
+        # about.
+        temp_dir = tempfile.gettempdir()
+        if not os.path.isdir(temp_dir):
+            raise OSError(f"no usable temp directory: {temp_dir}")
         fd, connection_path = tempfile.mkstemp(
-            prefix=f"ipynb-mcp-{safe_kernel_id}-{os.getpid()}-", suffix=".json"
+            prefix=f"ipynb-mcp-{safe_kernel_id}-{os.getpid()}-", suffix=".json", dir=temp_dir
         )
         os.close(fd)
         os.chmod(connection_path, 0o600)

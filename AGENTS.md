@@ -1,6 +1,6 @@
 # AGENTS.md — ipynb-mcp
 
-> 本文件面向**在本仓库工作的编码 AI agent**。它规定工作方式、边界与常见陷阱。
+> 本文件面向**在本仓库工作的编码 AI agent**。它规定工作方式、边界与常见陷阱。  
 > 接口契约不在这里 —— 在 [`SPEC.md`](./SPEC.md)。**动手前必须读 SPEC 的对应章节。**
 
 ---
@@ -49,15 +49,15 @@
 
 ## 2. 文档地图
 
-| 文件 | 作用 | 何时读/更新 |
-|---|---|---|
-| `SPEC.md` | **唯一权威实现规格**（24 项决策、逐字段 schema、35 个错误码、验收用例、实现顺序） | 动手前读对应章节；**不修改** |
-| `README.md` | 面向用户：安装、配置、已知限制、安全声明 | 凡改动对外行为/配置项/限制，同一提交内更新 |
-| `docs/COMPATIBILITY.md` | 实测过的客户端与版本矩阵 | 发布前更新；macOS 只跑 unit 的缺口必须写明 |
-| `docs/DEVIATIONS.md` | 每一次偏离 SPEC 的记录（含理由与影响） | 每次偏离当场写 |
-| `docs/OPEN_QUESTIONS.md` | SPEC §12 的原样抄录 | 初始化时建立 |
-| `docs/archive/` | v1（dsh bundle 形态）与 v2（架构定位）**历史存档，不生效** | 只读；**禁止**照它实现 |
-| `CHANGELOG.md` | 逐版本接口变化 | 每个发布版本 |
+| 文件                       | 作用                                                | 何时读/更新                      |
+| ------------------------ | ------------------------------------------------- | --------------------------- |
+| `SPEC.md`                | **唯一权威实现规格**（24 项决策、逐字段 schema、35 个错误码、验收用例、实现顺序） | 动手前读对应章节；**不修改**            |
+| `README.md`              | 面向用户：安装、配置、已知限制、安全声明                              | 凡改动对外行为/配置项/限制，同一提交内更新      |
+| `docs/COMPATIBILITY.md`  | 实测过的客户端与版本矩阵                                      | 发布前更新；macOS 只跑 unit 的缺口必须写明 |
+| `docs/DEVIATIONS.md`     | 每一次偏离 SPEC 的记录（含理由与影响）                            | 每次偏离当场写                     |
+| `docs/OPEN_QUESTIONS.md` | SPEC §12 的原样抄录                                    | 初始化时建立                      |
+| `docs/archive/`          | v1（dsh bundle 形态）与 v2（架构定位）**历史存档，不生效**           | 只读；**禁止**照它实现               |
+| `CHANGELOG.md`           | 逐版本接口变化                                           | 每个发布版本                      |
 
 **警告**：`docs/archive/` 里的 v1 含大量 **dsh 专有设计**（`ctx.jobs`、policy 插件、`injectImagesToModel`、`HarnessError`、精确版本锁、`\n@` 哨兵、正则 stale）。这些**全部已废弃**。看到它们不要照抄 —— 见 SPEC 附录 B 的映射表。
 
@@ -85,7 +85,7 @@ pnpm build            # 产出 lib/（发布用）
 
 ## 4. 仓库结构与模块铁律
 
-> **本树以 `src/` 的实际结构为准**（`git ls-files src` 可核对），与 `SPEC.md` §8 的清单有出入之处见
+> **本树以 `src/` 的实际结构为准**（`git ls-files src` 可核对），与 `SPEC.md` §8 的清单有出入之处见  
 > `docs/DEVIATIONS.md` D-007~D-011、D-022。
 
 ```
@@ -107,13 +107,13 @@ tests/{unit,integration}
 
 **模块边界（违反即回退）**：
 
-| 模块 | 禁止 |
-|---|---|
-| `src/core/*` | **禁止** import `node:*` 或任何 I/O；禁止时钟/随机数影响返回语义（R11）；nbformat 的形状转换只能发生在这里（`parse`/`outputs`） |
-| `src/fs/*` | 禁止解析 notebook 语义（字节与 errno 是它的职责面） |
-| `src/kernel/*` | 禁止解析 notebook 结构 |
-| `src/mcp/*` | 禁止直接碰 `node:fs`；禁止解析 notebook 语义 |
-| `python/*.py` | **禁止读写用户文件**；只接收 `{code}` / `{sources}`，永不接收用户文件路径（R13）。唯一例外是它自己 kernel 的 connection file（位置被钉在 OS 临时目录并负责清理，D-023） |
+| 模块             | 禁止                                                                                                                  |
+| -------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `src/core/*`   | **禁止** import `node:*` 或任何 I/O；禁止时钟/随机数影响返回语义（R11）；nbformat 的形状转换只能发生在这里（`parse`/`outputs`）                         |
+| `src/fs/*`     | 禁止解析 notebook 语义（字节与 errno 是它的职责面）                                                                                  |
+| `src/kernel/*` | 禁止解析 notebook 结构                                                                                                    |
+| `src/mcp/*`    | 禁止直接碰 `node:fs`；禁止解析 notebook 语义                                                                                    |
+| `python/*.py`  | **禁止读写用户文件**；只接收 `{code}` / `{sources}`，永不接收用户文件路径（R13）。唯一例外是它自己 kernel 的 connection file（位置被钉在 OS 临时目录并负责清理，D-023） |
 
 可变状态只允许存在于 `src/kernel/registry.ts` 的单一 `KernelRegistry` 与 `src/mcp/run-store.ts` 的 run 表（外加 `src/kernel/interpreter.ts` 的带 TTL 探测缓存）。
 
@@ -135,20 +135,20 @@ tests/{unit,integration}
 
 ## 6. 红线（最容易被无意违反的 12 条）
 
-| 红线 | 为什么 | 自检方式 |
-|---|---|---|
-| **stdout 只能有 JSON-RPC** | 混入任何字节都会污染 stdio 帧，服务直接不可用 | I12 断言每一行都能 `JSON.parse`；lint `no-console` |
-| **任何文本字段不得出现 base64** | 上下文爆炸，且是本项目对用户的承诺 | U15 用"可解码且解码后是 PNG/JPEG 魔数"的字符串断言 |
-| **不返回图片块时不得物化图片** | 默认的 read 调用不该产生磁盘写入 | U26 断言 artifact 目录无新文件 |
-| **不使用 `structuredContent` / 不声明 `outputSchema`** | 双写会让 token 翻倍（D24） | U24 断言恰好 1 个文本块、无结构化字段 |
-| **`replay` 静默阶段不写文件、不返回输出** | 否则会把"补齐状态"误当成用户要的结果 | I3 断言文件字节级未变 |
-| **无 CAS 锚不得写入源码** | 静默写错是本工具要消灭的头号故障 | U2 / U3 / U5 |
-| **不改 `metadata` / `kernelspec` / `nbformat`，不自动升级格式，不重排 cell** | 对用户文件的非必要改写 | U1 断言未知字段与未修改 cell 原样保留 |
-| **不碰 `root` 之外的文件** | 默认安全姿态 | U11；围栏比较必须 `realpath` + win32/darwin 转小写 |
-| **不执行 `pip` / `conda` / 包管理器** | 不修改用户环境 | 代码里搜 `spawn` 的用途；只有 sidecar 与 `python -c "import ipykernel"` 两处合法 |
-| **sidecar 不得接触文件路径** | 单一写入方 | 审 `python/ipynb_sidecar.py` 的 op 参数 |
-| **不得留下孤儿 kernel / sidecar** | 用户体验与环境整洁 | I11 按 pid 断言；退出路径必须 `shutdown_all` |
-| **零遥测** | 承诺 | 仓库内搜 `fetch` / `http` |
+| 红线                                                             | 为什么                        | 自检方式                                                              |
+| -------------------------------------------------------------- | -------------------------- | ----------------------------------------------------------------- |
+| **stdout 只能有 JSON-RPC**                                        | 混入任何字节都会污染 stdio 帧，服务直接不可用 | I12 断言每一行都能 `JSON.parse`；lint `no-console`                        |
+| **任何文本字段不得出现 base64**                                          | 上下文爆炸，且是本项目对用户的承诺          | U15 用"可解码且解码后是 PNG/JPEG 魔数"的字符串断言                                 |
+| **不返回图片块时不得物化图片**                                              | 默认的 read 调用不该产生磁盘写入        | U26 断言 artifact 目录无新文件                                            |
+| **不使用 `structuredContent` / 不声明 `outputSchema`**               | 双写会让 token 翻倍（D24）         | U24 断言恰好 1 个文本块、无结构化字段                                            |
+| **`replay` 静默阶段不写文件、不返回输出**                                    | 否则会把"补齐状态"误当成用户要的结果        | I3 断言文件字节级未变                                                      |
+| **无 CAS 锚不得写入源码**                                              | 静默写错是本工具要消灭的头号故障           | U2 / U3 / U5                                                      |
+| **不改 `metadata` / `kernelspec` / `nbformat`，不自动升级格式，不重排 cell** | 对用户文件的非必要改写                | U1 断言未知字段与未修改 cell 原样保留                                           |
+| **不碰 `root` 之外的文件**                                            | 默认安全姿态                     | U11；围栏比较必须 `realpath` + win32/darwin 转小写                          |
+| **不执行 `pip` / `conda` / 包管理器**                                 | 不修改用户环境                    | 代码里搜 `spawn` 的用途；只有 sidecar 与 `python -c "import ipykernel"` 两处合法 |
+| **sidecar 不得接触文件路径**                                           | 单一写入方                      | 审 `python/ipynb_sidecar.py` 的 op 参数                               |
+| **不得留下孤儿 kernel / sidecar**                                    | 用户体验与环境整洁                  | I11 按 pid 断言；退出路径必须 `shutdown_all`                                |
+| **零遥测**                                                        | 承诺                         | 仓库内搜 `fetch` / `http`                                             |
 
 完整 20 条见 SPEC §6。
 
@@ -175,19 +175,19 @@ tests/{unit,integration}
 
 按 SPEC §11 的 11 步顺序实现，**每一步完成前不得开始下一步**：
 
-| 步 | 内容 | 该步必须通过的用例 |
-|---|---|---|
-| 1 | 脚手架：`package.json` / tsconfig / vitest / `config` / `log` / `errors` | `typecheck` + `lint` |
-| 2 | `fs/fence` + `fs/atomic` + `fs/backup` | U11 |
-| 3 | `core/parse` | U1、U10 |
-| 4 | `core/edit`（双锚、坐标系、op 矩阵） | U2、U3、U5–U9、U14 |
-| 5 | `core/markdown` | U4 |
-| 6 | `core/outputs` + `fs/artifact` | U15、U16、U17、U26 |
-| 7 | `kernel/*` + `python/ipynb_sidecar.py` | U22、I1、I5–I12、I17 |
-| 8 | `core/stale` + sidecar `analyze` | U18、U19、U19b、U20、U25 |
-| 9 | `mcp/*`：6 个工具、render、run-store、progress、abort | U21、U21b、U23、U24、U27、I13、I14、I16 |
-| 10 | 打包与发布：`files`、README、LICENSE、dsh bundle、CI | I15 |
-| 11 | 手工端到端 | E1–E9 |
+| 步  | 内容                                                                   | 该步必须通过的用例                        |
+| -- | -------------------------------------------------------------------- | -------------------------------- |
+| 1  | 脚手架：`package.json` / tsconfig / vitest / `config` / `log` / `errors` | `typecheck` + `lint`             |
+| 2  | `fs/fence` + `fs/atomic` + `fs/backup`                               | U11                              |
+| 3  | `core/parse`                                                         | U1、U10                           |
+| 4  | `core/edit`（双锚、坐标系、op 矩阵）                                            | U2、U3、U5–U9、U14                  |
+| 5  | `core/markdown`                                                      | U4                               |
+| 6  | `core/outputs` + `fs/artifact`                                       | U15、U16、U17、U26                  |
+| 7  | `kernel/*` + `python/ipynb_sidecar.py`                               | U22、I1、I5–I12、I17                |
+| 8  | `core/stale` + sidecar `analyze`                                     | U18、U19、U19b、U20、U25             |
+| 9  | `mcp/*`：6 个工具、render、run-store、progress、abort                        | U21、U21b、U23、U24、U27、I13、I14、I16 |
+| 10 | 打包与发布：`files`、README、LICENSE、dsh bundle、CI                           | I15                              |
+| 11 | 手工端到端                                                                | E1–E9                            |
 
 **每一步的"完成"= 该步全部用例通过 + `pnpm typecheck` + `pnpm lint` + `pnpm test` 全绿。** 不满足就不算完成，不许进入下一步，也不许宣称完成。
 
@@ -209,7 +209,7 @@ tests/{unit,integration}
   - 自己写的检查器（如 `findStructuralProblem`）只能当**快速防线**，不能替代外部权威，且必须与外部权威对同一批 fixture 同时通过（`tests/integration/fixtures-valid.test.ts`）。
 - **测试 fixture 本身也要过外部权威。** 历史上多个 fixture（kernelspec 缺 `display_name`、`execute_result` 缺 `execution_count`）本身就是非法 nbformat，这让"文件没问题"类断言失去意义。
 - **格式类问题必须用解析器查，不能抽样。** 同一个"整块缩进错位"事故出现过三次；`git diff -w` 看不见它，`oxlint` 也不管。`pnpm lint` 现在会跑 `scripts/check-format.mjs`（tab/行尾空白）与 `scripts/check-indent.mjs`（用 TypeScript parser 校验块缩进与闭合括号列）。
-- **守卫必须自己证明有判别力。** 第五轮评审把仓库的测试当**被测对象**做变异，立刻抓到一条"看着很硬、实际无判别力"的性能守卫：它的计数器挂在父 Buffer 的**自有属性**上，而被测代码拿到的是 `subarray` 结果（不继承自有属性），于是计数器恒为 0、断言恒真，把实现换成二次版本仍然全绿。
+- **守卫必须自己证明有判别力。** 第五轮评审把仓库的测试当**被测对象**做变异，立刻抓到一条"看着很硬、实际无判别力"的性能守卫：它的计数器挂在父 Buffer 的**自有属性**上，而被测代码拿到的是 `subarray` 结果（不继承自有属性），于是计数器恒为 0、断言恒真，把实现换成二次版本仍然全绿。  
   **规则**：新增或修改任何"守卫型"断言（性能上界、不变量、安全边界、错误路径）时，必须在提交信息或注释里写明**在什么变异下它会红**，并亲手做一次该变异。做不到，就说明它守不住任何东西，等于没有。同理，断言里出现的计数器/探针要有一条"探针确实跑过"的断言（例如 `expect(calls).toBeGreaterThan(0)`），否则探针失效时守卫会静默变成恒真。
 - **闸门的范围要等于它的责任范围。** 校验"我们写出的东西"时，不要把"用户本来就有的东西"一起判：第五轮的写前结构闸门审整份文档，于是一处历史遗留的不合规输出让**所有**编辑与运行永久失败（`selfcheck_failed`），而错误位置指向调用方从未触碰的 cell。**判据**：任何"拒绝写入/拒绝执行"的检查，都要能回答"这是本次操作引入的，还是本来就存在的"；后者应当是 warning，不是失败。
 
@@ -219,6 +219,8 @@ tests/{unit,integration}
 
 - 不要"顺手"重构、加功能、加工具、加参数、改返回字段 —— 1.x 有对外兼容承诺（D22）。
 - 不要改动用户文件里的任何东西，除：被执行/编辑 cell 的 `source`/`outputs`/`execution_count`/`cell_type`，加上备份文件与 artifact。
+
+
 - 不要为"更方便"而修改 SPEC、放宽红线或跳过某一步。
 - 不要在 `src/core/*` 里为了省事直接 `import fs`。
 - 不要把日志打到 stdout，也不要为了调试在 `src/` 里留 `console.*`。

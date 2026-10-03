@@ -33,7 +33,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { parseNotebook, findStructuralProblem } from '../../src/core/parse.js';
 import { hasher } from '../../src/hash.js';
-import { nbformatAvailable, validateNotebook } from './nbformat-validator.js';
+import { nbformatAvailable, nbformatSkipReason, validateNotebook } from './nbformat-validator.js';
 
 /**
  * Representative notebook literals: the shapes the write paths must be able to
@@ -113,11 +113,16 @@ describe('[FID-1] every notebook fixture is valid nbformat', () => {
     }
   });
 
-  it('the real nbformat validator accepts each fixture', async () => {
+  it('the real nbformat validator accepts each fixture', async (context) => {
     if (!available) {
-      // No Python with nbformat here. The structural case above still ran, so
-      // this is a coverage note rather than a silent pass.
-      expect(interpreter).toBe('');
+      // The case is SKIPPED, not passed: `expect(interpreter).toBe('')` looked
+      // like an assertion while actually asserting nothing, so on a machine (or a
+      // CI job) without nbformat this file reported a green result for a check
+      // that never ran — the failure mode review v7 P0-a is about. The reason is
+      // in the test name now, and `IPYNB_REQUIRE_NBFORMAT=1` turns the absence
+      // into a failure.
+      const reason = nbformatSkipReason(process.env['IPYNB_TEST_PYTHON'] ?? 'python3');
+      context.skip(reason ?? 'no interpreter with nbformat was found');
       return;
     }
     for (const fixture of FIXTURES) {

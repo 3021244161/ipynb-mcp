@@ -118,7 +118,15 @@ export class SidecarTransport implements KernelTransport {
       ['-u', sidecarPath],
       {
         stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...options.env, PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' },
+        // MERGED with the parent environment, not replaced by it. The old
+        // `{ ...options.env, … }` meant a caller that passed a partial env (every
+        // test that constructs a transport, and any embedder) handed the sidecar,
+        // the kernel, and every executed cell an environment with no `PATH`,
+        // `TEMP`/`TMPDIR`, `SystemRoot` or `HOME` — which is why 45 connection
+        // files accumulated in the working directory instead of the temp directory
+        // (review v7 P1-c). A caller that wants a clean environment can still pass
+        // one explicitly via `env`.
+        env: { ...process.env, ...options.env, PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' },
         detached: this.#platform !== 'win32',
       },
     ) as ChildProcessWithoutNullStreams;

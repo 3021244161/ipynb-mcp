@@ -253,6 +253,19 @@ export function dropUnrepresentableOutputs(outputs: readonly unknown[]): {
   return { outputs: kept, droppedMimes };
 }
 
+/**
+ * A cell's `execution_count` in a form nbformat accepts, or null.
+ *
+ * The schema sets `minimum: 0`, and the gate refuses a negative cell count in the
+ * cells a write is responsible for (review v7 P1-a). The execution path therefore
+ * must not write one: `execution_count: -1` can arrive from the kernel, and a
+ * saved count being restored (`write_outputs: false`) can be one that was already
+ * in the file.
+ */
+export function representableExecutionCount(value: unknown): number | null {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : null;
+}
+
 export type OutputItem =
   | { kind: 'stream'; stream_name: 'stdout' | 'stderr'; text: string; truncated: boolean; truncated_at_chars: number | null }
   | { kind: 'text'; media_type: 'text/plain'; text: string }

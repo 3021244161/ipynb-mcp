@@ -300,6 +300,20 @@ export function findStructuralProblem(
       }
       continue;
     }
+    // Cell-level `execution_count` (review v7 P1-a). The gate checked the copy
+    // INSIDE an `execute_result` output but not the cell's own field, so a cell
+    // with `execution_count: -1` — which nbformat rejects ("-1 is less than the
+    // minimum of 0") — stayed writable and the file stayed invalid after a
+    // successful edit, contradicting D-037's "a rewritten cell that still carries
+    // a problem is still refused".
+    //
+    // Checked before `outputs` is required, because a cell with no `outputs` key at
+    // all still carries the count.
+    if (cell.execution_count !== undefined && cell.execution_count !== null) {
+      if (!Number.isInteger(cell.execution_count) || cell.execution_count < 0) {
+        return { cell_index: index, rule: 'execution_count_negative', execution_count: cell.execution_count };
+      }
+    }
     const outputs = cell.outputs;
     if (outputs === undefined) {
       continue;

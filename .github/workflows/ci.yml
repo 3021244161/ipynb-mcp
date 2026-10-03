@@ -63,13 +63,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      # BOTH modules, explicitly. `pip install ipykernel` used to be assumed to
-      # bring jupyter_client along; it does not always, and the sidecar imports
-      # jupyter_client at startup, so the interpreter the tests picked looked
-      # "capable" to a probe that only checked ipykernel and then failed inside
-      # the sidecar (CI issue #1 problem 2). The list mirrors
+      # BOTH modules, explicitly, plus nbformat. `pip install ipykernel` used to be
+      # assumed to bring jupyter_client along; it does not always, and the sidecar
+      # imports jupyter_client at startup, so the interpreter the tests picked looked
+      # "capable" to a probe that only checked ipykernel and then failed inside the
+      # sidecar (CI issue #1 problem 2). The module list mirrors
       # SIDECAR_REQUIRED_MODULES in src/kernel/interpreter.ts.
-      - run: pip install ipykernel jupyter_client
+      #
+      # `nbformat` is here because it is the EXTERNAL AUTHORITY for "is this file
+      # valid nbformat", and neither ipykernel nor jupyter_client depends on it
+      # (verified via Requires-Dist). Without it the two [FID-1]/[FID-3]
+      # assertions were skipped by a bare `if`, so the only automated environment
+      # reported green while never checking validity at all (review v7 P0-a).
+      - run: pip install ipykernel jupyter_client nbformat
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm build
@@ -83,7 +89,12 @@ jobs:
       # TST-1: a fallback to a non-venv interpreter means the environment (or
       # our own spawn/path logic) is broken; in CI that must be a failure, not a
       # silently greener suite.
+      #
+      # IPYNB_REQUIRE_NBFORMAT is the same guard for the external authority: with
+      # it set, an environment without nbformat fails instead of skipping the only
+      # assertion that checks our output against something we did not write.
       - run: pnpm test:integration
         env:
           IPYNB_TEST_PYTHON: python
           IPYNB_TEST_REQUIRE_VENV: '1'
+          IPYNB_REQUIRE_NBFORMAT: '1'

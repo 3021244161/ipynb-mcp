@@ -11,7 +11,13 @@ import {
   type JsonValue,
   type Warning,
 } from './core/errors.js';
-import { dropUnrepresentableOutputs, mapRawOutputs, nbformatOutputsOfRaw, type OutputItem } from './core/outputs.js';
+import {
+  dropUnrepresentableOutputs,
+  mapRawOutputs,
+  nbformatOutputsOfRaw,
+  representableExecutionCount,
+  type OutputItem,
+} from './core/outputs.js';
 import { cellSource, readNotebookMetadata, type Hasher, type NotebookDoc, type NotebookFile } from './core/parse.js';
 import { analyzeStale, downgradeConfidence, regexDefs, regexUses, type StaleCell } from './core/stale.js';
 import type { IpynbConfig } from './config.js';
@@ -438,7 +444,7 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
             // The in-flight cell is not a completed cell: its partial output never
             // lands (SPEC §4.8 rule 2).
           cell.outputs = savedOutputs;
-          cell.execution_count = savedCount;
+          cell.execution_count = representableExecutionCount(savedCount);
           if (isAborted(effectiveReq.abort)) {
               // The kernel was killed while this cell was in flight (restart /
               // shutdown / client cancel raced the execution): fall through to
@@ -522,7 +528,7 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
             // Half-finished outputs of the interrupted cell never reach the file:
             // restore the pre-run outputs instead (SPEC §4.7 rule 5 / §4.8 rule 2).
           cell.outputs = savedOutputs;
-          cell.execution_count = savedCount;
+          cell.execution_count = representableExecutionCount(savedCount);
           sawTimeout = true;
           break;
         }
@@ -550,11 +556,11 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
             ));
           }
           cell.outputs = sanitized.outputs;
-          cell.execution_count = result.result.executionCount;
+          cell.execution_count = representableExecutionCount(result.result.executionCount);
           executedCellsSet.add(index);
         } else {
           cell.outputs = savedOutputs;
-          cell.execution_count = savedCount;
+          cell.execution_count = representableExecutionCount(savedCount);
         }
         if (abortedNow) {
           break;
@@ -574,6 +580,13 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
             // JsonValue union so failed-run status can report what actually ran.
             executed: executed as unknown as JsonValue,
             write_back: timeoutWriteBack,
+            // The warnings gathered so far travel with the failure, exactly as
+            // `failedRunError` does for cancelled/kernel_died. Without them a
+            // timeout response was the ONE terminal shape that hid what the earlier
+            // cells had already reported — a dropped output value, a pre-existing
+            // quirk, a degraded stale analysis — because the run ends here and the
+            // successful-path warnings are never reached (review v7 V7-8).
+            warnings: warnings.map((warning) => ({ code: warning.code, message: warning.message })),
           });
       }
 
@@ -584,7 +597,15 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
         throw await abortedRunError(executed, deps, abortState, notebook, effectiveReq, platform, executedCellsSet, preRunDoc);
       }
 
-      if (mappedTruncated(executed)) {
+      // SPEC §7 defines `output_truncated` as "ANY OutputItem has
+      // `truncated === true`", and says the whole call appends it ONCE. The
+      // dropped-value warning above reuses the same code, and without this guard a
+      // single run could return two or three copies — the read path has had the
+      // same dedup since v6, so the two directions disagreed (review v7 V7-2).
+      // Deduping cannot be done by hiding the drop: that message names the cell and
+      // the mime, and it is the only place the model can learn that a value was
+      // discarded.
+      if (mappedTruncated(executed) && !warnings.some((warning) => warning.code === 'output_truncated')) {
         warnings.push(createWarning(
           'output_truncated',
           'at least one output exceeded inline_text_chars and was truncated',

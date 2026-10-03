@@ -46,3 +46,43 @@ export function nbformatAvailable(interpreter: string): boolean {
     return false;
   }
 }
+
+/**
+ * Whether the environment INSISTS on the external authority.
+ *
+ * This is the lesson of review v7 P0-a, and it has the same shape as
+ * `IPYNB_TEST_REQUIRE_VENV`: the nbformat assertions were guarded by
+ * `if (nbformatAvailable(...))`, and CI's integration job installed only
+ * `ipykernel jupyter_client` — neither of which depends on nbformat — so the one
+ * environment that exists to verify output against an external authority was the
+ * one environment where that authority was absent. The suite was green, and that
+ * green said nothing about nbformat.
+ *
+ * With this set, an absent authority is a FAILURE rather than a silent no-op.
+ * Locally it stays optional, and the skip is at least visible.
+ */
+export function nbformatRequired(): boolean {
+  return process.env['IPYNB_REQUIRE_NBFORMAT'] === '1';
+}
+
+/**
+ * The reason to SKIP a case that needs the external authority, or null to run it.
+ *
+ * Returning the reason (rather than a boolean) puts it in the test name, so a
+ * skipped case says which capability is missing instead of quietly passing.
+ * Throws when the environment requires nbformat, which is what makes the
+ * requirement enforceable in CI.
+ */
+export function nbformatSkipReason(interpreter: string): string | null {
+  if (nbformatAvailable(interpreter)) {
+    return null;
+  }
+  if (nbformatRequired()) {
+    throw new Error(
+      'IPYNB_REQUIRE_NBFORMAT=1 but nbformat is not importable: the external authority for ' +
+        'notebook validity is missing, so every assertion that depends on it would silently ' +
+        `not run (interpreter: ${interpreter})`,
+    );
+  }
+  return `nbformat is not importable by ${interpreter}; the external validity check cannot run here`;
+}

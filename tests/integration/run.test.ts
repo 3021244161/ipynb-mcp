@@ -22,7 +22,7 @@ import { runNotebook, type RunDeps, type RunRequest } from '../../src/run.js';
 import { handleNotebookEdit } from '../../src/mcp/tools/edit.js';
 import { RunStore } from '../../src/mcp/run-store.js';
 import { PathFence } from '../../src/fs/fence.js';
-import { nbformatAvailable, validateNotebook } from './nbformat-validator.js';
+import { nbformatSkipReason, validateNotebook } from './nbformat-validator.js';
 import { createLogger } from '../../src/log.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -45,8 +45,6 @@ let previousJupyterPath: string | undefined;
  * interpreter via the SPEC §5.2 candidate chain and are unaffected.
  */
 let sidecarInterpreter = VENV_PY;
-/** Whether the chosen interpreter can validate with the real nbformat. */
-let NBFORMAT_AVAILABLE = false;
 
 async function canStartKernel(candidate: string): Promise<boolean> {
   if (!existsSync(candidate)) {
@@ -85,7 +83,6 @@ beforeAll(async () => {
     }
     sidecarInterpreter = BASE_PYTHON;
   }
-  NBFORMAT_AVAILABLE = nbformatAvailable(VENV_PY);
   workspace = await mkdtemp(path.join(tmpdir(), 'ipynb-mcp-run-'));
   artifactRoot = path.join(workspace, 'artifacts');
   registry = new KernelRegistry({ idleSeconds: 3600, logger: createLogger('debug') });
@@ -912,7 +909,16 @@ describe('[ROB-8] a cancel that lands AFTER the last cell still reports what it 
 });
 
 describe('[FID-1] the file the run writes is valid nbformat', () => {
-  it('passes the real nbformat validator, and the tool can read its own outputs back', async () => {
+  it('passes the real nbformat validator, and the tool can read its own outputs back', async (context) => {
+    // Skips (visibly, with the reason in the test name) when nbformat is absent,
+    // and FAILS when the environment requires it: an external authority that is
+    // merely optional degrades to "nothing was checked" on a bare machine, which
+    // is exactly what happened in CI (review v7 P0-a).
+    const skip = nbformatSkipReason(VENV_PY);
+    if (skip !== null) {
+      context.skip(skip);
+      return;
+    }
     // The bug this pins: `result.result.rawOutputs` (the sidecar's private
     // shape: `outputType`, camelCase) was assigned straight to `cell.outputs`.
     // Every executed cell produced a file nbformat rejects, the outputs could
@@ -945,7 +951,7 @@ describe('[FID-1] the file the run writes is valid nbformat', () => {
     expect(executeResult, 'print + expression should yield an execute_result').toBeDefined();
     expect('execution_count' in executeResult!).toBe(true);
 
-    if (NBFORMAT_AVAILABLE) {
+    {
       const validation = validateNotebook(nb, VENV_PY);
       expect(validation.ok, `nbformat.validate rejected the written file:\n${validation.message}`).toBe(true);
     }
@@ -956,7 +962,12 @@ describe('[FID-1] the file the run writes is valid nbformat', () => {
     expect(readBack.executed[0]!.outputs.length).toBeGreaterThanOrEqual(2);
   }, 180_000);
 
-  it('[FID-3] code -> markdown leaves a document the validator accepts', async () => {
+  it('[FID-3] code -> markdown leaves a document the validator accepts', async (context) => {
+    const skip = nbformatSkipReason(VENV_PY);
+    if (skip !== null) {
+      context.skip(skip);
+      return;
+    }
     const nb = await writeNb('fid3-markdown.ipynb', [
       codeCell('print("before")', 'c0'),
     ]);
@@ -973,7 +984,7 @@ describe('[FID-1] the file the run writes is valid nbformat', () => {
     expect('execution_count' in onDisk.cells[0]!).toBe(false);
     expect('outputs' in onDisk.cells[0]!).toBe(false);
 
-    if (NBFORMAT_AVAILABLE) {
+    {
       const validation = validateNotebook(nb, VENV_PY);
       expect(validation.ok, `nbformat.validate rejected the converted file:\n${validation.message}`).toBe(true);
     }
