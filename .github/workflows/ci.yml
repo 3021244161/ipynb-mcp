@@ -79,6 +79,15 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm build
+      # V8-9: the tarball shipped a compiled copy of the sidecar and nothing
+      # checked the artifact at all. Asserting its SHAPE here means a stray
+      # `__pycache__` or a lost entry point fails the build instead of reaching
+      # npm.
+      - run: pnpm check:package
+      # The smoke test drives a real stdio server through the real SDK. It was
+      # "19/19 locally" for three rounds, which is why it is here: a check that
+      # only ever ran on one machine is the class of gap CI exists to close.
+      - run: pnpm smoke
       # Review T5/D2: the unit suite is the only place the symtable analyzer's
       # discriminating power is asserted (analyze-op drives the REAL sidecar),
       # so it must run in a job that has ipykernel. Without this line the D2

@@ -21,7 +21,7 @@
 // happens after the handle is closed: an exclusive handle refuses the check too.
 
 import { spawn } from 'node:child_process';
-import { existsSync, realpathSync, writeFileSync } from 'node:fs';
+import { realpathSync, writeFileSync } from 'node:fs';
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -36,7 +36,8 @@ import { PathFence } from '../../src/fs/fence.js';
 import { createLogger } from '../../src/log.js';
 import { handleNotebookEdit } from '../../src/mcp/tools/edit.js';
 import { toCallToolResult } from '../../src/mcp/tools/result.js';
-import { BASE_PYTHON, VENV_DIR, VENV_PY } from './test-venv.js';
+import { VENV_PY, prepareVenv } from './test-venv.js';
+import { SIDECAR_REQUIRED_MODULES } from '../../src/kernel/interpreter.js';
 
 const WINDOWS = process.platform === 'win32';
 
@@ -44,10 +45,10 @@ let workspace: string;
 let registry: KernelRegistry;
 
 beforeAll(async () => {
-  if (!existsSync(VENV_PY)) {
-    const { execFileSync } = await import('node:child_process');
-    execFileSync(BASE_PYTHON, ['-m', 'venv', '--system-site-packages', VENV_DIR], { stdio: 'inherit', timeout: 120_000 });
-  }
+  // ONE place builds, validates and falls back (review v8 V8-5: the constants had
+  // been centralised while five copies of this logic remained, and the helper that
+  // was supposed to replace them had no callers).
+  prepareVenv({ modules: SIDECAR_REQUIRED_MODULES });
   workspace = await mkdtemp(path.join(tmpdir(), 'ipynb-mcp-lock-'));
   registry = new KernelRegistry({ idleSeconds: 3600, logger: createLogger('error') });
 }, 180_000);

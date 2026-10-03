@@ -1,7 +1,6 @@
 // Integration tests (step 8): stale analysis over a real sidecar's symtable
 // pass, wired through runNotebook.
 
-import { execFileSync } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -12,21 +11,19 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { IpynbConfig } from '../../src/config.js';
 import { hasher } from '../../src/hash.js';
 import { KernelRegistry } from '../../src/kernel/registry.js';
-import { pythonPrefix } from '../../src/kernel/interpreter.js';
+import { SIDECAR_REQUIRED_MODULES, pythonPrefix } from '../../src/kernel/interpreter.js';
 import { runNotebook, type RunDeps } from '../../src/run.js';
 import { createLogger } from '../../src/log.js';
-import { BASE_PYTHON, VENV_PY, VENV_DIR } from './test-venv.js';
+import { BASE_PYTHON, prepareVenv } from './test-venv.js';
 
 let workspace: string;
 let registry: KernelRegistry;
 
 beforeAll(async () => {
-  if (!existsSync(VENV_PY)) {
-    execFileSync(BASE_PYTHON, ['-m', 'venv', '--system-site-packages', VENV_DIR], {
-      stdio: 'inherit',
-      timeout: 120_000,
-    });
-  }
+    // ONE place builds, validates and falls back (review v8 V8-5: the constants had
+  // been centralised while five copies of this logic remained, and the helper that
+  // was supposed to replace them had no callers).
+  prepareVenv({ modules: SIDECAR_REQUIRED_MODULES });
   workspace = await mkdtemp(path.join(tmpdir(), 'ipynb-mcp-stale-'));
   registry = new KernelRegistry({ idleSeconds: 3600, logger: createLogger('debug') });
   registry.start();

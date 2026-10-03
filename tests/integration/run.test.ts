@@ -15,7 +15,7 @@ import { IpynbError } from '../../src/core/errors.js';
 import { parseNotebook } from '../../src/core/parse.js';
 import { hasher } from '../../src/hash.js';
 import { KernelRegistry } from '../../src/kernel/registry.js';
-import { createNodeInterpreterDeps, pythonPrefix, resolveInterpreter } from '../../src/kernel/interpreter.js';
+import { SIDECAR_REQUIRED_MODULES, createNodeInterpreterDeps, pythonPrefix, resolveInterpreter } from '../../src/kernel/interpreter.js';
 import { SidecarTransport } from '../../src/kernel/sidecar-transport.js';
 import { runNotebook, type RunDeps, type RunRequest } from '../../src/run.js';
 import { handleNotebookEdit } from '../../src/mcp/tools/edit.js';
@@ -23,7 +23,7 @@ import { RunStore } from '../../src/mcp/run-store.js';
 import { PathFence } from '../../src/fs/fence.js';
 import { nbformatSkipReason, validateNotebook } from './nbformat-validator.js';
 import { createLogger } from '../../src/log.js';
-import { BASE_PYTHON, VENV_PY, VENV_DIR } from './test-venv.js';
+import { BASE_PYTHON, VENV_PY, prepareVenv } from './test-venv.js';
 
 const WINDOWS = process.platform === 'win32';
 // An interpreter that exists but CANNOT import ipykernel (I17). If absent on
@@ -63,12 +63,10 @@ async function canStartKernel(candidate: string): Promise<boolean> {
 }
 
 beforeAll(async () => {
-  if (!existsSync(VENV_PY)) {
-    execFileSync(BASE_PYTHON, ['-m', 'venv', '--system-site-packages', VENV_DIR], {
-      stdio: 'inherit',
-      timeout: 120_000,
-    });
-  }
+    // ONE place builds, validates and falls back (review v8 V8-5: the constants had
+  // been centralised while five copies of this logic remained, and the helper that
+  // was supposed to replace them had no callers).
+  prepareVenv({ modules: SIDECAR_REQUIRED_MODULES });
   if (!(await canStartKernel(VENV_PY)) && (await canStartKernel(BASE_PYTHON))) {
     // Same TST-1 rule as kernel.test.ts: on CI the venv must work, so a
     // fallback there is a failure rather than a quieter green run.

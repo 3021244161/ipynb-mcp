@@ -39,6 +39,14 @@ ipynb-mcp-*.json
 
 # 一次性补丁脚本（历史遗留形状：patch-tmp.py，见审查 H1）
 patch-tmp*
+# 根目录的「临时探针 / 一次性补丁」脚本。
+# 同类事故第五次（v8 V8-13 又抓到三个被跟踪的：patch-*.mjs / probe-*.mjs）。
+# 结论落进单测后就该删掉；还没删的也不该进版本库 —— 它们的价值是「当场看一眼」，
+# 不是「留给后人读」。要长期保留的检查器放 scripts/ 并接进 `pnpm lint`。
+/patch-*.mjs
+/probe-*.mjs
+/patch-*.cjs
+/probe-*.cjs
 
 # 提交信息草稿（用 `git commit -F` 时产生；`git add -A` 会误收）
 # 三次都踩到了（commit-msg.txt / msg*.txt / m1.txt），所以把整个家族列全：

@@ -202,9 +202,12 @@ function prepareTestVenv(): void {
 }
 
 /**
- * The venv is removed at the END too, so a suite run does not leave it for the next
- * one — leaving it behind is how one CI run's leftover changed what the next run
- * measured. Only a venv this test created is touched.
+ * Ownership is dropped at the end, but a HEALTHY venv is deliberately KEPT:
+ * rebuilding it costs ~18 MB and several seconds, and the next run benefits. What
+ * must not happen is an UNUSABLE venv surviving to change what the next run
+ * measures, which is why `removeOwnedVenv` deletes that case immediately — see
+ * `prepareTestVenv`. The earlier comment here claimed the venv is removed in
+ * `afterAll`, which the code never did (review v8 V8-15).
  */
 afterAll(() => {
   removeOwnedVenv();

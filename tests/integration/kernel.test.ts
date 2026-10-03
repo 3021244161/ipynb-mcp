@@ -3,7 +3,6 @@
 // (defaults to the PATH python). A dedicated test venv is created from that
 // base so the user's environment is never touched (AGENTS §3).
 
-import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -12,9 +11,10 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { createLogger } from '../../src/log.js';
+import { SIDECAR_REQUIRED_MODULES } from '../../src/kernel/interpreter.js';
 import { KernelRegistry } from '../../src/kernel/registry.js';
 import { SidecarTransport } from '../../src/kernel/sidecar-transport.js';
-import { BASE_PYTHON, VENV_PY, VENV_DIR } from './test-venv.js';
+import { BASE_PYTHON, VENV_PY, prepareVenv } from './test-venv.js';
 
 let workspace: string;
 let notebookPath: string;
@@ -50,12 +50,10 @@ async function canStartKernel(candidate: string): Promise<boolean> {
 }
 
 beforeAll(async () => {
-  if (!existsSync(VENV_PY)) {
-    execFileSync(BASE_PYTHON, ['-m', 'venv', '--system-site-packages', VENV_DIR], {
-      stdio: 'inherit',
-      timeout: 120_000,
-    });
-  }
+    // ONE place builds, validates and falls back (review v8 V8-5: the constants had
+  // been centralised while five copies of this logic remained, and the helper that
+  // was supposed to replace them had no callers).
+  prepareVenv({ modules: SIDECAR_REQUIRED_MODULES });
   // Prefer the dedicated venv; fall back to the base interpreter when it cannot
   // actually host a kernel, and say which one is in use.
   if (!(await canStartKernel(VENV_PY)) && (await canStartKernel(BASE_PYTHON))) {

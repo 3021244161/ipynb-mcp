@@ -98,7 +98,7 @@ pnpm test:integration                              # real kernels (needs ipykern
 pnpm build
 ```
 
-Integration tests create a dedicated venv (`tests/.venv-test`, system-site-packages) and never touch your interpreters. Set `IPYNB_TEST_PYTHON` to a base interpreter that already has `ipykernel`.
+Integration tests create a dedicated venv **in the system temp directory** (never in the repository; override the location with `IPYNB_TEST_VENV`) and never touch your interpreters. Set `IPYNB_TEST_PYTHON` to a base interpreter that already has `ipykernel`.
 
 Implementation follows the frozen spec in [SPEC.md](./SPEC.md); every deviation is recorded in [docs/DEVIATIONS.md](./docs/DEVIATIONS.md).
 

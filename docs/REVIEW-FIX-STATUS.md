@@ -128,9 +128,9 @@
 | **INDENT-HOLE** `if` 体不受检 | ⬜ **漏列** | ✅ **本轮修复**：`check-indent.mjs` 重写（`thenStatement`/`else`/`switch`/箭头/访问器 + 自测 + "语句必须独占一行"），并用它发现并修好了 `run.ts` 等 5 个文件里 68 行真实错位 |
 | **NEW5-REPRO** 终态可二次翻转 | ⬜ **漏列** | ✅ **本轮修复**：`RunStore.settle()` 单写者 + `progress.completed` 收口 + 写回前 abort 复查 |
 | **TST-CI** 用例全绿但 exit 1 | ⬜ **漏列** | ✅ **本轮修复**：`settled = inflight.then(...)`，在 kill 之前挂上 handler；I15 的相位错误同时修掉 |
-| **NBFORMAT-GATE-SILENT** 校验静默消失 | ⬜ **漏列** | ✅ **本轮修复**：`[FID-1]`/`[FID-3]` 在 nbformat 不可用时用 `it.skip` 记录原因，而不是删掉断言 |
+| **NBFORMAT-GATE-SILENT** 校验静默消失 | ⬜ **漏列** | ~~✅ 本轮修复~~ **已撤回：第六轮代码里仍是裸 `if`；第七轮才真做（见第七轮段）** |
 | **NEW-2** 值级校验漂成协议错误 | ⬜ **漏列** | ⚠️ **部分**：`timeout_seconds` 用 `.int()`（类型级）。广播枚举**保持工具层**——schema enum 会让 SDK 返回协议错误，与 U27 要求的 `invalid_arguments` 冲突，需 SPEC 先裁决（见剩余事项） |
-| **NEW-6** stderr 尾巴挂在任意失败上 | ⬜ **漏列** | ✅ **本轮修复**：只在 transport 确实失联时附带，超时路径不再无条件附加 |
+| **NEW-6** stderr 尾巴挂在任意失败上 | ⬜ **漏列** | ~~✅ 本轮修复~~ **已撤回：第六轮只改了 `!this.alive` 一支，`#failureDetail()` 仍无条件附加；第七轮如实标 ⚠️（见第七轮段）** |
 | DEP-2 版本双真源 | ⬜ **漏列** | ✅ **本轮修复**：`server.ts` 从 `package.json` 读版本（`createRequire`），新增单测 + smoke 断言 |
 | QUAL-2 两份同构 `isAbortCause` | ⬜ **漏列** | ✅ **本轮修复**：统一到 `core/errors.ts`，两处 import |
 | TST-2 `acquireRun` 调用点零覆盖 | ⬜ **漏列** | ✅ **本轮修复**：`tests/unit/acquire-run.test.ts` 用包装 registry 断言真的调用与释放 |
