@@ -5,12 +5,12 @@
 // and skips (with a recorded reason) when no Python is available, keeping
 // the "no Python required" guarantee for unit tests.
 
-import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
 
 import { createLogger } from '../../src/log.js';
 import { SIDECAR_REQUIRED_MODULES } from '../../src/kernel/interpreter.js';
@@ -30,11 +30,35 @@ const PYTHON_AVAILABLE =
   existsSync(VENV_PY) ||
   spawnSync(WINDOWS ? 'python' : 'python3', ['-c', ''], { timeout: 5000 }).status === 0;
 
+let chosenInterpreter: string | null = null;
+
+/**
+ * The interpreter every case in this file will use — and the one the capability
+ * probe must judge. Resolving it once, in one place, is the fix for a CI failure
+ * that had nothing to do with the product: the probe validated the BASE
+ * interpreter (no venv existed yet) and the case then created a venv and ran with
+ * THAT, so the first CI run passed and the second failed on the same code, purely
+ * because the venv it left behind could not import jupyter_client.
+ *
+ * A venv is only preferred when it can actually run the sidecar; one that cannot
+ * is removed so it cannot mislead a later run either. Override the location with
+ * IPYNB_TEST_VENV.
+ */
 function interpreter(): string {
-  if (existsSync(VENV_PY)) {
-    return VENV_PY;
+  if (chosenInterpreter !== null) {
+    return chosenInterpreter;
   }
-  return BASE_PYTHON;
+  if (existsSync(VENV_PY) && canRunSidecar(VENV_PY)) {
+    chosenInterpreter = VENV_PY;
+    return chosenInterpreter;
+  }
+  chosenInterpreter = BASE_PYTHON;
+  return chosenInterpreter;
+}
+
+/** Every module the sidecar imports at startup (see SIDECAR_REQUIRED_MODULES). */
+function canRunSidecar(candidate: string): boolean {
+  return SIDECAR_REQUIRED_MODULES.every((module) => runs(candidate, `import ${module}`));
 }
 
 /**
@@ -60,26 +84,18 @@ function probeKernelStartup(): Promise<ProbeOutcome> {
     if (!PYTHON_AVAILABLE) {
       return { status: 'noInterpreter', reason: 'no Python interpreter on this machine' };
     }
-    if (!runs(interpreter(), 'import ipykernel')) {
-      return { status: 'ipykernelMissing', reason: `${interpreter()} cannot import ipykernel` };
-    }
-    // Both modules the sidecar imports at startup. The candidate chain in
-    // src/kernel/interpreter.ts probes exactly this set (SIDECAR_REQUIRED_MODULES,
-    // D-038) and would refuse a candidate missing either one — the probe has to
-    // use the same source of truth, or the two disagree and the disagreement
-    // looks like a product failure: CI's ubuntu jobs installed ipykernel but not
-    // jupyter_client, this probe said "capable", and the case failed with
-    // "start_kernel is broken ... jupyter_client is not importable" while the
-    // real answer was "this interpreter cannot run the sidecar" (a recorded skip).
-    const missing = SIDECAR_REQUIRED_MODULES.filter(
-      (module) => !runs(interpreter(), `import ${module}`),
-    );
+    const missing = SIDECAR_REQUIRED_MODULES.filter((module) => !runs(interpreter(), `import ${module}`));
     if (missing.length > 0) {
       return {
         status: 'ipykernelMissing',
-        reason: `${interpreter()} cannot import ${missing.join(', ')}`,
+        reason: `${interpreter()} cannot import ${missing.join(', ')}`
       };
     }
+    // Both modules the sidecar imports at startup. The candidate chain in
+    // src/kernel/interpreter.ts probes exactly this set (SIDECAR_REQUIRED_MODULES,
+    // D-038) and would refuse a candidate missing either one — one source of truth,
+    // so the probe and production cannot disagree and turn a missing module into a
+    // product-looking failure.
     if (!runs(interpreter(), 'import zmq; zmq.Context().socket(zmq.PAIR)')) {
       // The interpreter advertises ipykernel but its pyzmq cannot open a
       // socket at all (this machine's `.venv-test`: pyzmq 26.2.0 aborts with
@@ -110,6 +126,49 @@ function probeKernelStartup(): Promise<ProbeOutcome> {
 function runs(candidate: string, snippet: string): boolean {
   return spawnSync(candidate, ['-c', snippet], { timeout: 10_000 }).status === 0;
 }
+
+/**
+ * Decide the venv BEFORE anything reads `interpreter()`.
+ *
+ * A venv is created only when the base interpreter can serve it, and an existing
+ * venv that cannot run the sidecar is removed rather than preferred. Both halves
+ * matter: creating it lazily is what made CI pass once and fail once on the same
+ * code (the first run probed the base interpreter and then ran in a venv it had
+ * just created; the second run found that venv and probed IT), and leaving an
+ * unusable one behind is what makes the failure survive into later runs.
+ */
+function prepareTestVenv(): void {
+  if (!PYTHON_AVAILABLE) {
+    return;
+  }
+  if (existsSync(VENV_PY)) {
+    if (!canRunSidecar(VENV_PY)) {
+      rmSync(VENV_DIR, { recursive: true, force: true });
+    }
+    return;
+  }
+  // Only build one from an interpreter that can actually serve it.
+  if (!canRunSidecar(BASE_PYTHON)) {
+    return;
+  }
+  try {
+    execFileSync(BASE_PYTHON, ['-m', 'venv', '--system-site-packages', VENV_DIR], {
+      stdio: 'ignore',
+      timeout: 120_000,
+    });
+  } catch {
+    // A venv is an optimisation here, not a requirement: the base interpreter
+    // already passed the capability check, so fall back to it.
+    return;
+  }
+  if (!canRunSidecar(VENV_PY)) {
+    rmSync(VENV_DIR, { recursive: true, force: true });
+  }
+}
+
+beforeAll(() => {
+  prepareTestVenv();
+}, 180_000);
 
 describe('[U18][D2] the symtable analyzer maps real source to defs/uses', () => {
   it.skipIf(!PYTHON_AVAILABLE)('tuple unpacking lands in module-level defs (regex cannot)', async () => {
@@ -174,10 +233,9 @@ describe('[U20][D2] non-Python kernels report method skipped', () => {
       throw new Error(`start_kernel is broken with a capable interpreter: ${kernelReady.reason}`);
     }
 
-    const { execFileSync } = await import('node:child_process');
-    if (!existsSync(VENV_PY)) {
-      execFileSync(BASE_PYTHON, ['-m', 'venv', '--system-site-packages', VENV_DIR], { stdio: 'ignore', timeout: 120_000 });
-    }
+    // No venv is created here any more: `interpreter()` resolved (and validated)
+    // the one this case will use, and created a venv only if the base interpreter
+    // can serve it (see prepareTestVenv).
     const { KernelRegistry } = await import('../../src/kernel/registry.js');
     const { runNotebook } = await import('../../src/run.js');
     const { mkdtemp, mkdir, rm, writeFile } = await import('node:fs/promises');
