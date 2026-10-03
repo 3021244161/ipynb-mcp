@@ -266,6 +266,55 @@ export function representableExecutionCount(value: unknown): number | null {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : null;
 }
 
+/**
+ * The `output_truncated` warning for a call, or null when nothing was lost.
+ *
+ * Two different facts share this code because SPEC §7's table is closed
+ * (AGENTS §11.4): a value nbformat cannot store was DROPPED, and an output was
+ * TRUNCATED at `inline_text_chars`. They also share the code's one-per-call rule, so
+ * whichever spoke first used to silence the other — the model would be told about
+ * truncation and never learn that a value had been discarded, or the reverse
+ * (review v8 V8-10).
+ *
+ * One message therefore carries both counts. The text is built here, in core, so the
+ * rule is testable without a kernel and cannot drift from the callers: the v7
+ * attempt at this lived inline in `run.ts`, and the test for it re-implemented the
+ * same `if` on its own array, so deleting the real guard kept the suite green
+ * (review v8 V8-4).
+ */
+export function outputTruncatedWarning(
+  droppedMimes: readonly string[],
+  truncatedCount: number,
+): { code: 'output_truncated'; message: string } | null {
+  const unique = [...new Set(droppedMimes)];
+  if (unique.length === 0 && truncatedCount === 0) {
+    return null;
+  }
+  const parts: string[] = [];
+  if (unique.length > 0) {
+    parts.push(
+      `dropped ${String(unique.length)} mime value(s) nbformat cannot store (${unique.join(', ')})`,
+    );
+  }
+  if (truncatedCount > 0) {
+    parts.push(
+      `${String(truncatedCount)} output(s) exceeded inline_text_chars and were truncated`,
+    );
+  }
+  return { code: 'output_truncated', message: parts.join('; ') };
+}
+
+/** How many executed cells had at least one truncated output. */
+export function countTruncatedCells(
+  cells: readonly { readonly outputs: readonly OutputItem[] }[],
+): number {
+  return cells.filter((cell) => cell.outputs.some(isTruncatedItem)).length;
+}
+
+function isTruncatedItem(item: OutputItem): boolean {
+  return item.kind === 'stream' && item.truncated;
+}
+
 export type OutputItem =
   | { kind: 'stream'; stream_name: 'stdout' | 'stderr'; text: string; truncated: boolean; truncated_at_chars: number | null }
   | { kind: 'text'; media_type: 'text/plain'; text: string }

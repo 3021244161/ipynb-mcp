@@ -1,17 +1,11 @@
-// [P1-a][V7-2][V7-8] Three defects the v7 review reproduced by hand, all of them
-// about what a run REPORTS rather than what it does:
+// [P1-a][V7-2][V7-8][V8-4] Defects about what a run REPORTS rather than what it does.
 //
-//   P1-a  the write gate checked `execution_count` inside an `execute_result`
-//         output but not the CELL's own field, so a cell with -1 (which nbformat
-//         rejects: "-1 is less than the minimum of 0") stayed editable and the
-//         file stayed invalid after a "successful" edit.
-//   V7-2  `output_truncated` is defined by SPEC §7 as "any OutputItem has
-//         truncated === true", appended ONCE per call. The run path reused it for
-//         "a value was dropped" AND pushed the real truncation notice separately,
-//         so one response could carry two or three copies.
-//   V7-8  `exec_timeout` was the one terminal shape whose detail omitted
-//         `warnings`, so a timeout hid everything the earlier cells had reported.
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+// The cases here drive REAL functions. An earlier version of this file did not: it
+// re-implemented the product's `if` on a local array and asserted source TEXT, so
+// deleting the actual guard from `run.ts` left the suite green — the reviewer's
+// mutation M1 (review v8 V8-4). A guard that cannot be made to fail is not a guard.
+import { EventEmitter } from 'node:events';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -19,10 +13,12 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { findStructuralProblem, parseNotebook, selfCheckNotebook } from '../../src/core/parse.js';
 import {
+  countTruncatedCells,
   dropUnrepresentableOutputs,
-  mapRawOutputs,
   nbformatOutputsOfRaw,
+  outputTruncatedWarning,
   representableExecutionCount,
+  type OutputItem,
 } from '../../src/core/outputs.js';
 import { hasher } from '../../src/hash.js';
 
@@ -139,66 +135,163 @@ describe('[P1-a] a negative CELL execution_count is refused by the gate', () => 
   });
 });
 
-describe('[V7-2] output_truncated is appended at most once per call', () => {
-  it('the mapped truncation flag and the dropped-value notice do not double up', () => {
-    // Reproduces the shape the review measured: the same response reporting a
-    // dropped value AND a genuine truncation. SPEC §7 says the code appears once.
-    const warnings: Array<{ code: string; message: string }> = [];
-    // The run pushes the drop notice while mapping outputs…
-    warnings.push({ code: 'output_truncated', message: 'cell 2: dropped output value(s) …' });
-    // …and then the truncation notice, which must notice it is already there.
-    const truncated = mapRawOutputs(
-      [{ outputType: 'stream', text: 'x'.repeat(50) }],
-      { maxImageBytes: 20_971_520, inlineTextChars: 10, hasher },
-    ).items.some((item) => item.kind === 'stream' && item.truncated);
-    expect(truncated, 'the fixture must actually truncate').toBe(true);
-    if (truncated && !warnings.some((warning) => warning.code === 'output_truncated')) {
-      warnings.push({ code: 'output_truncated', message: 'at least one output exceeded inline_text_chars …' });
-    }
-    expect(warnings.filter((warning) => warning.code === 'output_truncated')).toHaveLength(1);
-    // The surviving message is the informative one: it names the cell and the mime,
-    // and it is the only place the model can learn a value was discarded.
-    expect(warnings[0]!.message).toContain('cell 2');
+describe('[V7-2][V8-10] output_truncated is emitted once, and carries both facts', () => {
+  // These cases call the REAL function the run uses. The previous version
+  // re-implemented the product's `if` on a local array, so deleting the actual guard
+  // from `run.ts` kept the suite green (review v8 V8-4, mutation M1) — the same class
+  // of fake guard as a source-text assertion, only harder to notice.
+
+  it('reports a dropped value', () => {
+    expect(outputTruncatedWarning(['text/plain'], 0)).toEqual({
+      code: 'output_truncated',
+      message: expect.stringContaining('dropped 1'),
+    });
+  });
+
+  it('reports truncation', () => {
+    expect(outputTruncatedWarning([], 2)).toEqual({
+      code: 'output_truncated',
+      message: expect.stringContaining('2 output(s) exceeded inline_text_chars'),
+    });
+  });
+
+  it('reports BOTH when both happened, instead of one silencing the other', () => {
+    // V8-10: the drop notice used to be pushed first and the truncation notice was
+    // deduped away, so a call that had lost a value AND truncated an output told the
+    // model about only one of them.
+    const warning = outputTruncatedWarning(['image/png', 'text/plain'], 3);
+    expect(warning).not.toBeNull();
+    expect(warning!.message).toContain('dropped 2');
+    expect(warning!.message).toContain('3 output(s) exceeded');
+    expect(warning!.message).toContain('image/png');
+  });
+
+  it('deduplicates the mime names (one value per mime is not two drops)', () => {
+    const warning = outputTruncatedWarning(['text/plain', 'text/plain', 'text/plain'], 0);
+    expect(warning!.message).toContain('dropped 1');
+    expect(warning!.message.match(/text\/plain/g)).toHaveLength(1);
+  });
+
+  it('is silent when nothing was lost — the case a blanket push would break', () => {
+    // Without this, `outputTruncatedWarning` could return a warning unconditionally
+    // and every case above would still pass.
+    expect(outputTruncatedWarning([], 0)).toBeNull();
+  });
+
+  it('counts the cells that actually truncated, not the outputs', () => {
+    const truncated = (text: string): OutputItem => ({
+      kind: 'stream',
+      stream_name: 'stdout',
+      text,
+      truncated: true,
+      truncated_at_chars: 10,
+    });
+    const whole: OutputItem = {
+      kind: 'stream',
+      stream_name: 'stdout',
+      text: 'ok',
+      truncated: false,
+      truncated_at_chars: null,
+    };
+    expect(countTruncatedCells([{ outputs: [truncated('a'), truncated('b')] }])).toBe(1);
+    expect(countTruncatedCells([{ outputs: [whole] }, { outputs: [truncated('a')] }])).toBe(1);
+    expect(countTruncatedCells([{ outputs: [whole] }])).toBe(0);
   });
 });
 
 describe('[V7-8] a timeout detail carries the warnings gathered so far', () => {
-  it('the exec_timeout detail has a warnings array (shape guard)', async () => {
-    // The failure path is driven by a real kernel in the integration suite; this
-    // pins the SHAPE so a future edit cannot silently drop the key again, which is
-    // what happened before (review v7 V7-8: `failedRunError` had it, the timeout
-    // branch did not).
-    const source = await readFile(path.join(process.cwd(), 'src', 'run.ts'), 'utf8');
-    const timeoutBlock = source.slice(source.indexOf("throw new IpynbError('exec_timeout'"));
-    const end = timeoutBlock.indexOf('});');
-    expect(end, 'the exec_timeout detail must be a closed object literal').toBeGreaterThan(0);
-    expect(timeoutBlock.slice(0, end)).toContain('warnings:');
+  it('the exec_timeout detail keeps a warnings array on the wire', async () => {
+    // V8-4: this used to assert SOURCE TEXT (`expect(source).toContain('warnings:')`),
+    // which passes even when the line sits inside a comment. It drives the real
+    // error and the real projection instead.
+    const { IpynbError } = await import('../../src/core/errors.js');
+    const { toCallToolResult } = await import('../../src/mcp/tools/result.js');
+
+    const error = new IpynbError('exec_timeout', 'cell execution timed out', {
+      cell_index: 2,
+      completed_cells: 2,
+      warnings: [{ code: 'output_truncated', message: 'dropped 1 mime value(s) (text/plain)' }],
+    });
+    const outcome = await (await import('../../src/mcp/tools/result.js')).runTool(async () => {
+      throw error;
+    });
+    const result = toCallToolResult(outcome);
+    expect(result.isError).toBe(true);
+    const body = JSON.parse(String((result.content[0] as { text?: string }).text ?? '{}')) as Record<string, unknown>;
+    expect(body['code']).toBe('exec_timeout');
+    // The point of V7-8: the earlier cells' warnings must survive into the failure.
+    expect(body['detail']).toMatchObject({
+      warnings: [{ code: 'output_truncated', message: 'dropped 1 mime value(s) (text/plain)' }],
+    });
   });
 });
 
 describe('[P1-c] the sidecar environment is merged, not replaced', () => {
-  it('a partial env option still leaves PATH visible to the sidecar', async () => {
-    const source = await readFile(path.join(process.cwd(), 'src', 'kernel', 'sidecar-transport.ts'), 'utf8');
-    // The bug was `env: { ...options.env, … }`, which dropped PATH/TEMP/HOME for
-    // every caller that passed a partial environment — the sidecar then wrote its
-    // HMAC-bearing connection file into the working directory.
-    expect(source).toContain('...process.env, ...options.env');
-  });
-});
+  /** A ChildProcess stand-in: the transport only attaches listeners in its ctor. */
+  function fakeChild(): EventEmitter & Record<string, unknown> {
+    const stream = new EventEmitter() as EventEmitter & { write: () => boolean; end: () => void };
+    stream.write = () => true;
+    stream.end = () => undefined;
+    const child = new EventEmitter() as EventEmitter & Record<string, unknown>;
+    child['stdout'] = stream;
+    child['stderr'] = stream;
+    child['stdin'] = stream;
+    child['kill'] = () => true;
+    child['pid'] = 4242;
+    return child;
+  }
 
-describe('[P1-c] the connection file is pinned to a real temp directory', () => {
-  it('the sidecar passes an explicit dir and refuses the cwd fallback', async () => {
-    const source = await readFile(path.join(process.cwd(), 'python', 'ipynb_sidecar.py'), 'utf8');
-    expect(source).toContain('dir=temp_dir');
-    // `gettempdir()` returns '.' when nothing is set, which is the fallback that
-    // put 45 connection files in the working directory.
-    expect(source).toContain('os.path.isdir(temp_dir)');
+  it('a transport built with a partial env still gives the sidecar PATH', async () => {
+    // A source-text assertion cannot show this; the constructor can. A transport
+    // created with a partial `env` must still hand the child the parent's variables,
+    // or the sidecar and every executed cell lose PATH/TEMP/HOME — which is how 45
+    // HMAC-bearing connection files ended up in the working directory (v7 P1-c).
+    const { SidecarTransport } = await import('../../src/kernel/sidecar-transport.js');
+    const spawned: Array<Record<string, unknown>> = [];
+    new SidecarTransport({
+      interpreterPath: 'python',
+      env: { IPYNB_TEST_MARKER: '1' },
+      onLog: () => undefined,
+      spawnImpl: ((_command: string, _args: readonly string[], options: Record<string, unknown>) => {
+        spawned.push(options);
+        return fakeChild();
+      }) as never,
+    });
+    // Spawning is synchronous; `shutdownAll()` waits for an exit the stand-in
+    // never produces, so nothing here awaits it.
+
+    expect(spawned).toHaveLength(1);
+    const env = spawned[0]!['env'] as Record<string, string | undefined>;
+    // The caller's variable survives…
+    expect(env['IPYNB_TEST_MARKER']).toBe('1');
+    // …and so do the parent's, which the old `{ ...options.env }` dropped.
+    expect(Object.keys(env).length).toBeGreaterThan(1);
+    if (process.env['PATH'] !== undefined) {
+      expect(env['PATH']).toBe(process.env['PATH']);
+    }
+    // PYTHONUNBUFFERED/PYTHONIOENCODING are this tool's own, and must still win.
+    expect(env['PYTHONUNBUFFERED']).toBe('1');
+    expect(env['PYTHONIOENCODING']).toBe('utf-8');
   });
 
-  it('writing and removing a connection file leaves no residue', async () => {
-    const target = path.join(dir, 'conn.json');
-    await writeFile(target, '{"key":"secret"}');
-    await rm(target, { force: true });
-    await expect(readFile(target)).rejects.toMatchObject({ code: 'ENOENT' });
+  it('the called env cannot smuggle a cwd onto the child', async () => {
+    // The other half of P1-c: the connection file goes to the interpreter's TEMP
+    // directory, so the child must not be given a working directory of our choosing
+    // (the transport never sets `cwd`). Pinned because setting one would silently
+    // reintroduce the "files land in the repository" failure.
+    const { SidecarTransport } = await import('../../src/kernel/sidecar-transport.js');
+    const spawned: Array<Record<string, unknown>> = [];
+    new SidecarTransport({
+      interpreterPath: 'python',
+      env: {},
+      onLog: () => undefined,
+      spawnImpl: ((_command: string, _args: readonly string[], options: Record<string, unknown>) => {
+        spawned.push(options);
+        return fakeChild();
+      }) as never,
+    });
+    // Spawning is synchronous; `shutdownAll()` waits for an exit the stand-in
+    // never produces, so nothing here awaits it.
+    expect(spawned[0]).not.toHaveProperty('cwd');
   });
 });

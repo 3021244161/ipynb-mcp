@@ -12,9 +12,11 @@ import {
   type Warning,
 } from './core/errors.js';
 import {
+  countTruncatedCells,
   dropUnrepresentableOutputs,
   mapRawOutputs,
   nbformatOutputsOfRaw,
+  outputTruncatedWarning,
   representableExecutionCount,
   type OutputItem,
 } from './core/outputs.js';
@@ -341,6 +343,9 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
   const executed: ExecutedCell[] = [];
   const imageBlocks: RunImageBlock[] = [];
   const executedCellsSet = new Set<number>();
+  // Mime types dropped because nbformat cannot store them, collected across the
+  // whole call so ONE warning can report both this and any truncation (V8-10).
+  const droppedMimes: string[] = [];
   // Guards the failure-path write-back against running twice for one run.
   const abortState: AbortState = { writtenBack: false };
   // Running cursor so image_index stays unique across the whole call
@@ -549,12 +554,12 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
           // cell of the run over one output value — a plain user cell can produce
           // one (review v6 GATE-5/CRASH-1).
           const sanitized = dropUnrepresentableOutputs(converted);
-          if (sanitized.droppedMimes.length > 0) {
-            warnings.push(createWarning(
-              'output_truncated',
-              `cell ${index}: dropped output value(s) nbformat cannot store (non-string mime data: ${[...new Set(sanitized.droppedMimes)].join(', ')})`,
-            ));
-          }
+          // Collected, not warned here: the warning is emitted once per call by
+          // `outputTruncatedWarning`, which can carry BOTH facts (dropped values
+          // and truncated outputs). Pushing per cell let the first fact silence
+          // the second (review v8 V8-10), and doing it inline made the rule
+          // untestable (review v8 V8-4).
+          droppedMimes.push(...sanitized.droppedMimes);
           cell.outputs = sanitized.outputs;
           cell.execution_count = representableExecutionCount(result.result.executionCount);
           executedCellsSet.add(index);
@@ -605,11 +610,9 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
       // Deduping cannot be done by hiding the drop: that message names the cell and
       // the mime, and it is the only place the model can learn that a value was
       // discarded.
-      if (mappedTruncated(executed) && !warnings.some((warning) => warning.code === 'output_truncated')) {
-        warnings.push(createWarning(
-          'output_truncated',
-          'at least one output exceeded inline_text_chars and was truncated',
-        ));
+      const truncation = outputTruncatedWarning(droppedMimes, countTruncatedCells(executed));
+      if (truncation !== null) {
+        warnings.push(createWarning(truncation.code, truncation.message));
       }
 
       // ---- stale analysis (SPEC §5.6) --------------------------------------------
@@ -955,8 +958,3 @@ async function writeBackCompleted(
   }
 }
 
-function mappedTruncated(executed: readonly ExecutedCell[]): boolean {
-  return executed.some((entry) =>
-    entry.outputs.some((output) => output.kind === 'stream' && output.truncated),
-  );
-}
