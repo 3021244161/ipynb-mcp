@@ -1,21 +1,28 @@
 // I15: a file held open with a NON-SHARED handle (Windows) maps to
-// notebook_locked, never internal. On other platforms the scenario is skipped
-// and recorded (SPEC §10.2).
+// notebook_locked, never internal. On other platforms the scenario is skipped and
+// recorded (SPEC §10.2).
 //
-// The first version had a phase error that CI exposed: it took its "unchanged"
-// snapshot with `readFile` AFTER the exclusive holder was running, so the
-// snapshot itself threw EBUSY and the test never reached its assertions
-// (CI issue #1 problem 3). Three things are fixed here:
-//   - the snapshot is taken while the file is still readable;
-//   - the READ phase and the WRITE phase each get a case (the issue asked for
-//     coverage of "the read collides", which the original never had);
-//   - the write-phase case triggers the lock deterministically through the
-//     serializer hook, so it cannot silently degrade into "the read failed
-//     first" and pass for the wrong reason.
+// This case has now failed twice in ways that had nothing to do with the product,
+// and both times the reason was the same: the test could not tell whether its own
+// precondition was in place.
+//   1. The first version took its "unchanged" snapshot with `readFile` AFTER the
+//      exclusive holder was running, so the snapshot itself threw EBUSY (CI issue
+//      #1 problem 3).
+//   2. The second version slept a fixed 1.5 s hoping the holder had taken the
+//      handle, and never checked. On windows-latest it had not, so the WRITE-phase
+//      case ran against an UNLOCKED file, the edit succeeded, and the failure
+//      surfaced as `expected [EBUSY, EPERM, EACCES] to include 'undefined'` —
+//      pointing at the product while the test's own setup was the problem.
+//      (A local reproduction showed the same thing: with the lock never taken,
+//      both cases pass.)
+// So every phase now WAITS FOR THE HOLDER TO REPORT that the handle is open, and
+// the holder verifies the handle itself (`CreateFileW` returning INVALID_HANDLE_VALUE
+// used to be a silent `sys.exit(1)` that nobody looked at). The verification read
+// happens after the handle is closed: an exclusive handle refuses the check too.
 
 import { spawn } from 'node:child_process';
 import { existsSync, realpathSync, writeFileSync } from 'node:fs';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -54,30 +61,42 @@ afterAll(async () => {
   await rm(workspace, { recursive: true, force: true });
 }, 120_000);
 
-/**
- * Opens the file with dwShareMode = 0 (exclusive).
- *
- * With a trigger path as argv[3] the holder waits for that file to appear before
- * taking the handle, which is how the write-phase case pins the moment the lock
- * starts. Without it the handle is taken immediately.
- */
-const HOLDER_SCRIPT = `
-import os, sys, time
-import ctypes
-path = sys.argv[1]
-seconds = float(sys.argv[2])
+const PYTHON_HOLDER = `
+import ctypes, json, os, sys, time
+from ctypes import wintypes
+
+CreateFileW = ctypes.windll.kernel32.CreateFileW
+CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
+CreateFileW.restype = wintypes.HANDLE
+GENERIC_READ = 0x80000000
+OPEN_EXISTING = 3
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+FILE_ATTRIBUTE_NORMAL = 0x80
+
+path, seconds = sys.argv[1], float(sys.argv[2])
 trigger = sys.argv[3] if len(sys.argv) > 3 else ''
+
 if trigger:
     deadline = time.time() + 30
     while not os.path.exists(trigger):
         if time.time() > deadline:
+            print(json.dumps({"ok": False, "why": "trigger never appeared"}), flush=True)
             sys.exit(2)
         time.sleep(0.01)
-handle = ctypes.windll.kernel32.CreateFileW(path, 0x80000000, 0, None, 3, 0x80, None)
-if handle == -1 or handle == 0xFFFFFFFFFFFFFFFF:
+
+# The argtypes above are load-bearing: without them the 64-bit path pointer is
+# truncated and CreateFileW fails with ERROR_INVALID_NAME, which the old version
+# reported only as a silent sys.exit(1).
+handle = CreateFileW(path, GENERIC_READ, 0, None, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None)
+if handle == INVALID_HANDLE_VALUE or handle is None:
+    print(json.dumps({"ok": False, "why": "CreateFileW failed"}), flush=True)
     sys.exit(1)
-time.sleep(seconds)
-ctypes.windll.kernel32.CloseHandle(handle)
+try:
+    print(json.dumps({"ok": True}), flush=True)
+    time.sleep(seconds)
+finally:
+    ctypes.windll.kernel32.CloseHandle(handle)
 `;
 
 interface Holder {
@@ -85,15 +104,47 @@ interface Holder {
   readonly exited: Promise<number | null>;
 }
 
-function startHolder(target: string, seconds: number, trigger?: string): Holder {
-  const args = ['-c', HOLDER_SCRIPT, target, String(seconds)];
+/**
+ * Starts the exclusive handle and resolves only once it reports that it is HELD.
+ *
+ * Waiting for the report is the whole point: the previous version slept and hoped,
+ * so a holder that failed to take the handle left the case passing against an
+ * unlocked file.
+ */
+async function startHolder(target: string, seconds: number, trigger?: string): Promise<Holder> {
+  const args = ['-c', PYTHON_HOLDER, target, String(seconds)];
   if (trigger !== undefined) {
     args.push(trigger);
   }
-  const child = spawn(VENV_PY, args, { stdio: 'ignore' });
+  const child = spawn(VENV_PY, args, { stdio: ['ignore', 'pipe', 'pipe'] });
   const exited = new Promise<number | null>((resolve) => {
     child.once('exit', (code) => resolve(code));
   });
+  let stdout = '';
+  let stderr = '';
+  child.stdout?.on('data', (chunk: Buffer) => {
+    stdout += chunk.toString('utf8');
+  });
+  child.stderr?.on('data', (chunk: Buffer) => {
+    stderr += chunk.toString('utf8');
+  });
+  const held = await new Promise<boolean>((resolve) => {
+    const deadline = Date.now() + 30_000;
+    const poll = setInterval(() => {
+      if (stdout.includes('"ok": true')) {
+        clearInterval(poll);
+        resolve(true);
+      } else if (stdout.includes('"ok": false') || Date.now() > deadline) {
+        clearInterval(poll);
+        resolve(false);
+      }
+    }, 25);
+  });
+  if (!held) {
+    child.kill();
+    await exited;
+    throw new Error(`the exclusive holder never took the lock: ${stdout.trim()} ${stderr.trim()}`);
+  }
   return { child, exited };
 }
 
@@ -149,7 +200,9 @@ function expectLocked(outcome: Awaited<ReturnType<typeof handleNotebookEdit>>): 
   const body = JSON.parse(String((result.content[0] as { text?: string }).text ?? '{}')) as Record<string, unknown>;
   expect(body['code']).toBe('notebook_locked');
   // The original errno survives in the detail: without it the model cannot tell a
-  // lock apart from a permission problem (CI issue #1 problem 3).
+  // lock apart from a permission problem (CI issue #1 problem 3). NOTE: any code
+  // path that reaches the lock must carry it — the backup copy is one of them, and
+  // it used to build this error inline without the errno.
   const detail = (body['detail'] ?? {}) as Record<string, unknown>;
   expect(['EBUSY', 'EPERM', 'EACCES']).toContain(String(detail['errno']));
   return body;
@@ -164,18 +217,22 @@ describe('[I15] exclusive-open writes raise notebook_locked (Windows)', () => {
     const nb = await writeNotebook('locked-read.ipynb');
     // Snapshot BEFORE the lock exists: reading it afterwards is what broke CI.
     const before = await readFile(nb);
-    const holder = startHolder(nb, 20);
-    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    const beforeStat = await stat(nb);
+    const holder = await startHolder(nb, 20);
     try {
       const outcome = await handleNotebookEdit(toolContext(), {
         path: nb,
         ops: [{ op: 'replace_source', cell_index: 0, expected_text: 'x = 1', new_text: 'x = 2' }],
       });
       expectLocked(outcome);
-      expect(await readFile(nb)).toEqual(before);
     } finally {
       await stopHolder(holder);
     }
+    // "The file did not change" can only be CHECKED once the lock is gone.
+    // Comparing mtime as well means a write that happened to preserve the bytes
+    // would still be visible.
+    expect(await readFile(nb)).toEqual(before);
+    expect((await stat(nb)).mtimeMs).toBe(beforeStat.mtimeMs);
   }, 120_000);
 
   it('WRITE phase: the lock appears after the read succeeded', async (context) => {
@@ -186,7 +243,7 @@ describe('[I15] exclusive-open writes raise notebook_locked (Windows)', () => {
     const nb = await writeNotebook('locked-write.ipynb');
     const before = await readFile(nb);
     const trigger = path.join(workspace, 'take-the-lock');
-    const holder = startHolder(nb, 20, trigger);
+    let holder: Holder | null = null;
     try {
       const outcome = await handleNotebookEdit(
         toolContext(),
@@ -195,25 +252,31 @@ describe('[I15] exclusive-open writes raise notebook_locked (Windows)', () => {
           ops: [{ op: 'replace_source', cell_index: 0, expected_text: 'x = 1', new_text: 'x = 2' }],
         },
         {
-          // Fires after the read/hash check and before the write lands, so the
-          // lock is guaranteed to appear only once "the read succeeded" is
-          // settled. Without this the case could pass because the READ hit the
-          // lock, which is the other case's job.
-          beforeWrite: () => {
+          // Fires after the read/hash check and before the write lands, so the lock
+          // is guaranteed to appear only once "the read succeeded" is settled.
+          // Without this the case could pass because the READ hit the lock, which
+          // is the other case's job.
+          //
+          // It AWAITS the holder's report, which is what makes the lock real
+          // rather than hoped for: the previous version wrote the trigger file and
+          // returned, leaving the write to race the holder's process startup — and
+          // on windows-latest the write won, so the case reported
+          // `expected [EBUSY, EPERM, EACCES] to include 'undefined'` against an
+          // unlocked file.
+          beforeWrite: async () => {
             writeFileSync(trigger, 'now');
-            // Let the holder acquire the handle before the rename runs.
-            const until = Date.now() + 750;
-            while (Date.now() < until) {
-              /* spin: the holder polls for the trigger every 10 ms */
-            }
+            holder = await startHolder(nb, 20, trigger);
           },
         },
       );
       expectLocked(outcome);
-      expect(await readFile(nb)).toEqual(before);
     } finally {
-      await stopHolder(holder);
+      if (holder !== null) {
+        await stopHolder(holder);
+      }
     }
+    // Same rule as the READ phase: verify only after the handle is closed.
+    expect(await readFile(nb)).toEqual(before);
 
     // The same edit succeeds once the lock is gone: the failure was the lock, not
     // a stuck write path.

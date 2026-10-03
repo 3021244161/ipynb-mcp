@@ -88,7 +88,16 @@ export interface WriteOptions {
   readonly now?: () => Date;
   readonly onCleanupError?: (message: string) => void;
   /** Test injection point for corrupt serializers (U10). */
-  readonly serialize?: (notebook: NotebookFile) => string;
+  readonly serialize?: (notebook: NotebookFile) => string | Promise<string>;
+  /**
+   * Byte copier used for the pre-write backup. Injectable for the same reason the
+   * reader is (`ReadFileDeps.readFileImpl`): a held-open notebook makes the BACKUP
+   * COPY fail first on Windows, and that branch used to build its `notebook_locked`
+   * error inline, without the errno — so one lock produced two different errors
+   * depending on which syscall reached it first (CI windows-latest, issue #1
+   * problem 3's second act).
+   */
+  readonly copyFileImpl?: (src: string, dest: string) => Promise<void>;
   /**
    * Cells this write is responsible for. The structural self check only judges
    * these, so content that was already in the user's file (written by another
@@ -205,7 +214,9 @@ async function writeNotebookFileUnlocked(
   }
 
   const serialize = options.serialize ?? serializeNotebook;
-  const serialized = serialize(notebook);
+  // `await` so an async hook (the test seam for "the write is about to land") can
+  // hold the write off until its precondition is really in place.
+  const serialized = await serialize(notebook);
   // Self check before any byte lands on disk (SPEC §5.5.5); throws selfcheck_failed.
   // The scope is the cells this write changed, and content that was already
   // there is reported instead of refused — otherwise one historical quirk
@@ -227,7 +238,7 @@ async function writeNotebookFileUnlocked(
   if (options.createBackup) {
     try {
       const result = await createBackup(absolutePath, options.backupKeep, {
-        copyFile: (src, dest, flags) => copyFile(src, dest, flags),
+        copyFile: options.copyFileImpl ?? ((src, dest, flags) => copyFile(src, dest, flags)),
         readdir: (dir) => readdir(dir),
         unlink: (target) => unlink(target),
         now: options.now ?? (() => new Date()),
@@ -236,15 +247,14 @@ async function writeNotebookFileUnlocked(
       backupPath = result.backupPath;
     } catch (cause) {
       // A held-open notebook blocks the backup copy too (Windows EBUSY etc.):
-      // same lock semantics as the rename path (D12).
-      if (isLockError(cause)) {
-        throw new IpynbError(
-          'notebook_locked',
-          `notebook file is locked by another process: ${absolutePath}`,
-          { path: absolutePath },
-        );
-      }
-      throw cause;
+      // same lock semantics as the read and rename paths (D12). It goes through
+      // `translateLockError` like those two, because this branch used to build the
+      // error inline and therefore dropped `errno` — so one lock produced two
+      // different errors depending on which syscall reached it first, and the
+      // WRITE-phase integration case saw `detail.errno === undefined` while the
+      // READ phase saw 'EPERM' (CI windows-latest, issue #1 problem 3's second act).
+      // `[W1b]` in tests/unit/notebook-file.test.ts fails if this reverts.
+      throw translateLockError(cause, absolutePath);
     }
   }
 

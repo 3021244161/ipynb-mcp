@@ -590,8 +590,17 @@ describe('[I8] idle kernels are reclaimed', () => {
       realpath: (target) => realpathSync(target),
     });
     expect(shortLived.findByNotebook(nb)).not.toBeNull();
-    // Reclamation timer fires at clamp(2/2, 5..60) = 5s; wait past it.
-    await new Promise((resolve) => setTimeout(resolve, 6_500));
+    // Reclamation fires at clamp(2/2, 5..60) = 5s. Waiting a fixed 6.5 s left only
+    // 1.5 s of margin, and the reclamation TIMER is node's, so anything that delays
+    // the event loop (the sibling cases start real kernels and a 9 s [I8] run was
+    // observed) makes the assertion fail without the product being wrong. Poll
+    // until it is gone, with a bound well past the timer, and still assert the
+    // end state — the "it was there to begin with" assertion above is what makes
+    // this unreachable-by-accident.
+    const deadline = Date.now() + 30_000;
+    while (shortLived.findByNotebook(nb) !== null && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
     expect(shortLived.findByNotebook(nb)).toBeNull();
     await shortLived.shutdownAll();
   }, 120_000);

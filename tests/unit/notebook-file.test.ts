@@ -2,6 +2,7 @@
 // §10.2 I15 (a locked notebook must map to notebook_locked, never internal),
 // §4.1.8 (the optimistic-lock recheck), §5.5.5 (self check before writing).
 
+import { realpathSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -87,6 +88,49 @@ describe('[W1] lock errors map to notebook_locked on the READ path too', () => {
         readFileImpl: () => Promise.reject(errorWithCode('ENOENT')),
       }),
     ).rejects.toMatchObject({ code: 'file_not_found' });
+  });
+
+  it('[W1b] the BACKUP COPY path maps a lock errno and keeps it in the detail', async () => {
+    // The third syscall that can meet the lock, and the one CI's windows-latest
+    // job actually hit: the backup copy runs BEFORE the rename, so a held-open
+    // notebook fails there first. That branch built its error inline and dropped
+    // `errno`, so the WRITE-phase integration case reported
+    // `expected [EBUSY, EPERM, EACCES] to include 'undefined'` while the READ
+    // phase reported 'EBUSY' for the same lock. Asserting the detail (not just
+    // the code) is what makes the two paths agree.
+    const target = path.join(dir, 'backup-locked.ipynb');
+    await writeFile(target, NOTEBOOK_JSON);
+    const notebook = await readNotebookFile(target, hasher);
+    // The detail carries the CANONICAL path the writer worked with (Windows' short
+    // 8.3 form of the temp directory differs from what `mkdtemp` returned), so
+    // compare against that rather than the input spelling.
+    const canonical = realpathSync(target);
+    for (const code of ['EBUSY', 'EPERM', 'EACCES']) {
+      await expect(
+        writeNotebookFile(notebook, target, {
+          hasher,
+          backupKeep: 10,
+          createBackup: true,
+          expectedContentHash: notebook.contentHash,
+          platform: 'win32',
+          copyFileImpl: () => Promise.reject(errorWithCode(code)),
+        }),
+      ).rejects.toMatchObject({
+        code: 'notebook_locked',
+        detail: { path: canonical, errno: code },
+      });
+    }
+    // …and a non-lock failure is not relabelled as a lock.
+    await expect(
+      writeNotebookFile(notebook, target, {
+        hasher,
+        backupKeep: 10,
+        createBackup: true,
+        expectedContentHash: notebook.contentHash,
+        platform: 'win32',
+        copyFileImpl: () => Promise.reject(errorWithCode('ENOSPC')),
+      }),
+    ).rejects.toMatchObject({ code: 'ENOSPC' });
   });
 });
 

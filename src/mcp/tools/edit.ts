@@ -47,9 +47,9 @@ export const notebookEditDescription =
  * must fire at a point where "the read succeeded, the write has not happened" is
  * already decided, and serialization is exactly that point.
  */
-function wrapSerializer(hook: () => void): (notebook: NotebookFile) => string {
-  return (notebook) => {
-    hook();
+function wrapSerializer(hook: () => void | Promise<void>): (notebook: NotebookFile) => Promise<string> {
+  return async (notebook) => {
+    await hook();
     return serializeNotebook(notebook);
   };
 }
@@ -66,7 +66,7 @@ export async function handleNotebookEdit(
      * that it exercises the write path rather than the read path — with a real
      * handle there is no other way to pin that moment (CI issue #1 problem 3).
      */
-    beforeWrite?: () => void;
+    beforeWrite?: () => void | Promise<void>;
   },
 ): Promise<ToolOutcome> {
   return runTool(async () => {
