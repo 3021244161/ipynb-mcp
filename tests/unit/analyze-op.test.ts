@@ -13,6 +13,7 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { createLogger } from '../../src/log.js';
+import { SIDECAR_REQUIRED_MODULES } from '../../src/kernel/interpreter.js';
 import { SidecarTransport } from '../../src/kernel/sidecar-transport.js';
 
 // The venv used to live at `<repo>/tests/.venv-test`, i.e. inside the working
@@ -61,6 +62,23 @@ function probeKernelStartup(): Promise<ProbeOutcome> {
     }
     if (!runs(interpreter(), 'import ipykernel')) {
       return { status: 'ipykernelMissing', reason: `${interpreter()} cannot import ipykernel` };
+    }
+    // Both modules the sidecar imports at startup. The candidate chain in
+    // src/kernel/interpreter.ts probes exactly this set (SIDECAR_REQUIRED_MODULES,
+    // D-038) and would refuse a candidate missing either one — the probe has to
+    // use the same source of truth, or the two disagree and the disagreement
+    // looks like a product failure: CI's ubuntu jobs installed ipykernel but not
+    // jupyter_client, this probe said "capable", and the case failed with
+    // "start_kernel is broken ... jupyter_client is not importable" while the
+    // real answer was "this interpreter cannot run the sidecar" (a recorded skip).
+    const missing = SIDECAR_REQUIRED_MODULES.filter(
+      (module) => !runs(interpreter(), `import ${module}`),
+    );
+    if (missing.length > 0) {
+      return {
+        status: 'ipykernelMissing',
+        reason: `${interpreter()} cannot import ${missing.join(', ')}`,
+      };
     }
     if (!runs(interpreter(), 'import zmq; zmq.Context().socket(zmq.PAIR)')) {
       // The interpreter advertises ipykernel but its pyzmq cannot open a
