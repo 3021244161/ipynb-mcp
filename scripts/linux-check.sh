@@ -17,6 +17,22 @@ WORK="${WORK:-/tmp/ipynb-linux-check}"
 export PATH="$NODE_DIR/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 
+# `rm -rf "$WORK"` with an unvalidated, environment-supplied path is a loaded gun:
+# `WORK=/` or `WORK=$HOME` deletes the machine (review v7 V7-13). The guard below
+# refuses anything that is not a dedicated directory under a temp root, so the
+# worst a mistyped variable can do is fail.
+case "$WORK" in
+  /tmp/*|/var/tmp/*|"$HOME"/tmp/*) ;;
+  *)
+    echo "refusing to delete WORK='$WORK': set WORK to a path under /tmp" >&2
+    exit 2
+    ;;
+esac
+if [ "$WORK" = "/tmp" ] || [ "$WORK" = "/var/tmp" ] || [ "$WORK" = "/" ]; then
+  echo "refusing to delete WORK='$WORK'" >&2
+  exit 2
+fi
+
 rm -rf "$WORK"
 mkdir -p "$WORK"
 cd "$REPO_DIR"

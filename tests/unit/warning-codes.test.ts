@@ -13,6 +13,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import type { IpynbConfig } from '../../src/config.js';
 import { PREEXISTING_CONTENT_WARNING, WARNING_CODES } from '../../src/core/errors.js';
+import { PREEXISTING_CONTENT_PREFIX } from '../../src/core/parse.js';
 import { hasher } from '../../src/hash.js';
 import { KernelRegistry } from '../../src/kernel/registry.js';
 import { PathFence } from '../../src/fs/fence.js';
@@ -101,6 +102,12 @@ describe('[WARN-CODE-1] the pre-existing-content warning obeys the closed code s
     const warning = body.warnings?.find((entry) => entry.code === PREEXISTING_CONTENT_WARNING);
     expect(warning, `warnings were ${JSON.stringify(body.warnings)}`).toBeDefined();
     expect(warning!.message).toContain('output_metadata_missing');
+    // The code is BORROWED (§7's `file_changed_externally` means "an external
+    // change was detected"), so the message carries a fixed machine-readable prefix
+    // that says what actually happened. A client that branches on the code alone
+    // would discard CAS state or retry for a file nobody touched (review v7
+    // WARN-CODE-2 / D-041).
+    expect(warning!.message.startsWith(PREEXISTING_CONTENT_PREFIX)).toBe(true);
     // The quirk is carried forward, so the file still fails nbformat — the
     // documented trade-off this warning is the signal for.
     const written = JSON.parse(await readFile(nb, 'utf8')) as { cells: Array<Record<string, unknown>> };

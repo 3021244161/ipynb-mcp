@@ -13,20 +13,22 @@
 
 ## 运行时矩阵（本地实测）
 
-> **计数更新（2026-10-03，第六轮复核整改后）**：数字按**文件**给出，因为它们并不一致 —— 见"已知缺口"。
-> 这一轮的主要变化不是数字，而是**验证能力**：Linux 从"只在 CI 上跑"变成"本机可复现"
-> （`scripts/linux-check.sh`），因为 CI 首次运行的 8 个失败全在非 Windows 上，而 Windows 上一直是绿的。
+> **计数更新（2026-10-04，第七轮复核整改后）**：数字按**文件**给出，因为它们并不一致 —— 见"已知缺口"。
+> 第六轮的主要变化是**验证能力**：Linux 从"只在 CI 上跑"变成"本机可复现"（`scripts/linux-check.sh`），
+> 因为 CI 首次运行的 8 个失败全在非 Windows 上，而 Windows 上一直是绿的。
+> 第七轮补上了另一半：**CI 现在真的装 `nbformat`**（外部权威）并设 `IPYNB_REQUIRE_NBFORMAT=1`，
+> 此前那两条"用外部权威校验产物"的断言被 `if` 挡着，在唯一会自动运行的环境里从未执行。
 
 | 平台 | Node | Python | unit | integration |
 |---|---|---|---|---|
-| Windows 11 x64 | 22.22.2 | 3.10.14（base anaconda：ipykernel 6.25.2 / jupyter_client 8.3.1 / pyzmq 25.1.1） | **251（250 passed + 1 skipped）**，20 文件 | **45/45**，6 文件全绿（`kernel.test.ts` / `run.test.ts` 自动回退到 base 解释器，见下） |
+| Windows 11 x64 | 22.22.2 | 3.10.14（base anaconda：ipykernel 6.25.2 / jupyter_client 8.3.1 / pyzmq 25.1.1） | **286（全绿）**，23 文件 | **46/46**，6 文件全绿（`kernel.test.ts` / `run.test.ts` 自动回退到 base 解释器，见下） |
 | Windows 11 x64 | 22.22.2 | 3.11.11（测试 venv，base conda env 内含 **pyzmq 26.2.0**） | 同上 | **该解释器无法启动 kernel**：sidecar 以 `0xC0000409`（`STATUS_STACK_BUFFER_OVERRUN`）退出，stderr 为 `Bad file descriptor (epoll.cpp:73)` |
-| **WSL Ubuntu 22.04（本机实跑）** | **v22.22.0** | 3.x（无 ipykernel → U20 显式 skip） | **238 passed + 1 skipped**，20 文件 | 未在本机跑（需真实 kernel，见下） |
-| ubuntu-latest | 22 / 24 | 3.10 / 3.12 | CI | CI（`pip install ipykernel jupyter_client`） |
+| **WSL Ubuntu 22.04（本机实跑）** | **v22.22.0** | 3.x（无 ipykernel → U20 显式 skip） | **265 passed + 1 skipped**，23 文件 | 未在本机跑（需真实 kernel，见下） |
+| ubuntu-latest | 22 / 24 | 3.10 / 3.12 | CI | CI（`pip install ipykernel jupyter_client nbformat` + `IPYNB_REQUIRE_NBFORMAT=1`） |
 | windows-latest | 22 / 24 | 3.x | CI | CI |
 | macos-latest | **22 only** | — | CI | **不跑 integration**（见下） |
 
-**其他实测项**：`pnpm lint` 0 警（63 文件 / 99 规则 + `scripts/check-format.mjs` + `scripts/check-indent.mjs`）；
+**其他实测项**：`pnpm lint` 0 警（65 文件 / 99 规则 + `scripts/check-format.mjs` + `scripts/check-indent.mjs`）；
 `pnpm smoke` **19/19**；`npm pack --dry-run` 133 项，含 `lib/bin.js`（shebang ✓）与 `python/ipynb_sidecar.py`；
 `git ls-files --eol` 全树 LF（0 CRLF / 0 mixed）。
 

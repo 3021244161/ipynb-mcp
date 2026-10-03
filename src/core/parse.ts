@@ -227,8 +227,17 @@ export function structuralWarning(problem: Record<string, JsonValue>): string {
   // function knows nothing about — and it is emitted before the write lands, so a
   // later `notebook_locked` left a log line asserting success (review v6
   // WARN-CODE-1 附带).
-  return `notebook already contained nbformat content this tool would not write (${rule}${cell}); it was preserved rather than rewritten`;
+  //
+  // The message starts with a FIXED, machine-readable prefix because the warning
+  // code is borrowed: §7's `file_changed_externally` means "an external change was
+  // detected", which is not what happened here — the content was always like this.
+  // A client that branches on the code would otherwise discard CAS state or retry
+  // for a file nobody touched (review v7 WARN-CODE-2 / D-041).
+  return `pre-existing-content: notebook already contained nbformat content this tool would not write (${rule}${cell}); it was preserved rather than rewritten`;
 }
+
+/** The fixed prefix {@link structuralWarning} puts on its message (D-041). */
+export const PREEXISTING_CONTENT_PREFIX = 'pre-existing-content: ';
 
 function requireParsed(serialized: string, hasher: Hasher): NotebookFile {
   try {
@@ -448,14 +457,21 @@ function dataProblem(
   return null;
 }
 
-/** `application/json` and `application/<subtype>+json` carry arbitrary values. */
-const JSON_MIME = /^application\/(?:[^/]+\+)?json$/;
-
 /**
- * Whether a mime KEY may hold an arbitrary JSON value. The execution path needs
- * this to decide what it can store at all, using the same rule the write gate
- * enforces — one definition, so the two cannot disagree (review v6 GATE-5).
+ * Whether a mime KEY may hold an arbitrary JSON value.
+ *
+ * The pattern is nbformat's OWN `patternProperties` key, verbatim:
+ * `^application/(.*\+)?json$`. Writing it as `(?:[^/]+\+)?json` looked equivalent
+ * and was not — it required a non-empty subtype without a slash, so
+ * `application/x/y+json` and `application/+json`, both of which nbformat accepts,
+ * were rejected and their values dropped or refused (review v7 V7-10, the mirror
+ * image of GATE-6: too strict, so legal data is lost).
+ *
+ * The execution path needs the same rule the write gate enforces — one definition,
+ * so the two cannot disagree (review v6 GATE-5).
  */
+const JSON_MIME = /^application\/(.*\+)?json$/;
+
 export function isJsonMime(mime: string): boolean {
   return JSON_MIME.test(mime);
 }

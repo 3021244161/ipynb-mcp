@@ -6,11 +6,11 @@
 // the "no Python required" guarantee for unit tests.
 
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, rmSync } from 'node:fs';
+import { existsSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import { beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { createLogger } from '../../src/log.js';
 import { SIDECAR_REQUIRED_MODULES } from '../../src/kernel/interpreter.js';
@@ -137,13 +137,45 @@ function runs(candidate: string, snippet: string): boolean {
  * just created; the second run found that venv and probed IT), and leaving an
  * unusable one behind is what makes the failure survive into later runs.
  */
+/**
+ * Deletes the venv only when this test owns it.
+ *
+ * `VENV_DIR` comes from `IPYNB_TEST_VENV`, so pointing that at a real environment —
+ * a plausible thing to do, since the variable exists precisely to reuse one — made
+ * `rmSync(VENV_DIR, { recursive: true })` delete the user's virtualenv
+ * (review v7 V7-14). Ownership is recorded in a marker file this test writes when
+ * it creates the venv, and both delete sites go through here.
+ */
+const VENV_MARKER = '.ipynb-mcp-test-venv';
+
+function removeOwnedVenv(): void {
+  if (!existsSync(path.join(VENV_DIR, VENV_MARKER))) {
+    // Not ours: leave it, and say so, because the caller is about to fall back to
+    // the base interpreter and that decision should be explicable.
+    process.stderr.write(
+      `[analyze-op] ${VENV_DIR} exists but was not created by this test; leaving it alone\n`,
+    );
+    return;
+  }
+  rmSync(VENV_DIR, { recursive: true, force: true });
+}
+
+/**
+ * Decide the venv BEFORE anything reads `interpreter()`.
+ *
+ * A venv is created only when the base interpreter can serve it, and an existing
+ * venv that cannot run the sidecar is removed rather than preferred. Both halves
+ * matter: creating it lazily is what made CI pass once and fail once on the same
+ * code, and leaving an unusable one behind is what makes the failure survive into
+ * later runs.
+ */
 function prepareTestVenv(): void {
   if (!PYTHON_AVAILABLE) {
     return;
   }
   if (existsSync(VENV_PY)) {
     if (!canRunSidecar(VENV_PY)) {
-      rmSync(VENV_DIR, { recursive: true, force: true });
+      removeOwnedVenv();
     }
     return;
   }
@@ -156,15 +188,27 @@ function prepareTestVenv(): void {
       stdio: 'ignore',
       timeout: 120_000,
     });
+    // Ownership marker, written first so a failed capability check can still clean
+    // up what it just made.
+    writeFileSync(path.join(VENV_DIR, VENV_MARKER), 'created by tests/unit/analyze-op.test.ts\n');
   } catch {
     // A venv is an optimisation here, not a requirement: the base interpreter
     // already passed the capability check, so fall back to it.
     return;
   }
   if (!canRunSidecar(VENV_PY)) {
-    rmSync(VENV_DIR, { recursive: true, force: true });
+    removeOwnedVenv();
   }
 }
+
+/**
+ * The venv is removed at the END too, so a suite run does not leave it for the next
+ * one — leaving it behind is how one CI run's leftover changed what the next run
+ * measured. Only a venv this test created is touched.
+ */
+afterAll(() => {
+  removeOwnedVenv();
+});
 
 beforeAll(() => {
   prepareTestVenv();

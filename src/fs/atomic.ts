@@ -207,6 +207,14 @@ export function isLockError(cause: unknown): boolean {
 }
 
 /** The errno behind a lock error, for the `notebook_locked` detail. */
+/**
+ * The raw `errno` behind a filesystem failure, or null.
+ *
+ * Lives here because this module owns the errno-to-code mapping. It used to exist
+ * twice, as `lockErrno` and as `errnoCode` in `notebook-file.ts`, differing only in
+ * null vs undefined — the same drift surface that QUAL-2 had just removed from
+ * `isAbortCause` (review v7 V7-11).
+ */
 export function lockErrno(cause: unknown): string | null {
   if (cause instanceof Error && 'code' in cause) {
     const code = (cause as NodeJS.ErrnoException).code;

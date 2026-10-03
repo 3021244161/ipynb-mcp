@@ -18,7 +18,7 @@ import {
   type NotebookFile,
 } from '../core/parse.js';
 import { normalizeForCompare } from '../config.js';
-import { atomicWriteFile, isLockError } from './atomic.js';
+import { atomicWriteFile, isLockError, lockErrno } from './atomic.js';
 import { createBackup } from './backup.js';
 
 export interface ReadFileDeps {
@@ -41,7 +41,7 @@ export async function readNotebookFile(
   try {
     bytes = await readBytes(absolutePath);
   } catch (cause) {
-    if (errnoCode(cause) === 'ENOENT') {
+    if (lockErrno(cause) === 'ENOENT') {
       throw new IpynbError('file_not_found', `notebook file not found: ${absolutePath}`, {
         path: absolutePath,
       });
@@ -57,7 +57,7 @@ export async function readNotebookFile(
 
 function translateLockError(cause: unknown, absolutePath: string): unknown {
   if (isLockError(cause)) {
-    const errno = errnoCode(cause);
+    const errno = lockErrno(cause);
     return new IpynbError('notebook_locked', `notebook file is locked by another process: ${absolutePath}`, {
       path: absolutePath,
       // The raw errno travels with the code: the model (and the user) can then
@@ -197,7 +197,7 @@ async function writeNotebookFileUnlocked(
   try {
     currentBytes = await readFile(absolutePath);
   } catch (cause) {
-    if (errnoCode(cause) === 'ENOENT') {
+    if (lockErrno(cause) === 'ENOENT') {
       throw new IpynbError('file_not_found', `notebook file not found: ${absolutePath}`, {
         path: absolutePath,
       });
@@ -267,9 +267,4 @@ async function writeNotebookFileUnlocked(
   return { backupPath, contentHashAfter, serialized };
 }
 
-function errnoCode(cause: unknown): string | undefined {
-  if (cause instanceof Error && 'code' in cause) {
-    return (cause as NodeJS.ErrnoException).code;
-  }
-  return undefined;
-}
+
