@@ -14,9 +14,9 @@
 > 第五轮则出现**漏列**（18 条只列 8 条）。**因此未做或未验证的条目一律 ⬜ / ⚠️ 并写明原因。**
 >
 > **门禁实测（第六轮整改后）**：`pnpm typecheck` 0 错 / `pnpm lint` 0 警（oxlint + `check-format` + `check-indent`）/
-> 单测 **251（250 passed + 1 skipped）** / 集成 **45/45**（6 文件）/ `pnpm smoke` **19/19** /
-> `pnpm pack --dry-run` 133 文件 / 全树 LF / **Linux（WSL Ubuntu + Node 22）单测 239（238 passed + 1 skipped）**。
-> 唯一 skip 是 U20，原因是本机/WSL 的 python3 都无法导入 ipykernel（用例记录了原因，并区分"环境不足"与 `start_kernel` 回归）。
+> 单测 **252（全绿）** / 集成 **46/46**（6 文件）/ `pnpm smoke` **19/19** /
+> `pnpm pack --dry-run` 133 文件 / 全树 LF / **Linux（WSL Ubuntu + Node 22）单测全绿** /
+> **CI 全绿**（run `37136146902`，9 个 job：unit ×7 + integration ×4 中的 9 项；本机无 Python 的 job 按设计跳过 U20 并记录原因）。
 > 集成用到的解释器与三平台默认根见 `COMPATIBILITY.md`。
 ---
 

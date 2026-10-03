@@ -37,10 +37,14 @@
 - **测试 venv 现在位于系统临时目录**（`%TEMP%\ipynb-mcp-test-venv` / `$TMPDIR/ipynb-mcp-test-venv`，可用 `IPYNB_TEST_VENV` 覆盖）。它此前建在 `tests/.venv-test`，即**工作树内部**：跑一次测试就在仓库里留下一个虚拟环境（v5 TST-5）。仓库里那份已删除；`.gitignore` 仍保留 `tests/.venv*/` 以防旧检出残留。
 - **该 venv 继承的 pyzmq 26.2.0 无法启动 kernel。** 现象：sidecar 一收到 `start_kernel` 就以 `0xC0000409` 退出，Python 侧打印 `Bad file descriptor (zmq …/epoll.cpp:73)`；同一台机器上 pyzmq 25.1.1 的 base anaconda 解释器一切正常。这是**解释器环境**问题，不是 ipynb-mcp 的代码问题（`ping`、`analyze` 正常，`run/server/stale/locked-file` 四个集成文件全绿）。
   **处理方式**：把 `IPYNB_TEST_PYTHON` 指向 base anaconda 解释器即可让集成套件全绿；`tests/integration/kernel.test.ts` 与 `run.test.ts` 里直接用 transport 的用例，现在会在 `beforeAll` 里**真正起一次 kernel**做候选探测——venv 能起就用 venv，起不来就回退到 base 解释器（`kernel.test.ts` 会在 stderr 记录一行说明；走 `runNotebook` 的用例本就用 SPEC §5.2 候选链，不受影响）。因此集成套件在两种环境下都全绿，"环境坏了"不会被误读成"代码坏了"。真正的修复（给测试 venv 一个能用的 pyzmq）属环境操作，未执行。
-- **`analyze-op.test.ts` 的 U20 用例在无 kernel 能力的环境下显式 skip**（记录原因：无解释器 / 无 ipykernel / pyzmq 起不了 socket），因此单测在无 Python / 无 ipykernel 的机器上仍然全绿（AGENTS §3 要求）；而"解释器自称能起 kernel 却起不来"（`start_kernel` 回归）会**失败**而不是 skip（TST-5，已用变异验证）。
+- **`analyze-op.test.ts` 的 U20 用例在无 kernel 能力的环境下显式 skip**（记录原因：无解释器 / 缺 `SIDECAR_REQUIRED_MODULES` 中的模块 / pyzmq 起不了 socket），因此单测在无 Python / 无 ipykernel 的机器上仍然全绿（AGENTS §3 要求）；而"解释器自称能起 kernel 却起不来"（`start_kernel` 回归）会**失败**而不是 skip（TST-5，已用变异验证）。
+  **该文件现在只有一个解释器决策**：`beforeAll` 里的 `prepareTestVenv()` 先验证既有 venv 能否运行 sidecar，不能就删除；只在基础解释器能服务时才新建 venv 并再次验证；否则直接用基础解释器。此前"探针问的是 `interpreter()`、用例却自己建 venv"导致同一个 commit 在 CI 上先过后败（run `37134640458`）—— 留下的 venv 让第二次运行的探针看到了另一个解释器。
 - **macOS 仅通过 unit 层验证**（SPEC §9 CI 矩阵的既定决策：macOS 不跑 integration；其 kernel 生命周期语义与 Linux 一致，unit 层覆盖其平台特有分支——路径规范化、缓存目录、`.venv/bin/python`）。
 - 集成测试在 vitest 下**按文件串行**（`fileParallelism: false`）：真实 kernel 的时序敏感用例（I16）在并行文件下不稳定，串行是准确性优先的取舍。
-- **CI 已真跑**（2026-10-03，run `37130350485`）：10 个 job 里 8 个失败，全部在非 Windows 上。四类根因分别是平台假设写死在用例里（含一处**实现**按宿主规则判绝对路径）、探针与 sidecar 的真实依赖不一致、`I15` 用例自身的相位错误、以及 unhandled rejection。逐条修复见 `CHANGELOG.md` 与 `review-fix-status.md`，本机 Linux 复现由 `scripts/linux-check.sh` 承担。CI 上设 `IPYNB_TEST_REQUIRE_VENV=1`：解释器回退会直接失败，避免环境问题被"更绿"的表象掩盖（TST-1）。
+- **CI 全绿**（2026-10-03，run `37136146902`）。首次运行（`37130350485`）10 个 job 里 8 个失败，全部在非 Windows 上；
+  四类根因（平台假设写死在用例里、探针与 sidecar 真实依赖不一致、`I15`/`U20` 两个用例的自身相位与解释器选择问题）逐条修复，
+  过程见 `CHANGELOG.md` 与本文件上方矩阵。**本机 Linux 复现由 `scripts/linux-check.sh` 承担** —— 这些失败在 Windows 上全都看不到。
+  CI 上设 `IPYNB_TEST_REQUIRE_VENV=1`：解释器回退会直接失败，避免环境问题被"更绿"的表象掩盖（TST-1）。
 - **`pnpm test` 的并行度保持 vitest 默认值**：`analyze-op.test.ts` 建的是**临时目录**里的 venv，六个用临时目录的文件互不共享状态，串行只会让单测慢一倍（v5 TST-5 的另一半，裁定为"不需要改"）。集成套件相反，仍按文件串行。
 
 

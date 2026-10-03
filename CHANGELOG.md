@@ -28,12 +28,18 @@
 - **版本号双真源**（DEP-2）：`server.ts` 从 `package.json` 读版本，单测与 `pnpm smoke` 各断言一次。
 - `isAbortCause` 的两份同构实现（QUAL-2）合并到 `core/errors.ts`；传输层注释与 sidecar 的具名常量对齐（FID-6）；stderr 尾巴只在 transport 真的失联时附带（NEW-6）。
 - **Linux 可本地复现**：`scripts/linux-check.sh` 把 tracked 文件复制到 WSL 的 Linux 文件系统、按 lockfile 安装并跑 typecheck/lint/单测。CI 的失败全在非 Windows 上，而在 Windows 上"全绿"正是这些问题的成因。
+- **`I15` 的两条用例在 windows-latest 上失败**，原因都在用例自身：READ 相位用一次 `readFile` 去验证"文件没变"，而那次读本身会被独占句柄拒绝（EBUSY），断言永远跑不到；WRITE 相位写完触发文件后 `sleep 750ms` 就假定持有者已经拿到句柄，在 runner 上并没有，于是编辑**成功**、用例报出 `expected [...] to include 'undefined'` 这种看起来像产品缺陷的失败。现在持有者通过 stdout 确认句柄已打开、钩子 **await** 该确认（钩子与序列化缝都是异步的），验证读也移到句柄关闭之后。
+- **`notebook_locked` 的 `errno` 在备份拷贝这条路径上丢失**：Windows 上被独占打开的文件会先让**备份拷贝**失败，而该分支自己内联构造错误、没带 `errno`，于是同一把锁在"读路径"报 `EPERM`、在"备份路径"什么都不报。现在三条路径统一走 `translateLockError`；新增 `copyFileImpl` 注入点，用例 `[W1b]` 断言 `detail.errno`（已做变异验证）。
+- **`U20` 的解释器选择有两个来源**：探针问 `interpreter()`（有 venv 就优先 venv），用例却在自己建 venv 后用它运行——于是同一个 commit 在 CI 上先过后败，差别只是上一次留下的 venv 无法导入 `jupyter_client`。现在只有一个决策（`prepareTestVenv()`）：不能运行 sidecar 的 venv 会被删除，只在基础解释器能服务时才新建并再次验证。
+- `[I8]` 用固定 6.5 s 等一个 5 s 的回收定时器，事件循环稍有延迟就会失败（实测该用例耗时 9.6 s）；改为在 30 s 上限内轮询到回收完成，仍断言终态。
 
 ### Tests
 
-- 新增 `tests/unit/interpreter.test.ts`（探针与 sidecar 依赖一致，含源码解析的漂移守卫）、`run-store.test.ts`（终态单写者）、`server-version.test.ts`、`warning-codes.test.ts`（码在闭集内 + 编辑路径返回）、`[GATE-5][CRASH-1]` ×3、`[I15]` 读/写相位两条、`[GATE-1]` 的重排用例。
-- `pnpm smoke` 11 → **19** 项（新增版本一致性断言）。
-- 本轮所有守卫都做了变异验证：GATE-1（去掉 scope → 变红）、`[NEW-3][FRAME-1]`（换成行为等价的二次实现 → 36 s，变红）、探针（清单退回只有 ipykernel → 3 条变红）、I15（Windows 集成实跑）。
+- 新增 `tests/unit/interpreter.test.ts`（探针与 sidecar 依赖一致，含源码解析的漂移守卫）、`run-store.test.ts`（终态单写者）、`server-version.test.ts`、`warning-codes.test.ts`（码在闭集内 + 编辑路径返回）、`[GATE-5][CRASH-1]` ×3、`[I15]` 读/写相位两条、`[W1b]`（备份路径的 `errno`）、`[TST-2]`（整次 run 真的取到 run 级锁）、`[GATE-1]` 的重排用例。
+- `pnpm smoke` 11 → **19** 项（新增版本一致性断言）；`[I18b]` 扩到三 cell（未执行的那个必须保留种子输出与 `execution_count`）。
+- 本轮所有守卫都做了变异验证：GATE-1（去掉 scope → 变红）、`[NEW-3][FRAME-1]`（换成行为等价的二次实现 → 36 s，变红）、探针（清单退回只有 ipykernel → 3 条变红）、`[W1b]`（恢复内联错误 → 变红）、`[TST-2]`（去掉 `acquireRun` 调用 → 变红）、I15（Windows 集成实跑）。
+- **测试 venv 移出仓库**：此前建在 `tests/.venv-test`（跑一次测试就在工作树里留一个虚拟环境），现在位于系统临时目录并可用 `IPYNB_TEST_VENV` 覆盖。
+- **CI 全绿**：run `37136146902`，9 个 job 全部通过（首次运行是 10 个里 8 个失败）。
 
 ### Deviations
 
