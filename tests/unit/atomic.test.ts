@@ -56,6 +56,13 @@ describe('[step2] atomicWriteFile', () => {
         stat: async () => null,
       readdir: async () => [],
       now: () => new Date(),
+        // The retry window exists for a TRANSIENT sharing violation, and it costs
+        // 750 ms of real sleeping per code. Injecting a no-op keeps this case about
+        // what it tests (the errno mapping) instead of about the clock: with real
+        // sleeps it took 2.3 s alone and over 5 s under a loaded parallel run, so it
+        // failed on Linux CI-style runs and passed on a quiet machine. The retry
+        // timing itself is asserted separately, in the case that is about it.
+        sleep: async () => undefined,
       };
       const target = path.join(dir, `locked-${code}.ipynb`);
       await expect(atomicWriteFile(target, 'x', { deps })).rejects.toMatchObject({
