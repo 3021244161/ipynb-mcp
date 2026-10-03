@@ -189,7 +189,8 @@ describe('[A5][W4] the image budget is call-wide, not per cell', () => {
   });
 });
 
-describe('[step9] read projection details', () => {  it('respects cell_indexes filtering and include_source=none', async () => {
+describe('[step9] read projection details', () => {
+  it('respects cell_indexes filtering and include_source=none', async () => {
     const json = JSON.stringify({
       nbformat: 4,
       nbformat_minor: 5,

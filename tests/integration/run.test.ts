@@ -454,9 +454,21 @@ describe('[I7] sidecar death fails in-flight work; next run replays', () => {
       storeOutputs: true,
       timeoutMs: 120_000,
     });
+    // Attach the rejection handler BEFORE killing the sidecar. `expect(promise)
+    // .rejects` is attached afterwards, and in the gap between the kill and that
+    // attachment the rejection is unobserved: Node reports it as an unhandled
+    // rejection and vitest surfaces it as "an error happened outside a test",
+    // which is what CI flagged next to this case (review v5 TST-CI). Settling it
+    // here keeps the promise observed from the moment it can reject.
+    const settled = inflight.then(
+      (value) => ({ ok: true as const, value }),
+      (cause: unknown) => ({ ok: false as const, cause }),
+    );
     await new Promise((resolve) => setTimeout(resolve, 500));
     await transport.kill();
-    await expect(inflight).rejects.toMatchObject({ code: 'kernel_died' });
+    const outcome = await settled;
+    expect(outcome.ok).toBe(false);
+    expect(outcome.ok ? { code: null } : outcome.cause).toMatchObject({ code: 'kernel_died' });
     expect(transport.alive).toBe(false);
   }, 120_000);
 
@@ -722,7 +734,8 @@ describe('[R3] a kernel that dies mid-run still writes back the completed cells'
   }, 180_000);
 });
 
-describe('[W3] a failed write-back never replaces the primary error code', () => {  it('still reports exec_timeout when the notebook changed under the run', async () => {
+describe('[W3] a failed write-back never replaces the primary error code', () => {
+  it('still reports exec_timeout when the notebook changed under the run', async () => {
     const nb = await writeNb('w3-timeout.ipynb', [
       codeCell('print("done")', 'c0'),
       // Ignores SIGINT so the run ends in the timeout path (not a cancel).

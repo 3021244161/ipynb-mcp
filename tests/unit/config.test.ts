@@ -1,3 +1,5 @@
+import path from 'node:path';
+
 import { describe, expect, it } from 'vitest';
 import {
   defaultArtifactDir,
@@ -28,26 +30,79 @@ function makeFsDeps(overrides?: Partial<StartupFsDeps> & { existingPaths?: reado
 }
 
 describe('[step1] parseConfig defaults', () => {
-  it('applies all documented defaults (SPEC §5.1)', () => {
-    const result = parseConfig([], BASE_ENV, { fallbackRoot: 'C:/work', platform: 'win32' });
-    expect(result.errors).toEqual([]);
-    expect(result.config).toBeDefined();
-    const c = result.config!;
-    expect(c.root).toBe('C:/work');
-    expect(c.allowOutsideRoot).toBe(false);
-    expect(c.readOnly).toBe(false);
-    expect(c.images).toBe('auto');
-    expect(c.python).toBeNull();
-    expect(c.kernelIdleSeconds).toBe(3600);
-    expect(c.execTimeoutSeconds).toBe(300);
-    expect(c.backgroundThresholdSeconds).toBe(30);
-    expect(c.backupKeep).toBe(10);
-    expect(c.artifactDir).toBe('C:/Users/test/AppData/Local/ipynb-mcp/artifacts');
-    expect(c.inlineTextChars).toBe(20000);
-    expect(c.previewLines).toBe(12);
-    expect(c.maxImagesPerCall).toBe(20);
-    expect(c.maxImageBytes).toBe(20971520);
-    expect(c.logLevel).toBe('info');
+  // The artifact default is platform-specific (SPEC §5.9), so the expectation has
+  // to be too. Asserting the Windows value on every host is exactly what made
+  // `unit` fail on ubuntu/macos the first time CI ran (issue #1 problem 1a):
+  // `path.resolve('C:/…')` on Linux prepends the cwd, so the test compared a
+  // mangled path against a Windows literal. Both halves are fixed: the parser no
+  // longer mangles an already-absolute value, and this table pins all three
+  // platform defaults.
+  const PLATFORM_CASES = [
+    {
+      platform: 'win32' as NodeJS.Platform,
+      env: { LOCALAPPDATA: 'C:/Users/test/AppData/Local', HOME: 'C:/Users/test' },
+      root: 'C:/work',
+      artifactDir: 'C:/Users/test/AppData/Local/ipynb-mcp/artifacts',
+    },
+    {
+      platform: 'darwin' as NodeJS.Platform,
+      env: { HOME: '/Users/test' },
+      root: '/Users/test/work',
+      artifactDir: '/Users/test/Library/Caches/ipynb-mcp/artifacts',
+    },
+    {
+      platform: 'linux' as NodeJS.Platform,
+      env: { HOME: '/home/test', XDG_CACHE_HOME: '/home/test/.cache' },
+      root: '/home/test/work',
+      artifactDir: '/home/test/.cache/ipynb-mcp/artifacts',
+    },
+  ];
+
+  for (const testCase of PLATFORM_CASES) {
+    it(`applies the documented defaults on ${testCase.platform} (SPEC §5.1/§5.9)`, () => {
+      const result = parseConfig([], testCase.env, {
+        fallbackRoot: testCase.root,
+        platform: testCase.platform,
+      });
+      expect(result.errors).toEqual([]);
+      expect(result.config).toBeDefined();
+      const c = result.config!;
+      expect(c.root).toBe(testCase.root);
+      expect(c.allowOutsideRoot).toBe(false);
+      expect(c.readOnly).toBe(false);
+      expect(c.images).toBe('auto');
+      expect(c.python).toBeNull();
+      expect(c.kernelIdleSeconds).toBe(3600);
+      expect(c.execTimeoutSeconds).toBe(300);
+      expect(c.backgroundThresholdSeconds).toBe(30);
+      expect(c.backupKeep).toBe(10);
+      // Absolute in, absolute out — never resolved against the host's cwd.
+      expect(c.artifactDir).toBe(testCase.artifactDir);
+      expect(c.inlineTextChars).toBe(20000);
+      expect(c.previewLines).toBe(12);
+      expect(c.maxImagesPerCall).toBe(20);
+      expect(c.maxImageBytes).toBe(20971520);
+      expect(c.logLevel).toBe('info');
+    });
+  }
+
+  it('leaves an absolute --artifact-dir exactly as given on a foreign platform', () => {
+    // The host decides nothing here: a Win32-style absolute path stays absolute
+    // even when the parser is told the platform is linux (and vice versa). This
+    // is the regression that CI caught, isolated to one assertion.
+    const windowsValue = parseConfig(['--artifact-dir', 'D:/cache/artifacts'], {}, { platform: 'linux' });
+    expect(windowsValue.errors).toEqual([]);
+    expect(windowsValue.config!.artifactDir).toBe('D:/cache/artifacts');
+
+    const posixValue = parseConfig(['--artifact-dir', '/var/cache/artifacts'], {}, { platform: 'win32' });
+    expect(posixValue.errors).toEqual([]);
+    expect(posixValue.config!.artifactDir).toBe('/var/cache/artifacts');
+
+    // …while a genuinely relative value is still resolved against the cwd, which
+    // is what SPEC §4.1.3 requires of the returned artifact_path.
+    const relative = parseConfig(['--artifact-dir', 'artifacts'], {}, { platform: 'linux' });
+    expect(relative.errors).toEqual([]);
+    expect(path.isAbsolute(relative.config!.artifactDir)).toBe(true);
   });
 
   it('resolves the linux artifact dir from XDG_CACHE_HOME', () => {

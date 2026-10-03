@@ -70,8 +70,10 @@ export async function handleRunCancel(
       // the completed cells back under this same terminal state.
       handle.abortReason = 'cancelled';
       handle.abortController.abort();
-      handle.state = 'cancelled';
-      handle.error = { code: 'cancelled', message: 'run cancelled by the client' };
+      // The first writer wins: the background task may already have settled the
+      // run, and a cancel must not overwrite a terminal state any more than the
+      // reverse (review v5 NEW5-REPRO).
+      ctx.runStore.settle(handle.runId, 'cancelled', { code: 'cancelled', message: 'run cancelled by the client' });
       try {
         await ctx.registry.interrupt(handle.notebookPath);
       } catch (cause) {

@@ -47,7 +47,9 @@ describe('[W1] lock errors map to notebook_locked on the READ path too', () => {
       const mapped = translateLockError(errorWithCode(code), 'C:/work/nb.ipynb');
       expect(mapped).toBeInstanceOf(IpynbError);
       expect((mapped as IpynbError).code).toBe('notebook_locked');
-      expect((mapped as IpynbError).detail).toEqual({ path: 'C:/work/nb.ipynb' });
+      // The raw errno travels with the code so the caller can tell a sharing
+      // violation from a permission problem (CI issue #1 problem 3).
+      expect((mapped as IpynbError).detail).toEqual({ path: 'C:/work/nb.ipynb', errno: code });
     }
     // ENOENT has its own code (file_not_found) and is handled by the caller;
     // anything else must stay untouched so it is not mislabelled.

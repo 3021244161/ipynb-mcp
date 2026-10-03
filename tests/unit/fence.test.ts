@@ -48,7 +48,19 @@ describe('[step2][U11] PathFence enforcement', () => {
     expectOutsideRoot(() => fence.assertInside('..\\outside\\nb.ipynb'));
   });
 
-  it('rejects paths on another drive (win32)', () => {
+  it('rejects paths on another drive (win32 only)', () => {
+    // "Another drive" is Windows-only semantics: on POSIX `D:/other/nb.ipynb` is
+    // a RELATIVE path, so the fence resolves it under the root and correctly
+    // allows it. Asserting the Windows outcome on every host demanded something
+    // that cannot happen there (CI issue #1 problem 1b).
+    if (process.platform !== 'win32') {
+      // The reason is checked rather than assumed, so this is not a silent
+      // "we did not look": a drive letter is just a directory name here.
+      expect(path.isAbsolute('D:/other/nb.ipynb')).toBe(false);
+      const fence = new PathFence(root, false, process.platform);
+      expect(fence.assertInside('D:/other/nb.ipynb')).toContain('D:');
+      return;
+    }
     const fence = new PathFence('C:/work/root', false, 'win32');
     expectOutsideRoot(() => fence.assertInside('D:/other/nb.ipynb'));
   });
@@ -68,10 +80,33 @@ describe('[step2][U11] PathFence enforcement', () => {
   });
 
   it('folds case on win32/darwin but not on linux', () => {
-    const win = new PathFence('C:/Work/Root', false, 'win32');
-    expect(win.assertInside('c:/work/root/nb.ipynb')).toBe('C:/work/root/nb.ipynb'.replace('C:', 'c:').replace('c:', 'c:'));
-    const linux = new PathFence('/work/Root', false, 'linux');
-    expectOutsideRoot(() => linux.assertInside('/work/root/nb.ipynb'));
+    // Each platform gets its OWN expectation, which the title always claimed and
+    // the body never did: the win32 branch was the only one asserted, and on
+    // Linux the Windows spelling was mangled by the host's path handling
+    // (CI issue #1 problem 1c).
+    //
+    // The assertion is on the FOLDING RULE (the normalized comparison), not on
+    // the returned path's spelling, because the returned path is the caller's
+    // spelling resolved — that part is host-independent and covered above.
+    const folding = (platformRoot: string, candidate: string, platform: NodeJS.Platform): boolean => {
+      const fence = new PathFence(platformRoot, false, platform);
+      try {
+        fence.assertInside(candidate);
+        return true;
+      } catch (cause) {
+        if (cause instanceof IpynbError && cause.code === 'path_outside_root') {
+          return false;
+        }
+        throw cause;
+      }
+    };
+
+    expect(folding('C:/Work/Root', 'c:/work/root/nb.ipynb', 'win32')).toBe(true);
+    expect(folding('/Work/Root', '/work/root/nb.ipynb', 'darwin')).toBe(true);
+    // Linux is case-sensitive: the same spelling difference stays a different
+    // path, which is the property the title promised to check.
+    expect(folding('/work/Root', '/work/root/nb.ipynb', 'linux')).toBe(false);
+    expect(folding('/work/root', '/work/root/nb.ipynb', 'linux')).toBe(true);
   });
 
   it('accepts a non-existent path inside the root (file_not_found is a later concern)', () => {

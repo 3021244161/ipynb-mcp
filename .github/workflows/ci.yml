@@ -13,7 +13,14 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+        # macOS runners bill at 10x on GitHub Actions, so it carries only the
+        # LTS the package declares. SPEC §9 already layers macOS out of the
+        # integration job for the same reason (issue #1 problem 4); if a macOS
+        # refactor ever appears, this is where to look first.
         node: [22, 24]
+        exclude:
+          - os: macos-latest
+            node: 24
     steps:
       - uses: actions/checkout@v4
       # No `version:` input on purpose: package.json declares
@@ -56,7 +63,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: pip install ipykernel
+      # BOTH modules, explicitly. `pip install ipykernel` used to be assumed to
+      # bring jupyter_client along; it does not always, and the sidecar imports
+      # jupyter_client at startup, so the interpreter the tests picked looked
+      # "capable" to a probe that only checked ipykernel and then failed inside
+      # the sidecar (CI issue #1 problem 2). The list mirrors
+      # SIDECAR_REQUIRED_MODULES in src/kernel/interpreter.ts.
+      - run: pip install ipykernel jupyter_client
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm build

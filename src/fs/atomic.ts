@@ -140,7 +140,11 @@ export async function atomicWriteFile(
         throw new IpynbError(
           'notebook_locked',
           `notebook file is locked by another process: ${absolutePath}`,
-          { path: absolutePath },
+          // The raw errno is part of the contract: `notebook_locked` covers
+          // EBUSY/EPERM/EACCES, which mean different things to a user, and the
+          // Windows integration case asserts it saw a lock rather than a
+          // generic failure (CI issue #1 problem 3).
+          { path: absolutePath, errno: lockErrno(cause) },
         );
       }
       throw cause;
@@ -200,6 +204,15 @@ export function isLockError(cause: unknown): boolean {
         (cause as NodeJS.ErrnoException).code === 'EPERM' ||
         (cause as NodeJS.ErrnoException).code === 'EACCES'))
   );
+}
+
+/** The errno behind a lock error, for the `notebook_locked` detail. */
+export function lockErrno(cause: unknown): string | null {
+  if (cause instanceof Error && 'code' in cause) {
+    const code = (cause as NodeJS.ErrnoException).code;
+    return typeof code === 'string' ? code : null;
+  }
+  return null;
 }
 
 /**

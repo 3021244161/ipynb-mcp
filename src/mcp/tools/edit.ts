@@ -4,9 +4,17 @@
 import path from 'node:path';
 
 import { applyEditOps, type MarkdownIssue } from '../../core/edit.js';
-import { IpynbError, type JsonValue, type Warning } from '../../core/errors.js';
+import {
+  IpynbError,
+  PREEXISTING_CONTENT_WARNING,
+  createWarning,
+  isAbortCause,
+  type JsonValue,
+  type Warning,
+} from '../../core/errors.js';
 import { checkMarkdown } from '../../core/markdown.js';
 import { markdownTargetExists } from '../../fs/markdown-targets.js';
+import { serializeNotebook, type NotebookFile } from '../../core/parse.js';
 import { readNotebookFile, writeNotebookFile } from '../../fs/notebook-file.js';
 import {
   optionalBoolean,
@@ -18,20 +26,10 @@ import {
 } from '../context.js';
 import { runTool, type ToolOutcome } from './result.js';
 
-/**
- * Shared abort-cause check. `run.ts` used to carry a near-identical copy whose
- * only difference was a `signal.aborted` pre-check — two implementations of one
- * rule is a drift surface (review v3 QUAL-2).
- */
-export function isAbortCause(cause: unknown, signal: AbortSignal | undefined): boolean {
-  if (signal === undefined || !signal.aborted) {
-    return false;
-  }
-  return (
-    cause === signal.reason ||
-    (cause instanceof Error && (cause.name === 'AbortError' || cause.message === 'aborted'))
-  );
-}
+// Re-exported for callers that already import this module; the rule itself
+// lives in core/errors.ts so `run.ts` and this file cannot drift apart
+// (review v3 QUAL-2, closed in the v6 round).
+export { isAbortCause };
 
 export const EDIT_ARGUMENTS = [
   'path',
@@ -44,10 +42,32 @@ export const EDIT_ARGUMENTS = [
 export const notebookEditDescription =
   'Edit notebook cells. Every source change requires a compare-and-swap anchor (expected_source_hash or expected_text); a mismatch fails the whole request without writing.';
 
+/**
+ * Adapts the `beforeWrite` test hook onto the writer's serializer seam: the hook
+ * must fire at a point where "the read succeeded, the write has not happened" is
+ * already decided, and serialization is exactly that point.
+ */
+function wrapSerializer(hook: () => void): (notebook: NotebookFile) => string {
+  return (notebook) => {
+    hook();
+    return serializeNotebook(notebook);
+  };
+}
+
 export async function handleNotebookEdit(
   ctx: ToolContext,
   args: Record<string, unknown>,
-  options?: { signal?: AbortSignal },
+  options?: {
+    signal?: AbortSignal;
+    /**
+     * Runs after the read/hash check and after serialization, immediately before
+     * the write lands (`fs/notebook-file.ts`). Test-only seam: a Windows
+     * exclusive-handle case needs the lock to appear AFTER the read succeeded, so
+     * that it exercises the write path rather than the read path — with a real
+     * handle there is no other way to pin that moment (CI issue #1 problem 3).
+     */
+    beforeWrite?: () => void;
+  },
 ): Promise<ToolOutcome> {
   return runTool(async () => {
     rejectUnknownArguments(args, EDIT_ARGUMENTS);
@@ -95,10 +115,17 @@ export async function handleNotebookEdit(
           expectedContentHash,
           signal: options?.signal,
           platform: ctx.platform,
-          // The gate judges the cells THIS edit changed, so a pre-existing
-          // quirk elsewhere in the user's file cannot make the notebook
-          // permanently read-only (review v5 GATE-1).
-          touchedCellIndexes: new Set(editResult.changedCells.map((cell) => cell.cell_index)),
+          ...(options?.beforeWrite === undefined ? {} : { serialize: wrapSerializer(options.beforeWrite) }),
+          // The gate judges the cells THIS edit rewrote, so a pre-existing quirk
+          // elsewhere in the user's file cannot make the notebook permanently
+          // read-only, and a pure reorder is not treated as authorship of the
+          // moved cell (review v5 GATE-1, v6 SCOPE-REFUSE-HINT).
+          touchedCellIndexes: new Set(
+            editResult.changedCells.filter((cell) => cell.content_changed).map((cell) => cell.cell_index),
+          ),
+          // The pre-edit document, so a refusal can say whether it is refusing
+          // OUR output or content that was already there.
+          originalDoc: structuredClone(notebook.doc),
           // Carried-forward content is reported to the caller as a warning (the
           // same channel notebook_run uses) AND to the log. A bare log line would
           // tell the operator while leaving the model — the actual consumer —
@@ -139,9 +166,11 @@ export async function handleNotebookEdit(
       markdown_issues: editResult.markdownIssues,
       warnings: [
         ...editResult.warnings.map((warning: Warning) => ({ code: warning.code, message: warning.message })),
-        // `notebook_preexisting_content` is not a new error code: warnings are a
-        // free-form channel (SPEC §4.8), and this is not an error at all.
-        ...structuralWarnings.map((message) => ({ code: 'notebook_preexisting_content', message })),
+        // `file_changed_externally` rather than an invented 12th code: §7's list is
+        // closed, and this is the entry whose trigger matches what actually
+        // happened — the preserved content came from outside this tool (review v6
+        // WARN-CODE-1). The rule and the cell index are in the free-form message.
+        ...structuralWarnings.map((message) => createWarning(PREEXISTING_CONTENT_WARNING, message)),
       ],
     };
     return { payload: payload as JsonValue };

@@ -73,6 +73,34 @@ export class RunStore {
     return [...this.#runs.values()].filter((run) => run.state === 'running').map((run) => run.runId);
   }
 
+  /**
+   * Move a run to its terminal state, ONCE.
+   *
+   * Returns false when the run already left `running`, and the caller must then
+   * leave the recorded outcome alone. Two writers race here by construction:
+   * `notebook_run_cancel` lands `cancelled` immediately (SPEC §4.8 rule 1) while
+   * the background task keeps running, and a background task can also finish
+   * between a cancel and the status query. Without this, `completed` could be
+   * written over a `cancelled` that the client had already been told about —
+   * the terminal state a client observed was not stable (review v5 NEW5-REPRO,
+   * reproduced by the v6 review).
+   */
+  settle(
+    runId: string,
+    state: Exclude<RunState, 'running'>,
+    error?: { code: string; message: string },
+  ): boolean {
+    const handle = this.#runs.get(runId);
+    if (handle === undefined || handle.state !== 'running') {
+      return false;
+    }
+    handle.state = state;
+    if (error !== undefined) {
+      handle.error = error;
+    }
+    return true;
+  }
+
   /** Mark finished and apply retention (20 finished or 10 minutes). */
   finish(runId: string): void {
     const handle = this.#runs.get(runId);

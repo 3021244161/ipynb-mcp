@@ -141,6 +141,14 @@ export interface SelfCheckScope {
    * is what keeps a file with historical quirks editable (review v5 GATE-1).
    */
   readonly onPreExistingProblem?: (problem: Record<string, JsonValue>) => void;
+  /**
+   * The document as it was BEFORE this write, when the caller can supply it. It
+   * answers the question a refusal has to be able to answer — "did this write
+   * introduce the problem, or was it already there?" (AGENTS §9) — so the
+   * rejection detail can say `pre_existing: true` and point at the escape hatch
+   * instead of reading like "we broke your file" (review v6 SCOPE-REFUSE-HINT).
+   */
+  readonly originalDoc?: NotebookDoc;
 }
 
 /**
@@ -171,8 +179,27 @@ export function selfCheckNotebook(
   const parsed = requireParsed(serialized, hasher);
   const problem = findStructuralProblem(parsed.doc, scope.touchedCellIndexes);
   if (problem !== null) {
+    // A refusal must be able to say whether it is refusing OUR output or the
+    // user's pre-existing content (AGENTS §9), and it must point at the escape
+    // hatch: only `clear_outputs` or `set_cell_type` can remove the offending
+    // value, and a model that is not told that has no way forward
+    // (review v6 SCOPE-REFUSE-HINT).
+    const before =
+      scope.originalDoc === undefined
+        ? null
+        : findStructuralProblem(scope.originalDoc, scope.touchedCellIndexes);
+    const sameProblem =
+      before !== null &&
+      String(before['rule']) === String(problem['rule']) &&
+      before['cell_index'] === problem['cell_index'];
     throw new IpynbError('selfcheck_failed', 'serialized notebook failed the nbformat structure check', {
       problem: problem as JsonValue,
+      ...(sameProblem
+        ? {
+            pre_existing: true,
+            hint: `this cell already violated ${String(problem['rule'])} before the change; clear_outputs or set_cell_type removes it`,
+          }
+        : { pre_existing: false }),
     });
   }
   if (scope.onPreExistingProblem !== undefined) {
@@ -195,7 +222,12 @@ export function selfCheckNotebook(
 export function structuralWarning(problem: Record<string, JsonValue>): string {
   const cell = typeof problem['cell_index'] === 'number' ? ` at cell ${String(problem['cell_index'])}` : '';
   const rule = String(problem['rule']);
-  return `notebook contains nbformat content this tool would not write (${rule}${cell}); it was left untouched and the requested change was applied`;
+  // Describes the FILE, and only the file. The first version ended with "the
+  // requested change was applied", which is a claim about the request this
+  // function knows nothing about — and it is emitted before the write lands, so a
+  // later `notebook_locked` left a log line asserting success (review v6
+  // WARN-CODE-1 附带).
+  return `notebook already contained nbformat content this tool would not write (${rule}${cell}); it was preserved rather than rewritten`;
 }
 
 function requireParsed(serialized: string, hasher: Hasher): NotebookFile {
@@ -310,12 +342,25 @@ function outputProblem(
   const where = { cell_index: cellIndex, output_index: outputIndex, output_type: outputType };
   switch (outputType) {
     case 'stream': {
-      if (record['name'] !== 'stdout' && record['name'] !== 'stderr') {
-        return { ...where, rule: 'stream_name_invalid' };
+      // nbformat's schema types `name` as a plain STRING (no enum), and
+      // `nbformat.validate` accepts "foo". Demanding stdout/stderr here rejected
+      // files the authority accepts, which made such a cell permanently
+      // uneditable — the same class of over-refusal as GATE-1, at cell scale
+      // (review v6 GATE-6). Normalizing the two known names is the WRITE
+      // direction's job and already happens in `nbformatOutputsOfRaw`.
+      if (typeof record['name'] !== 'string') {
+        return { ...where, rule: 'stream_name_not_a_string' };
       }
       const text = record['text'];
-      if (typeof text !== 'string' && !Array.isArray(text)) {
+      if (typeof text === 'string') {
+        return null;
+      }
+      if (!Array.isArray(text)) {
         return { ...where, rule: 'stream_text_missing' };
+      }
+      // nbformat allows a list of strings, not a list of anything.
+      if (!text.every((entry) => typeof entry === 'string')) {
+        return { ...where, rule: 'stream_text_element_not_a_string' };
       }
       return null;
     }
@@ -325,10 +370,10 @@ function outputProblem(
           return { ...where, rule: 'error_field_missing', field };
         }
       }
-      if (!Array.isArray(record['traceback'])) {
-        return { ...where, rule: 'error_traceback_not_an_array' };
+      if (typeof record['ename'] !== 'string' || typeof record['evalue'] !== 'string') {
+        return { ...where, rule: 'error_field_not_a_string' };
       }
-      return null;
+      return stringArrayProblem(record, 'traceback', where);
     }
     case 'execute_result': {
       // nbformat requires execution_count HERE and only here: this is the rule
@@ -341,6 +386,11 @@ function outputProblem(
       const count = record['execution_count'];
       if (count !== null && !Number.isInteger(count)) {
         return { ...where, rule: 'execute_result_execution_count_not_an_integer' };
+      }
+      // The schema also sets `minimum: 0`; a negative count is invalid and was
+      // accepted (review v6 GATE-5, same family).
+      if (typeof count === 'number' && count < 0) {
+        return { ...where, rule: 'execute_result_execution_count_negative' };
       }
       return dataProblem(record, where);
     }
@@ -361,9 +411,63 @@ function dataProblem(
   if (typeof data !== 'object' || data === null || Array.isArray(data)) {
     return { ...where, rule: 'output_data_missing' };
   }
+  // A mime VALUE must be a string or an array of strings, and checking only that
+  // `data` is an object let the kernel smuggle any JSON value through: a plain
+  // user cell (`display({'text/plain': 5}, raw=True)`) produced a file
+  // `nbformat.validate` rejects while the run reported write_back.performed and
+  // no warning — the FID-1 failure mode with the entry point moved from the field
+  // NAME to the value TYPE (review v6 GATE-5, reproduced with a real kernel).
+  for (const [mime, value] of Object.entries(data as Record<string, unknown>)) {
+    // nbformat allows ANY type for JSON mime types: the value IS the document.
+    if (isJsonMime(mime)) {
+      continue;
+    }
+    if (isRepresentableMimeValue(value)) {
+      continue;
+    }
+    return { ...where, rule: 'output_data_value_not_a_string', mime };
+  }
   const metadata = record['metadata'];
   if (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata)) {
     return { ...where, rule: 'output_metadata_missing' };
+  }
+  return null;
+}
+
+/** `application/json` and `application/<subtype>+json` carry arbitrary values. */
+const JSON_MIME = /^application\/(?:[^/]+\+)?json$/;
+
+/**
+ * Whether a mime KEY may hold an arbitrary JSON value. The execution path needs
+ * this to decide what it can store at all, using the same rule the write gate
+ * enforces — one definition, so the two cannot disagree (review v6 GATE-5).
+ */
+export function isJsonMime(mime: string): boolean {
+  return JSON_MIME.test(mime);
+}
+
+/**
+ * Whether a mime VALUE is representable in nbformat: a string, or an array of
+ * strings. Shared with the execution path for the same reason as {@link isJsonMime}.
+ */
+export function isRepresentableMimeValue(value: unknown): boolean {
+  return typeof value === 'string' || (Array.isArray(value) && value.every((entry) => typeof entry === 'string'));
+}
+
+/** nbformat types every element of these arrays as a string. */
+function stringArrayProblem(
+  record: Record<string, unknown>,
+  field: string,
+  where: Record<string, JsonValue>,
+): Record<string, JsonValue> | null {
+  const value = record[field];
+  if (!Array.isArray(value)) {
+    return { ...where, rule: `${field}_not_an_array`, field };
+  }
+  if (!value.every((entry) => typeof entry === 'string')) {
+    // `["ok", 5]` is rejected by nbformat; accepting it wrote a file Jupyter
+    // would refuse (review v6 GATE-5, same family as the mime values).
+    return { ...where, rule: `${field}_element_not_a_string`, field };
   }
   return null;
 }

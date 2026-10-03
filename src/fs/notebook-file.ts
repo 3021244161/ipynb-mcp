@@ -14,6 +14,7 @@ import {
   serializeNotebook,
   structuralWarning,
   type Hasher,
+  type NotebookDoc,
   type NotebookFile,
 } from '../core/parse.js';
 import { normalizeForCompare } from '../config.js';
@@ -56,8 +57,14 @@ export async function readNotebookFile(
 
 function translateLockError(cause: unknown, absolutePath: string): unknown {
   if (isLockError(cause)) {
+    const errno = errnoCode(cause);
     return new IpynbError('notebook_locked', `notebook file is locked by another process: ${absolutePath}`, {
       path: absolutePath,
+      // The raw errno travels with the code: the model (and the user) can then
+      // tell a sharing violation from a permission problem, and the Windows
+      // integration case can assert it really saw a lock rather than a generic
+      // failure (CI issue #1 problem 3).
+      errno: errno ?? null,
     });
   }
   return cause;
@@ -90,6 +97,12 @@ export interface WriteOptions {
    * creating the document rather than editing one.
    */
   readonly touchedCellIndexes?: ReadonlySet<number>;
+  /**
+   * The parsed document as it was before this write. Used to tell a refusal
+   * apart from a carried-forward problem, so the error can say which one it is
+   * (review v6 SCOPE-REFUSE-HINT).
+   */
+  readonly originalDoc?: NotebookDoc;
   /** Warning sink for pre-existing problems the write deliberately preserves. */
   readonly onStructuralWarning?: (message: string) => void;
 }
@@ -200,6 +213,7 @@ async function writeNotebookFileUnlocked(
   // (review v5 GATE-1).
   selfCheckNotebook(serialized, options.hasher, {
     touchedCellIndexes: options.touchedCellIndexes,
+    ...(options.originalDoc === undefined ? {} : { originalDoc: options.originalDoc }),
     ...(options.touchedCellIndexes === undefined
       ? {}
       : {

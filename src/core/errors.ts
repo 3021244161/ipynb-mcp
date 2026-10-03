@@ -50,6 +50,41 @@ export const WARNING_CODES = [
   'output_truncated',
 ] as const;
 
+/**
+ * The warning code used when a write PRESERVED content this tool would not have
+ * written (a `display_data` without `metadata`, an `output_type` from a newer
+ * nbformat, …).
+ *
+ * It is `file_changed_externally` on purpose: §7's table is a closed set, and the
+ * v5 round minted a 12th code (`notebook_preexisting_content`) without
+ * registering it as a deviation — a client that validates against the table
+ * would have dropped the only signal the model got (review v6 WARN-CODE-1). Of
+ * the eleven, this is the one whose trigger ("external change detected") is what
+ * actually happened: the content came from outside this tool. The specific rule
+ * and cell live in the warning's free-form `message`.
+ */
+export const PREEXISTING_CONTENT_WARNING: (typeof WARNING_CODES)[number] = 'file_changed_externally';
+
+/**
+ * Shared abort-cause test: did this throw come from OUR cancellation signal?
+ *
+ * One implementation for the whole repository. It used to exist twice — once in
+ * `mcp/tools/edit.ts` and once in `run.ts`, byte-for-byte identical — which is a
+ * drift surface for a rule that decides whether an error is reported as
+ * `cancelled` or as a genuine failure (review v3 QUAL-2, still open in v6). It
+ * lives in `core/errors.ts` because both layers may import it and neither layer
+ * owns it.
+ */
+export function isAbortCause(cause: unknown, signal: AbortSignal | undefined): boolean {
+  if (signal === undefined || !signal.aborted) {
+    return false;
+  }
+  return (
+    cause === signal.reason ||
+    (cause instanceof Error && (cause.name === 'AbortError' || cause.message === 'aborted'))
+  );
+}
+
 export type WarningCode = (typeof WARNING_CODES)[number];
 
 export class IpynbError extends Error {

@@ -152,7 +152,7 @@ export async function handleNotebookRun(
           platform: ctx.platform,
           onProgress: hooks?.onProgress
             ? (event) => {
-                hooks.onProgress?.({
+              hooks.onProgress?.({
                   progress: event.phase === 'cell' ? event.completed : 0,
                   total: event.total,
                   phase: event.phase,
@@ -229,7 +229,15 @@ async function executeBackgroundRun(
     handle.writeBack = { performed: outcome.write_back.performed, backupPath: outcome.write_back.backup_path };
     handle.warnings = outcome.warnings;
     handle.imageBlocks = outcome.image_blocks;
-    handle.state = 'completed';
+    // `settle`, not a direct assignment: a cancel may already have landed this
+    // run in `cancelled`, and overwriting that would flip a terminal state the
+    // client was already told about (review v5 NEW5-REPRO). The facts gathered
+    // above still land, so a cancelled run's status keeps reporting what ran.
+    ctx.runStore.settle(handle.runId, 'completed');
+    // `progress.completed` is emitted BEFORE each cell runs, so it can lag the
+    // executed count by one on a run that ends normally. Finalize it here rather
+    // than reporting `progress: {completed: 0, total: 1}` next to `executed: 1`.
+    handle.progress.completed = handle.executed.length;
   } catch (cause) {
     const error = cause instanceof IpynbError ? cause : new IpynbError('internal', String(cause));
     // Surface the executed cells from the error detail so a failed run's
@@ -245,11 +253,16 @@ async function executeBackgroundRun(
     // kernel_died even though the cooperative abort raised 'cancelled'
     // (the reason was fixed when the run started).
     if (handle.abortReason === 'kernel_died') {
-      handle.state = 'failed';
-      handle.error = { code: 'kernel_died', message: 'kernel was shut down or restarted while the run was in flight' };
+      ctx.runStore.settle(handle.runId, 'failed', {
+        code: 'kernel_died',
+        message: 'kernel was shut down or restarted while the run was in flight',
+      });
     } else {
-      handle.state = error.code === 'cancelled' ? 'cancelled' : 'failed';
-      handle.error = { code: error.code, message: error.message };
+      ctx.runStore.settle(
+        handle.runId,
+        error.code === 'cancelled' ? 'cancelled' : 'failed',
+        { code: error.code, message: error.message },
+      );
     }
     // Best-effort detail extraction for write-back reporting in the failure.
     if (error.detail !== undefined && typeof error.detail === 'object' && error.detail !== null) {

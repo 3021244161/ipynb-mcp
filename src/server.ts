@@ -2,6 +2,8 @@
 // results (D24), progress notifications when the client sends a
 // progressToken, IpynbError -> isError mapping, read-only guards (D18).
 
+import { createRequire } from 'node:module';
+
 import type { CallToolResult, ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
@@ -44,8 +46,27 @@ function strict<T extends Record<string, z.ZodTypeAny>>(fields: T) {
   return z.object(fields).passthrough();
 }
 
+/**
+ * The version this server reports, read from the package manifest.
+ *
+ * A literal here meant a release could ship a server announcing a version that
+ * was not the one in the tarball, with no test able to notice (review v6 DEP-2).
+ * `createRequire` reads it from an ESM module without a build step or a JSON
+ * import assertion.
+ */
+function packageVersion(): string {
+  try {
+    const manifest = createRequire(import.meta.url)('../package.json') as { version?: unknown };
+    return typeof manifest.version === 'string' && manifest.version !== '' ? manifest.version : '0.0.0';
+  } catch {
+    // A packaged layout without the manifest must not break startup; the version
+    // string is informational.
+    return '0.0.0';
+  }
+}
+
 export function createServer(ctx: ToolContext): McpServer {
-  const server = new McpServer({ name: 'ipynb-mcp', version: '0.1.0' });
+  const server = new McpServer({ name: 'ipynb-mcp', version: packageVersion() });
 
   const wrap = (action: (args: Record<string, unknown>, extra: Extra) => Promise<ToolOutcome>) => {
     return async (rawArgs: Record<string, unknown>, extra: Extra): Promise<CallToolResult> => {

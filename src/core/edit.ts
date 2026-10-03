@@ -29,6 +29,14 @@ export interface ChangedCell {
   readonly new_line_count: number;
   readonly new_source_hash: string;
   readonly outputs_cleared: boolean;
+  /**
+   * Whether this op rewrote the cell's CONTENT (`source`/`outputs`/`cell_type`).
+   * A pure `move_cell` repositions a cell without touching a byte of it, so it
+   * must not be treated as "we wrote this cell" — otherwise reordering a
+   * notebook that contains a quirk elsewhere refuses the whole request and the
+   * only escape is to destroy the user's output (review v6 SCOPE-REFUSE-HINT).
+   */
+  readonly content_changed: boolean;
 }
 
 export interface EditResult {
@@ -138,6 +146,8 @@ export function applyEditOps(
   const warnings: Warning[] = [];
   const markdownIssues: MarkdownIssue[] = [];
   const touchedCells: NotebookCell[] = [];
+  /** Cells whose CONTENT this request rewrote (a pure move is not one). */
+  const contentTouched = new Set<NotebookCell>();
   const clearedOutputs = new Set<NotebookCell>();
   // First (not last) count-changing op: later structural ops must not reset
   // the scan window, or index ops between two structural ops go unwarned
@@ -233,7 +243,7 @@ export function applyEditOps(
         }
         const cell = createCell(cellType, source, options.nbformatMinor, notebook);
         notebook.cells.splice(atIndex, 0, cell);
-        trackCell(touchedCells, cell);
+        trackCell(touchedCells, contentTouched, cell);
         if (firstStructureChangeOpIndex < 0) {
           firstStructureChangeOpIndex = opIndex;
         }
@@ -259,7 +269,7 @@ export function applyEditOps(
         }
         const [moved] = notebook.cells.splice(fromIndex, 1);
         notebook.cells.splice(toIndex, 0, moved!);
-        trackCell(touchedCells, moved!);
+        trackMovedCell(touchedCells, moved!);
         if (options.nbformatMinor < 5 && !noStableIdWarned) {
           noStableIdWarned = true;
           pushOnce(warnings, createWarning(
@@ -326,7 +336,7 @@ export function applyEditOps(
     }
 
     if (touchedCell !== undefined) {
-      trackCell(touchedCells, touchedCell);
+      trackCell(touchedCells, contentTouched, touchedCell);
     }
   }
 
@@ -357,6 +367,7 @@ export function applyEditOps(
     new_line_count: cellSource(cell).split('\n').length,
     new_source_hash: cellSourceHash(cell, options.hasher),
     outputs_cleared: clearedOutputs.has(cell),
+    content_changed: contentTouched.has(cell),
   })).filter((entry) => entry.cell_index >= 0);
 
   return { applied: ops.length, changedCells, warnings, markdownIssues };
@@ -608,7 +619,26 @@ function pushOnce(warnings: Warning[], warning: Warning): void {
   }
 }
 
-function trackCell(touchedCells: NotebookCell[], cell: NotebookCell): void {
+function trackCell(
+  touchedCells: NotebookCell[],
+  contentTouched: Set<NotebookCell>,
+  cell: NotebookCell,
+): void {
+  if (!touchedCells.includes(cell)) {
+    touchedCells.push(cell);
+  }
+  // Any op routed through here rewrites the cell bytes; `trackMovedCell` is the
+  // one that only repositions.
+  contentTouched.add(cell);
+}
+
+/**
+ * Track a cell that was only REPOSITIONED. `move_cell` cannot change a cell's
+ * bytes, so it must not join the set the write gate treats as "ours" — doing so
+ * refused whole reorder requests over a quirk in the moved cell and left the user
+ * with `clear_outputs` as the only way forward (review v6 SCOPE-REFUSE-HINT).
+ */
+function trackMovedCell(touchedCells: NotebookCell[], cell: NotebookCell): void {
   if (!touchedCells.includes(cell)) {
     touchedCells.push(cell);
   }

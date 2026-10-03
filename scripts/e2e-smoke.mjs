@@ -17,8 +17,7 @@
 
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { readFileSync } from 'node:fs';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -119,6 +118,15 @@ try {
   check(
     'no tool advertises an outputSchema (D24)',
     tools.tools.every((tool) => tool.outputSchema === undefined),
+  );
+  // DEP-2: the advertised version must be the manifest's, or a release can ship a
+  // server that lies about which release it is.
+  const manifest = JSON.parse(readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf8'));
+  const clientVersion = client.getServerVersion?.();
+  check(
+    'the server reports the version in package.json',
+    clientVersion?.version === manifest.version,
+    `${String(clientVersion?.version)} vs ${String(manifest.version)}`,
   );
 
   const read = await call('notebook_read', { path: notebookPath });

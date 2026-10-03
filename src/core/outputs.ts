@@ -4,7 +4,9 @@
 // image headers are parsed by hand (no image libraries, SPEC §4.4).
 
 import type { JsonValue } from './errors.js';
-import type { Hasher, NotebookCell } from './parse.js';
+// Value types are imported, not redefined: the execution path and the write gate
+// must answer "is this representable?" identically (review v6 GATE-5).
+import { isJsonMime, isRepresentableMimeValue, type Hasher, type NotebookCell } from './parse.js';
 
 /** Raw output as delivered by the sidecar protocol (SPEC §5.8, + metadata for §4.4). */
 export interface RawOutput {
@@ -159,6 +161,62 @@ export function nbformatOutputsOfRaw(
   });
 }
 
+/**
+ * Make stored outputs representable in nbformat, reporting what had to go.
+ *
+ * The write gate refuses to produce a file nbformat rejects, and that refusal is
+ * correct — but refusing at write time means ALL the work in the run is lost
+ * because ONE output carried a value we cannot store. A plain user cell can do
+ * that (`display({'text/plain': 5}, raw=True)`), and the reviewer's reading of the
+ * contract applies: abnormal output is ours to handle, not an error to hand back
+ * (review v6 GATE-5 + CRASH-1; the SPEC §4.8 code list does not even contain a
+ * runner for this).
+ *
+ * So the execution path normalizes BEFORE serializing:
+ *   - a mime value that is neither a string nor an array of strings is dropped
+ *     (the output keeps its other, representable mime types);
+ *   - a negative `execution_count` becomes null (the schema sets `minimum: 0`).
+ * The write gate stays exactly as strict, which is why a future writer that
+ * forgets this step still cannot corrupt a file — it fails instead.
+ */
+export function dropUnrepresentableOutputs(outputs: readonly unknown[]): {
+  readonly outputs: unknown[];
+  readonly droppedMimes: string[];
+} {
+  const droppedMimes: string[] = [];
+  const kept = outputs.map((entry) => {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      return entry;
+    }
+    const record = entry as Record<string, unknown>;
+    let next = record;
+    const data = record['data'];
+    if (typeof data === 'object' && data !== null && !Array.isArray(data)) {
+      const filtered: Record<string, unknown> = {};
+      let changed = false;
+      for (const [mime, value] of Object.entries(data as Record<string, unknown>)) {
+        // JSON mime types may hold anything; every other kind must be a string
+        // or a list of strings.
+        if (isJsonMime(mime) || isRepresentableMimeValue(value)) {
+          filtered[mime] = value;
+        } else {
+          droppedMimes.push(mime);
+          changed = true;
+        }
+      }
+      if (changed) {
+        next = { ...next, data: filtered };
+      }
+    }
+    const count = next['execution_count'];
+    if (typeof count === 'number' && count < 0) {
+      next = { ...next, execution_count: null };
+    }
+    return next;
+  });
+  return { outputs: kept, droppedMimes };
+}
+
 export type OutputItem =
   | { kind: 'stream'; stream_name: 'stdout' | 'stderr'; text: string; truncated: boolean; truncated_at_chars: number | null }
   | { kind: 'text'; media_type: 'text/plain'; text: string }
@@ -242,11 +300,51 @@ export function mapRawOutputs(rawOutputs: readonly RawOutput[], options: MapOutp
       continue;
     }
     const data = raw.data ?? {};
-    // 3./4. images (png first, then jpeg)
+    // 3./4. images (png first, then jpeg).
+    //
+    // The value must be NARROWED to a string before it is treated as base64. The
+    // kernel can send any JSON value for a mime key, and a raw `display({'image/png':
+    // 123})` used to reach `base64.replace`, throw a TypeError and abort the whole
+    // run with `internal` — a code SPEC §4.8 does not list for notebook_run, from a
+    // path a user's own cell can trigger. `?? ''` only caught null/undefined
+    // (review v6 CRASH-1). A non-string value takes the existing
+    // image_materialize_failed route, which is the documented exit for an image
+    // that cannot be materialized (SPEC §4.4).
+    const imageValue = (key: string): string | null => {
+      const value = data[key];
+      return typeof value === 'string' ? value : null;
+    };
     const imageMediaType =
       data['image/png'] !== undefined ? 'image/png' : data['image/jpeg'] !== undefined ? 'image/jpeg' : null;
     if (imageMediaType !== null) {
-      const base64 = data[imageMediaType] ?? '';
+      const rawImage = imageValue(imageMediaType);
+      if (rawImage === null) {
+        items.push({
+          kind: 'image',
+          media_type: imageMediaType,
+          width: null,
+          height: null,
+          bytes: 0,
+          artifact_path: null,
+          image_index: null,
+          text_fallback: typeof data['text/plain'] === 'string' ? data['text/plain'] : '',
+        });
+        // Register the failure so the caller emits the documented
+        // `image_materialize_failed` warning. Without this entry the output would
+        // be silently "an image with no artifact", which is the kind of quiet
+        // degradation this project exists to avoid.
+        extractedImages.push({
+          outputIndex: items.length - 1,
+          mediaType: imageMediaType,
+          bytes: new Uint8Array(0),
+          width: null,
+          height: null,
+          sha256Hex: options.hasher.sha256Hex(String(rawImage ?? '')),
+          decodeFailed: true,
+        });
+        continue;
+      }
+      const base64 = rawImage;
       // Cheap pre-check on the ENCODED length before decoding: base64 is 4/3 of
       // the payload, so an obviously oversized image never needs the decode
       // (which itself costs ~2.5x the image in transient copies) nor the
@@ -427,7 +525,7 @@ function pickSize(record: Record<string, unknown>): { width: number; height: num
   const height = record['height'];
   if (typeof width === 'number' && Number.isInteger(width) && width >= 0 &&
       typeof height === 'number' && Number.isInteger(height) && height >= 0) {
-    return { width, height };
+        return { width, height };
   }
   return null;
 }

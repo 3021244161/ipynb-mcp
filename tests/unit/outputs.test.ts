@@ -4,7 +4,7 @@ import path from 'node:path';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { mapRawOutputs, type RawOutput } from '../../src/core/outputs.js';
+import { dropUnrepresentableOutputs, mapRawOutputs, type RawOutput } from '../../src/core/outputs.js';
 import { applyImagePolicy, shouldReturnImages } from '../../src/fs/artifact.js';
 import { hasher } from '../../src/hash.js';
 
@@ -395,5 +395,82 @@ describe('[D7] exactly max_images_per_call images: no limit warning (SPEC §4.4)
       .filter((value): value is number => value !== null)
       .sort((a, b) => a - b);
     expect(indexes).toEqual(Array.from({ length: 20 }, (_, i) => i));
+  });
+});
+
+describe('[GATE-5][CRASH-1] values nbformat cannot store', () => {
+  // A plain user cell can send any JSON value for a mime key:
+  //   display({'text/plain': 5}, raw=True)   -> invalid nbformat on disk,
+  //                                             reported as success with no warning
+  //   display({'image/png': 123}, raw=True)  -> aborted the run with `internal` /
+  //                                             "base64.replace is not a function"
+  // Both were reproduced with a real kernel in review v6. The write gate refuses
+  // such a file (correct), so the EXECUTION path must not build one — otherwise
+  // one output value destroys an entire run's work.
+
+  it('mapRawOutputs survives a non-string image value instead of throwing', () => {
+    const result = mapRawOutputs(
+      // The type says string; the KERNEL does not have to agree, which is the
+      // whole point of the case (review v6 CRASH-1 reproduced it with a real one).
+      [{ outputType: 'display_data', data: { 'image/png': 123 as unknown as string }, metadata: {} }],
+      { maxImageBytes: 20_971_520, inlineTextChars: 20000, hasher },
+    );
+    // Routed to the documented "image could not be materialized" path: an image
+    // item with nulls plus a decodeFailed marker, never a TypeError.
+    expect(result.items[0]).toMatchObject({
+      kind: 'image',
+      media_type: 'image/png',
+      artifact_path: null,
+      image_index: null,
+      bytes: 0,
+    });
+    expect(result.extractedImages[0]).toMatchObject({ decodeFailed: true });
+  });
+
+  it('dropUnrepresentableOutputs removes only the values nbformat forbids', () => {
+    const dropped = dropUnrepresentableOutputs([
+      // A number where the schema wants a string (or a list of strings)…
+      { output_type: 'display_data', data: { 'text/plain': 5, 'text/html': '<b>ok</b>' }, metadata: {} },
+      // …an array with a non-string element…
+      { output_type: 'display_data', data: { 'text/plain': ['ok', 5] }, metadata: {} },
+      // …and a negative execution count (schema `minimum: 0`).
+      { output_type: 'execute_result', data: { 'text/plain': '7' }, metadata: {}, execution_count: -1 },
+      // JSON mime types are the documented exception: any value is legal.
+      { output_type: 'display_data', data: { 'application/json': { any: ['thing'] } }, metadata: {} },
+      // Representable entries must pass through untouched.
+      { output_type: 'display_data', data: { 'text/plain': 'fine' }, metadata: {} },
+      { output_type: 'stream', name: 'stdout', text: 'hi' },
+    ]);
+
+    expect(dropped.droppedMimes).toEqual(['text/plain', 'text/plain']);
+    const [first, second, third, fourth] = dropped.outputs as Array<Record<string, unknown>>;
+    // The good mime type in the same output survives: only the value is dropped.
+    expect(first!['data']).toEqual({ 'text/html': '<b>ok</b>' });
+    expect(second!['data']).toEqual({});
+    expect(third!['execution_count']).toBeNull();
+    expect(fourth!['data']).toEqual({ 'application/json': { any: ['thing'] } });
+    expect(dropped.outputs).toHaveLength(6);
+  });
+
+  it('the write gate still refuses the same shapes (defence in depth)', async () => {
+    const { findStructuralProblem, parseNotebook } = await import('../../src/core/parse.js');
+    const doc = (output: Record<string, unknown>) => parseNotebook(new TextEncoder().encode(JSON.stringify({
+      nbformat: 4,
+      nbformat_minor: 5,
+      metadata: {},
+      cells: [{ cell_type: 'code', id: 'c0', metadata: {}, source: 'x', execution_count: 1, outputs: [output] }],
+    })), hasher).doc;
+
+    expect(findStructuralProblem(doc({ output_type: 'display_data', data: { 'text/plain': 5 }, metadata: {} })))
+      .toMatchObject({ rule: 'output_data_value_not_a_string', mime: 'text/plain' });
+    expect(findStructuralProblem(doc({ output_type: 'display_data', data: { 'text/plain': ['ok', 5] }, metadata: {} })))
+      .toMatchObject({ rule: 'output_data_value_not_a_string' });
+    expect(findStructuralProblem(doc({
+      output_type: 'execute_result', data: { 'text/plain': '7' }, metadata: {}, execution_count: -1,
+    }))).toMatchObject({ rule: 'execute_result_execution_count_negative' });
+    // `application/json` really is exempt, or the gate would reject valid files.
+    expect(findStructuralProblem(doc({
+      output_type: 'display_data', data: { 'application/json': { any: 1 } }, metadata: {},
+    }))).toBeNull();
   });
 });

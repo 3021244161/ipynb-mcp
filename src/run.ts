@@ -3,9 +3,16 @@
 // the guarded write-back. This module composes core/fs/kernel pieces and is
 // the only cross-layer assembly point; mcp/tools/run.ts calls runNotebook.
 
-import { IpynbError, createWarning, type JsonValue, type Warning } from './core/errors.js';
-import { mapRawOutputs, nbformatOutputsOfRaw, type OutputItem } from './core/outputs.js';
-import { cellSource, readNotebookMetadata, type Hasher, type NotebookFile } from './core/parse.js';
+import {
+  IpynbError,
+  PREEXISTING_CONTENT_WARNING,
+  createWarning,
+  isAbortCause,
+  type JsonValue,
+  type Warning,
+} from './core/errors.js';
+import { dropUnrepresentableOutputs, mapRawOutputs, nbformatOutputsOfRaw, type OutputItem } from './core/outputs.js';
+import { cellSource, readNotebookMetadata, type Hasher, type NotebookDoc, type NotebookFile } from './core/parse.js';
 import { analyzeStale, downgradeConfidence, regexDefs, regexUses, type StaleCell } from './core/stale.js';
 import type { IpynbConfig } from './config.js';
 import { applyImagePolicy, shouldReturnImages, type ImagesPolicy } from './fs/artifact.js';
@@ -362,49 +369,57 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
       // that never ran the earlier cells and write back a result that looks
       // successful while half of it is missing (review v3 ROB-8 item 8).
       // `replay` and `full` build their own state, so a fresh kernel is exactly
+      // Snapshot the document BEFORE anything can mutate it: the write-back's
+      // self check uses it to say whether a refusal is about our output or about
+      // content that was already in the file (review v6 SCOPE-REFUSE-HINT). It
+      // has to be taken this early because the failure paths below (a kernel that
+      // died while the run was starting) already write back.
+      const preRunDoc = structuredClone(notebook.doc);
+
       // what they asked for.
       const activeSession = deps.registry.findByNotebook(req.path);
       if (modeUsed === 'resume' && activeSession?.kernelId !== session.kernelId) {
-          throw await failedRunError(
-            'kernel_died',
-            'kernel was shut down or restarted while the run was starting',
-            executed,
-            deps,
-            abortState,
-            notebook,
-            effectiveReq,
-            platform,
-            executedCellsSet,
-          );
-        }
+        throw await failedRunError(
+          'kernel_died',
+          'kernel was shut down or restarted while the run was starting',
+          executed,
+          deps,
+          abortState,
+          notebook,
+          effectiveReq,
+          platform,
+          executedCellsSet,
+          preRunDoc,
+        );
+      }
       deps.onProgress?.({ phase: 'start', total: targets.length });
 
-        // ---- replay prefix: silent, no outputs, no counters, nothing written ------
+      // ---- replay prefix: silent, no outputs, no counters, nothing written ------
       for (const index of replayPrefix) {
         if (isAborted(effectiveReq.abort)) {
-            break; // outer abort branch performs the (empty) write-back and raises
-          }
+          break; // outer abort branch performs the (empty) write-back and raises
+        }
         const cell = notebook.cells[index]!;
         await deps.registry.execCell(req.path, {
-            code: cellSource(cell),
-            silent: true,
-            storeOutputs: false,
-            timeoutMs: req.timeoutSeconds * 1000,
-          });
+          code: cellSource(cell),
+          silent: true,
+          storeOutputs: false,
+          timeoutMs: req.timeoutSeconds * 1000,
+        });
       }
 
       for (const index of targets) {
         if (isAborted(effectiveReq.abort)) {
-            break; // fall through to the outer abort branch: write back completed cells
-          }
+          break; // fall through to the outer abort branch: write back completed cells
+        }
         const cell = notebook.cells[index]!;
         deps.onProgress?.({ phase: 'cell', completed: executed.length, total: targets.length, current_cell_index: index });
         const savedOutputs = cell.outputs;
         const savedCount = cell.execution_count;
         if (req.clearOutputsBefore) {
-            cell.outputs = [];
-            cell.execution_count = null;
-          }
+          cell.outputs = [];
+          cell.execution_count = null;
+        }
         let result;
           // A kernel termination only ends the run while one of OUR cells is in
           // flight (SPEC §4.8 rule 1). Outside that window the event is stale —
@@ -428,8 +443,8 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
               // The kernel was killed while this cell was in flight (restart /
               // shutdown / client cancel raced the execution): fall through to
               // the abort branch so completed cells still get written back.
-              break;
-            }
+            break;
+          }
           if (cause instanceof IpynbError && isKernelGone(cause)) {
               // The kernel died on its own (OOM, external kill, dead sidecar) or
               // was already gone before this cell could run (a restart/shutdown
@@ -437,18 +452,19 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
               // isAborted(), and simply throwing here lost every cell that had
               // already completed — the run's own record of what it did
               // (SPEC §4.8 rule 3 / review R3, v3 ROB-8 item 7).
-              throw await failedRunError(
-                'kernel_died',
-                cause.message,
-                executed,
-                deps,
-                abortState,
-                notebook,
-                effectiveReq,
-                platform,
-                executedCellsSet,
-              );
-            }
+            throw await failedRunError(
+              'kernel_died',
+              cause.message,
+              executed,
+              deps,
+              abortState,
+              notebook,
+              effectiveReq,
+              platform,
+              executedCellsSet,
+              preRunDoc,
+            );
+          }
           throw cause;
         }
         kernelAbortState.cellInFlight = false;
@@ -473,22 +489,22 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
           );
         for (const warning of policyResult.warnings) {
           if (!warnings.some((existing) => existing.code === warning.code)) {
-              warnings.push(warning);
-            }
+            warnings.push(warning);
+          }
         }
         imageCursor += policyResult.materialized.length;
         for (const materialized of policyResult.materialized) {
           const image = mapped.items[materialized.outputIndex];
           if (image === undefined || image.kind !== 'image') {
-              continue;
-            }
+            continue;
+          }
             // items and rawOutputs are index-aligned (each raw output maps to
             // exactly one item), so the base64 payload sits at the same index.
           const rawOutput = result.result.rawOutputs[materialized.outputIndex];
           const base64 = rawOutput?.data?.[image.media_type];
           if (base64 !== undefined) {
-              imageBlocks.push({ data: base64, media_type: image.media_type });
-            }
+            imageBlocks.push({ data: base64, media_type: image.media_type });
+          }
         }
 
         executed.push({
@@ -503,11 +519,11 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
         if (result.result.status === 'timeout') {
             // Half-finished outputs of the interrupted cell never reach the file:
             // restore the pre-run outputs instead (SPEC §4.7 rule 5 / §4.8 rule 2).
-            cell.outputs = savedOutputs;
-            cell.execution_count = savedCount;
-            sawTimeout = true;
-            break;
-          }
+          cell.outputs = savedOutputs;
+          cell.execution_count = savedCount;
+          sawTimeout = true;
+          break;
+        }
 
           // A cell interrupted by the abort (status error) is NOT a completed
           // cell: its partial output never lands (SPEC §4.8 rule 2). Cells that
@@ -515,29 +531,41 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
         const abortedNow = isAborted(effectiveReq.abort);
         const interruptedByAbort = abortedNow && result.result.status === 'error';
         if (!interruptedByAbort) {
-            // D15's boundary, write direction: the sidecar's private output shape
-            // must never reach the file (SPEC §4.1.1). Assigning `rawOutputs`
-            // directly produced invalid nbformat on every executed cell and the
-            // tool's own read path could not read it back (review v4 FID-1).
-            cell.outputs = nbformatOutputsOfRaw(result.result.rawOutputs, result.result.executionCount);
-            cell.execution_count = result.result.executionCount;
-            executedCellsSet.add(index);
-          } else {
-            cell.outputs = savedOutputs;
-            cell.execution_count = savedCount;
+          // D15's boundary, write direction: the sidecar's private output shape
+          // must never reach the file (SPEC §4.1.1). Assigning `rawOutputs`
+          // directly produced invalid nbformat on every executed cell and the
+          // tool's own read path could not read it back (review v4 FID-1).
+          const converted = nbformatOutputsOfRaw(result.result.rawOutputs, result.result.executionCount);
+          // …and before it is stored, drop what nbformat cannot represent. The
+          // write gate would refuse the whole file otherwise, which loses every
+          // cell of the run over one output value — a plain user cell can produce
+          // one (review v6 GATE-5/CRASH-1).
+          const sanitized = dropUnrepresentableOutputs(converted);
+          if (sanitized.droppedMimes.length > 0) {
+            warnings.push(createWarning(
+              'output_truncated',
+              `cell ${index}: dropped output value(s) nbformat cannot store (non-string mime data: ${[...new Set(sanitized.droppedMimes)].join(', ')})`,
+            ));
           }
+          cell.outputs = sanitized.outputs;
+          cell.execution_count = result.result.executionCount;
+          executedCellsSet.add(index);
+        } else {
+          cell.outputs = savedOutputs;
+          cell.execution_count = savedCount;
+        }
         if (abortedNow) {
-            break;
-          }
+          break;
+        }
       }
 
       if (sawTimeout) {
           // Write back the cells that DID complete (SPEC §4.7 rule 5), then raise
           // exec_timeout with the partial state in detail.
-          abortState.writtenBack = true;
-          const timeoutWriteBack = await writeBackCompleted(notebook, effectiveReq, deps, platform, executedCellsSet);
-          const timeoutCell = executed[executed.length - 1];
-          throw new IpynbError('exec_timeout', `cell execution timed out after ${req.timeoutSeconds}s (interrupt did not land)`, {
+        abortState.writtenBack = true;
+        const timeoutWriteBack = await writeBackCompleted(notebook, effectiveReq, deps, platform, executedCellsSet, warnings);
+        const timeoutCell = executed[executed.length - 1];
+        throw new IpynbError('exec_timeout', `cell execution timed out after ${req.timeoutSeconds}s (interrupt did not land)`, {
             cell_index: timeoutCell?.cell_index ?? null,
             completed_cells: executed.length - 1,
             // ExecutedCell is structurally JSON-safe; the cast bridges it to the
@@ -545,14 +573,14 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
             executed: executed as unknown as JsonValue,
             write_back: timeoutWriteBack,
           });
-        }
+      }
 
       if (isAborted(effectiveReq.abort)) {
           // Completed cells stay written; the interrupted cell never lands
           // (SPEC §4.8). This is the ONE terminal path for both the mid-cell abort
           // and the cancel that lands while the write-back is running (v3 ROB-8).
-          throw await abortedRunError(executed, deps, abortState, notebook, effectiveReq, platform, executedCellsSet);
-        }
+        throw await abortedRunError(executed, deps, abortState, notebook, effectiveReq, platform, executedCellsSet, preRunDoc);
+      }
 
       if (mappedTruncated(executed)) {
         warnings.push(createWarning(
@@ -637,6 +665,15 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
       }
 
       // ---- write-back -------------------------------------------------------------
+      // Last chance to notice a cancel before the file is touched: the stale
+      // analysis above can be a long RPC, and a cancel that lands during it must
+      // not produce a normal `completed` result whose outputs were written after
+      // the client was told the run was over (review v5 NEW5-REPRO: the window
+      // exists on paper, and the terminal state is now single-writer so getting
+      // it wrong is visible).
+      if (isAborted(effectiveReq.abort)) {
+        throw await abortedRunError(executed, deps, abortState, notebook, effectiveReq, platform, executedCellsSet, preRunDoc);
+      }
       deps.onProgress?.({ phase: 'write_back', completed: executed.length, total: targets.length });
       let writeBack: RunOutcome['write_back'] = { performed: false, backup_path: null };
       let contentHashAfter: string | null = null;
@@ -661,16 +698,24 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
             // that was already in the file must not block the write-back
             // (review v5 GATE-1).
             touchedCellIndexes: executedCellsSet,
-            onStructuralWarning: (message) => deps.logger?.warn(message),
+            originalDoc: preRunDoc,
+            // …and it must still be REPORTED to the caller, not only logged: the
+            // model is the consumer, and a log line leaves it believing the file
+            // is clean while the edit path already returns this warning (review
+            // v6 WARN-CODE-1: the two paths disagreed).
+            onStructuralWarning: (message) => {
+              warnings.push(createWarning(PREEXISTING_CONTENT_WARNING, message));
+              deps.logger?.warn(message);
+            },
           });
         } catch (cause) {
-          if (isAbortError(cause, effectiveReq.abort?.signal)) {
+          if (isAbortCause(cause, effectiveReq.abort?.signal)) {
             // A cancel that lands here (after the last cell, while the results are
             // being written) is the same terminal state as a cancel mid-cell: the
             // completed cells must still land and be reported. Throwing a bare
             // `cancelled` with no detail lost them silently and made one terminal
             // code answer with two different shapes (review v3 ROB-8).
-            throw await abortedRunError(executed, deps, abortState, notebook, effectiveReq, platform, executedCellsSet);
+            throw await abortedRunError(executed, deps, abortState, notebook, effectiveReq, platform, executedCellsSet, preRunDoc);
           }
           throw cause;
         }
@@ -733,6 +778,7 @@ async function abortedRunError(
   req: RunRequest,
   platform: NodeJS.Platform,
   executedCellsSet: ReadonlySet<number>,
+  preRunDoc: NotebookDoc,
 ): Promise<IpynbError> {
   const code = req.abort!.reason === 'kernel_died' ? 'kernel_died' : 'cancelled';
   return failedRunError(
@@ -745,6 +791,7 @@ async function abortedRunError(
     req,
     platform,
     executedCellsSet,
+    preRunDoc,
   );
 }
 
@@ -794,16 +841,6 @@ function combineAbortSignals(
  * one: a sidecar that dies during the write aborts that but not the client's
  * (review v3 ROB-8 item 6).
  */
-function isAbortError(cause: unknown, signal: AbortSignal | undefined): boolean {
-  if (signal === undefined || !signal.aborted) {
-    return false;
-  }
-  return (
-    cause === signal.reason ||
-    (cause instanceof Error && (cause.name === 'AbortError' || cause.message === 'aborted'))
-  );
-}
-
 /** Guards the failure-path write-back against running twice for one run. */
 interface AbortState {
   writtenBack: boolean;
@@ -825,15 +862,24 @@ async function failedRunError(
   req: RunRequest,
   platform: NodeJS.Platform,
   executedCellsSet: ReadonlySet<number>,
+  preRunDoc: NotebookDoc,
 ): Promise<IpynbError> {
+  // The failure-path write-back can discover carried-forward content, and the
+  // caller here is an ERROR response: without this collector the warning had
+  // nowhere to go and the failure detail simply claimed `warnings: []` (review v6
+  // WARN-CODE-1 — the run path never delivered it at all).
+  const warnings: Warning[] = [];
   const writeBack = abortState.writtenBack
     ? { performed: false, backup_path: null }
-    : await writeBackCompleted(notebook, req, deps, platform, executedCellsSet);
+    : await writeBackCompleted(notebook, req, deps, platform, executedCellsSet, warnings, preRunDoc);
   abortState.writtenBack = true;
   return new IpynbError(code, message, {
     executed_cells: executed.length,
     executed: executed as unknown as JsonValue,
     write_back: writeBack,
+    // Projected to the wire shape: warnings is a returned field, and the detail
+    // must stay JSON-safe.
+    warnings: warnings.map((warning) => ({ code: warning.code, message: warning.message })),
   });
 }
 
@@ -851,6 +897,9 @@ async function writeBackCompleted(
   deps: RunDeps,
   platform: NodeJS.Platform,
   executedCellsSet: ReadonlySet<number>,
+  /** Collector for warnings that must reach the caller (see failedRunError). */
+  warnings: Warning[] = [],
+  preRunDoc?: NotebookDoc,
 ): Promise<RunOutcome['write_back']> {
   if (!req.writeOutputs || executedCellsSet.size === 0) {
     return { performed: false, backup_path: null };
@@ -866,9 +915,14 @@ async function writeBackCompleted(
       // when a run dies), so an already-aborted signal must not block it.
       platform,
       onCleanupError: (message) => deps.logger?.warn(message),
-      // Same scope rule as the main write-back (review v5 GATE-1).
+      // Same scope rule as the main write-back (review v5 GATE-1), and the same
+      // duty to report what was preserved.
       touchedCellIndexes: executedCellsSet,
-      onStructuralWarning: (message) => deps.logger?.warn(message),
+      ...(preRunDoc === undefined ? {} : { originalDoc: preRunDoc }),
+      onStructuralWarning: (message) => {
+        warnings.push(createWarning(PREEXISTING_CONTENT_WARNING, message));
+        deps.logger?.warn(message);
+      },
     });
     return { performed: true, backup_path: partialWrite.backupPath };
   } catch (cause) {

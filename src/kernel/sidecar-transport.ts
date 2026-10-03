@@ -43,6 +43,13 @@ export type SpawnFn = typeof spawn;
  * what actually bounds it; keep the two in sync when either side changes.
  */
 const SIDECAR_INTERRUPT_GRACE_MS = 5_000;
+/**
+ * Mirror of SHELL_REPLY_BUDGET_SECONDS in python/ipynb_sidecar.py: the wait for
+ * an execute_reply after iopub went idle. It is NOT part of the timeout path
+ * any more (that path returns immediately, see above) but it still bounds how
+ * long a normal cell may take to report, so the transport budgets above it.
+ */
+const SIDECAR_SHELL_REPLY_MS = 30_000;
 const SIDECAR_WORST_CASE_MS = SIDECAR_INTERRUPT_GRACE_MS;
 
 /** How many trailing stderr lines travel with a kernel_died error. */
@@ -171,14 +178,22 @@ export class SidecarTransport implements KernelTransport {
   }
 
   async execCell(params: ExecCellParams): Promise<ExecCellResult> {
-    // The sidecar's worst case for a cell that times out is
-    // `timeoutMs + INTERRUPT_GRACE + SHELL_REPLY_BUDGET` (it interrupts, waits
-    // for the interrupt to land, then waits for the shell reply). A margin
-    // SMALLER than that makes the transport give up first, which turns the
-    // documented `exec_timeout` into `kernel_died` at the default 300 s and
-    // tears down every kernel on this sidecar (review v3 ROB-11).
-    // INVARIANT: transportTimeout > sidecarWorstCaseMs + slack.
-    const transportTimeout = Math.max(params.timeoutMs + SIDECAR_WORST_CASE_MS + 10_000, 60_000);
+    // The sidecar's worst case for a cell that times out is `timeoutMs + the
+    // interrupt grace`: it interrupts, then waits that long for the interrupt to
+    // land. There is no shell-reply term — the sidecar returns the timeout
+    // immediately instead of waiting for a reply a still-running cell cannot send
+    // (review v4 FID-6, D-033). A margin SMALLER than the real worst case makes
+    // the transport give up first, which turns the documented `exec_timeout` into
+    // `kernel_died` and tears down every kernel on this sidecar (review v3
+    // ROB-11).
+    // INVARIANT: transportTimeout > max(SIDECAR_WORST_CASE_MS, SIDECAR_SHELL_REPLY_MS) + slack.
+    // The shell-reply budget matters even though the timeout path no longer waits
+    // for a reply: a NORMAL cell still takes up to that long to report, and the
+    // transport must not give up inside a legitimate execution.
+    const transportTimeout = Math.max(
+      params.timeoutMs + Math.max(SIDECAR_WORST_CASE_MS, SIDECAR_SHELL_REPLY_MS) + 10_000,
+      60_000,
+    );
     return this.#request('exec_cell', { ...params }, transportTimeout, 'reclaim') as unknown as Promise<ExecCellResult>;
   }
 

@@ -342,7 +342,9 @@ export function parseConfig(
     backupKeep: Number(resolved['backup-keep']),
     // Explicit relative --artifact-dir values are resolved against the cwd:
     // artifact_path is a returned field and must be absolute (SPEC §4.1.3).
-    artifactDir: pathResolve(String(resolved['artifact-dir'])),
+    // An absolute value is kept as given — including a Windows-style one on a
+    // POSIX host, which `path.resolve` would have mangled (see absolutePath).
+    artifactDir: absolutePath(String(resolved['artifact-dir']), platform),
     inlineTextChars: Number(resolved['inline-text-chars']),
     previewLines: Number(resolved['preview-lines']),
     maxImagesPerCall: Number(resolved['max-images-per-call']),
@@ -352,7 +354,8 @@ export function parseConfig(
   return { config, errors: [], helpRequested };
 }
 
-/** Normalise a path for case-insensitive platforms (win32/darwin) — SPEC §5.3 reuse-key rule. */
+/**
+ * Normalise a path for case-insensitive platforms (win32/darwin) — SPEC §5.3 reuse-key rule. */
 export function normalizeForCompare(path: string, platform: NodeJS.Platform): string {
   let p = path.replace(/\\/g, '/');
   if (p.length > 1 && p.endsWith('/')) {
@@ -362,6 +365,28 @@ export function normalizeForCompare(path: string, platform: NodeJS.Platform): st
     return p.toLowerCase();
   }
   return p;
+}
+
+/**
+ * Make a configured path absolute, leaving an ALREADY-absolute one alone.
+ *
+ * `path.resolve` cannot be used blindly: it decides absoluteness with the
+ * HOST's rules, so on Linux (CI!) `path.resolve('C:/x/y')` prepends the cwd and
+ * produces `/home/runner/work/.../C:/x/y`. That is how the cross-platform
+ * failures started — the configured value came out prefixed with the working
+ * directory, and the test that expected the Windows default looked wrong
+ * (review v6 / CI issue #1 problem 1a). A path is absolute here if it is
+ * absolute for the target platform, not for the machine running the parser.
+ */
+function absolutePath(target: string, platform: NodeJS.Platform): string {
+  const posixAbsolute = target.startsWith('/');
+  // A drive-rooted or UNC spelling is absolute on Windows regardless of host.
+  const windowsAbsolute = /^[A-Za-z]:[\\/]/.test(target) || /^[\\/]{2}[^\\/]/.test(target);
+  if (posixAbsolute || windowsAbsolute) {
+    return target.replace(/\\/g, '/');
+  }
+  void platform;
+  return pathResolve(target);
 }
 
 function isFilesystemRoot(normalizedPath: string, platform: NodeJS.Platform): boolean {

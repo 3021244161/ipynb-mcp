@@ -85,6 +85,15 @@ KERNELS: dict[str, KernelEntry] = {}
 KERNELS_LOCK = threading.Lock()
 STDOUT_LOCK = threading.Lock()
 
+# How long to wait for an `execute_reply` after iopub went idle. Mirrored by
+# `SIDECAR_SHELL_REPLY_MS` in src/kernel/sidecar-transport.ts, which budgets the
+# transport's own timeout above this value.
+SHELL_REPLY_BUDGET_SECONDS = 30
+
+# Grace period after an interrupt request. Mirrored by
+# `SIDECAR_INTERRUPT_GRACE_MS` in src/kernel/sidecar-transport.ts.
+INTERRUPT_GRACE_SECONDS = 5.0
+
 
 class KernelDiedError(RuntimeError):
     """Raised when a kernel process dies during an operation."""
@@ -263,7 +272,7 @@ def op_exec_cell(params: dict) -> dict:
                 # FID-6). Both outcomes are documented in README's known
                 # limitations — the shutdown that follows the timeout is what
                 # actually reclaims the CPU (SPEC §4.7 rule 6, D-025).
-                interrupt_deadline = now + 5.0
+                interrupt_deadline = now + INTERRUPT_GRACE_SECONDS
                 continue
             if interrupt_deadline is not None and now >= interrupt_deadline:
                 if not entry.km.is_alive():
@@ -322,7 +331,12 @@ def op_exec_cell(params: dict) -> dict:
             "rawOutputs": [],
             "durationMs": duration_ms,
         }
-    shell_deadline = time.monotonic() + 30
+    # Budget for the `execute_reply` of a cell that DID become idle. This is the
+    # sidecar's second timeout constant, and the Node transport must stay above
+    # it: `SIDECAR_SHELL_REPLY_MS` in src/kernel/sidecar-transport.ts mirrors this
+    # number (review v6 FID-6 收尾 — it used to be an unexplained literal here and
+    # was still quoted in the transport's comments after the timeout path changed).
+    shell_deadline = time.monotonic() + SHELL_REPLY_BUDGET_SECONDS
     while time.monotonic() < shell_deadline:
         try:
             reply = kc.get_shell_msg(timeout=shell_deadline - time.monotonic())

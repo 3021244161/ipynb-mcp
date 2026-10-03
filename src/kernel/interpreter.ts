@@ -36,6 +36,49 @@ export interface InterpreterCache {
 /** Kernelspec name reported when the notebook declares none (D23 default). */
 const DEFAULT_SPEC_NAME = 'python3';
 
+/**
+ * Modules the sidecar imports at startup, in the order it imports them.
+ *
+ * The probe below MUST test these and not a subset. The first version checked
+ * `import ipykernel` alone (which is also all SPEC §5.2 asks for), so an
+ * interpreter that provides ipykernel but not jupyter_client passed the probe and
+ * then failed inside the sidecar with "jupyter_client is not importable" — an
+ * internal error instead of the actionable "install this" message the candidate
+ * chain exists to produce. CI hit it, and a real user hits it whenever a
+ * kernelspec points at a trimmed or isolated environment (CI issue #1 problem 2,
+ * D-038).
+ *
+ * `python/ipynb_sidecar.py` reads `from jupyter_client.manager import
+ * KernelManager`; a test parses that import and fails if this list falls behind.
+ */
+export const SIDECAR_REQUIRED_MODULES = ['ipykernel', 'jupyter_client'] as const;
+
+/**
+ * Prints the first module the interpreter cannot import, then exits non-zero.
+ * Importing beats `importlib.util.find_spec` here: it also catches a broken
+ * install (a native extension that fails to load), which is exactly the pyzmq
+ * class of failure this project has already been bitten by.
+ */
+function missingModuleScript(modules: readonly string[]): string {
+  return [
+    'import sys',
+    `for name in ${JSON.stringify(modules)}:`,
+    '    try:',
+    '        __import__(name)',
+    '    except Exception as exc:',
+    '        sys.stdout.write(name)',
+    '        sys.exit(3)',
+    'sys.exit(0)',
+  ].join('\n');
+}
+
+/** What a probe run concluded about one interpreter. */
+export interface ProbeResult {
+  readonly ok: boolean;
+  /** The module that could not be imported, when the probe got that far. */
+  readonly missingModule: string | null;
+}
+
 export interface InterpreterDeps {
   readonly platform: NodeJS.Platform;
   readonly env: Readonly<Record<string, string | undefined>>;
@@ -43,6 +86,12 @@ export interface InterpreterDeps {
   readFile(target: string): Promise<string>;
   /** Runs the command: 'ok' (exit 0), 'failed' (non-zero) or 'not-found' (ENOENT). */
   execFile(command: string, args: readonly string[], timeoutMs: number): Promise<'ok' | 'failed' | 'not-found'>;
+  /**
+   * Like `execFile` but returns stdout. Used by the capability probe so the
+   * failure can name the missing module instead of only reporting a non-zero
+   * exit (CI issue #1 problem 2).
+   */
+  runCapturing?(command: string, args: readonly string[], timeoutMs: number): Promise<{ status: 'ok' | 'failed' | 'not-found'; stdout: string }>;
   /** Absolute path of a PATH command (e.g. via `python -c "print(sys.executable)"`), null when absent. */
   resolveExecutable(command: string, timeoutMs: number): Promise<string | null>;
   homedir(): string;
@@ -89,15 +138,35 @@ export async function resolveInterpreter(
     }
   }
 
-  const checkIpykernel = async (candidate: string): Promise<boolean> => {
-    const cached = input.cache?.get(candidate);
+  // The probe answers two questions at once (usable? which module is missing?),
+  // and the shared cache stores one boolean per candidate path, so the reason is
+  // remembered alongside it. The key carries the required-module list, so an
+  // entry from an older probe definition can never answer for this one.
+  const probeKey = (candidate: string): string => `${candidate}\u0000${SIDECAR_REQUIRED_MODULES.join(',')}`;
+  const probeReasons = new Map<string, string>();
+
+  const probeInterpreter = async (candidate: string): Promise<ProbeResult> => {
+    const cached = input.cache?.get(probeKey(candidate));
     if (cached !== undefined) {
-      return cached;
+      return cached ? { ok: true, missingModule: null } : { ok: false, missingModule: probeReasons.get(probeKey(candidate)) ?? null };
     }
-    const status = await deps.execFile(candidate, ['-c', 'import ipykernel'], 5_000);
-    const ok = status === 'ok';
-    input.cache?.set(candidate, ok);
-    return ok;
+    const script = missingModuleScript(SIDECAR_REQUIRED_MODULES);
+    let result: ProbeResult;
+    if (deps.runCapturing !== undefined) {
+      const run = await deps.runCapturing(candidate, ['-c', script], 10_000);
+      const reported = run.stdout.trim();
+      result = run.status === 'ok' ? { ok: true, missingModule: null } : { ok: false, missingModule: reported === '' ? null : reported };
+    } else {
+      // No capturing runner injected: the exit status still refuses an
+      // interpreter that cannot provide the modules, it just cannot say WHICH.
+      const status = await deps.execFile(candidate, ['-c', script], 10_000);
+      result = { ok: status === 'ok', missingModule: null };
+    }
+    input.cache?.set(probeKey(candidate), result.ok);
+    if (result.missingModule !== null) {
+      probeReasons.set(probeKey(candidate), result.missingModule);
+    }
+    return result;
   };
 
   // ---- candidate 1: explicit (failure is FINAL, never degrades) -----------
@@ -110,11 +179,12 @@ export async function resolveInterpreter(
     }
     const kernelLanguage = kernelJson?.language ?? languageInfo ?? 'python';
     if (pythonRequested(kernelLanguage)) {
-      const ok = await checkIpykernel(explicit);
-      if (!ok) {
-        throw new IpynbError('ipykernel_missing', `--python interpreter cannot import ipykernel: ${explicit}`, {
+      const probe = await probeInterpreter(explicit);
+      if (!probe.ok) {
+        throw new IpynbError('ipykernel_missing', missingModuleMessage('--python interpreter', explicit, probe), {
           path: explicit,
-          install_command: `"${explicit}" -m pip install ipykernel`,
+          install_command: installCommandFor(explicit, probe),
+          ...(probe.missingModule === null ? {} : { missing_module: probe.missingModule }),
         });
       }
     }
@@ -144,8 +214,8 @@ export async function resolveInterpreter(
         };
       }
       if (deps.existsSync(resolvedArgv0)) {
-        const ok = await checkIpykernel(resolvedArgv0);
-        if (ok) {
+        const probe = await probeInterpreter(resolvedArgv0);
+        if (probe.ok) {
           maybeVenvMismatch(warnings, kernelJson, venvPython, deps);
           return {
             interpreterPath: resolvedArgv0,
@@ -154,8 +224,11 @@ export async function resolveInterpreter(
             warnings,
           };
         }
-        failed.push({ path: resolvedArgv0, reason: 'ipykernel_missing' });
-        installCommand = `"${resolvedArgv0}" -m pip install ipykernel`;
+        failed.push({
+          path: resolvedArgv0,
+          reason: probe.missingModule === null ? 'ipykernel_missing' : `missing_module:${probe.missingModule}`,
+        });
+        installCommand = installCommandFor(resolvedArgv0, probe);
       } else {
         failed.push({ path: resolvedArgv0, reason: 'not found' });
       }
@@ -164,8 +237,8 @@ export async function resolveInterpreter(
 
   // ---- candidate 3: notebook-dir .venv / venv -----------------------------
   if (venvPython !== null) {
-    const ok = await checkIpykernel(venvPython);
-    if (ok) {
+    const probe = await probeInterpreter(venvPython);
+    if (probe.ok) {
       // SPEC §5.2 trigger 3 is independent of whether the kernelspec
       // interpreter WORKED: a resolved kernelspec whose argv[0] differs from
       // the adjacent .venv must warn here too — this fallback path was the
@@ -178,17 +251,20 @@ export async function resolveInterpreter(
         warnings,
       };
     }
-    failed.push({ path: venvPython, reason: 'ipykernel_missing' });
+    failed.push({
+      path: venvPython,
+      reason: probe.missingModule === null ? 'ipykernel_missing' : `missing_module:${probe.missingModule}`,
+    });
     if (installCommand === null) {
-      installCommand = `"${venvPython}" -m pip install ipykernel`;
+      installCommand = installCommandFor(venvPython, probe);
     }
   }
 
   // ---- candidate 4: PATH python3 -> python --------------------------------
   const pathCandidates = deps.platform === 'win32' ? ['python'] : ['python3', 'python'];
   for (const candidate of pathCandidates) {
-    const status = await deps.execFile(candidate, ['-c', 'import ipykernel'], 5_000);
-    if (status === 'ok') {
+    const probe = await probeInterpreter(candidate);
+    if (probe.ok) {
       return {
         interpreterPath: candidate,
         kernelSpecName: specName ?? DEFAULT_SPEC_NAME,
@@ -198,10 +274,10 @@ export async function resolveInterpreter(
     }
     failed.push({
       path: candidate,
-      reason: status === 'not-found' ? 'not found' : 'ipykernel_missing',
+      reason: probe.missingModule === null ? 'ipykernel_missing' : `missing_module:${probe.missingModule}`,
     });
-    if (status !== 'not-found' && installCommand === null) {
-      installCommand = `"${candidate}" -m pip install ipykernel`;
+    if (installCommand === null) {
+      installCommand = installCommandFor(candidate, probe);
     }
   }
 
@@ -217,6 +293,26 @@ export async function resolveInterpreter(
 }
 
 // ---------------------------------------------------------------------------
+
+/**
+ * The user-facing sentence for a failed probe. It names the interpreter and, when
+ * the probe got far enough to tell, the exact module that is missing. "cannot
+ * import ipykernel" is a lie when ipykernel is present and jupyter_client is not,
+ * and a lie sends the user to install something they already have
+ * (CI issue #1 problem 2).
+ */
+function missingModuleMessage(context: string, interpreterPath: string, probe: ProbeResult): string {
+  if (probe.missingModule === null) {
+    return `${context} cannot provide the sidecar's Python modules (${SIDECAR_REQUIRED_MODULES.join(', ')}): ${interpreterPath}`;
+  }
+  return `${context} is missing the Python module '${probe.missingModule}': ${interpreterPath}`;
+}
+
+/** The command that actually fixes the reported problem. */
+function installCommandFor(interpreterPath: string, probe: ProbeResult): string {
+  const modules = probe.missingModule === null ? [...SIDECAR_REQUIRED_MODULES] : [probe.missingModule];
+  return `"${interpreterPath}" -m pip install ${modules.join(' ')}`;
+}
 
 function pushMismatch(warnings: Warning[], message: string): void {
   if (!warnings.some((warning) => warning.code === 'kernelspec_mismatch')) {
@@ -388,6 +484,19 @@ export function createNodeInterpreterDeps(platform: NodeJS.Platform): Interprete
           } else {
             resolve((error as NodeJS.ErrnoException).code === 'ENOENT' ? 'not-found' : 'failed');
           }
+        });
+      }),
+    // The capability probe needs stdout as well as the status: the module that
+    // could not be imported is what makes the error actionable, and it is printed
+    // by the probe script rather than inferred from a non-zero exit.
+    runCapturing: (command, args, timeoutMs) =>
+      new Promise((resolve) => {
+        execFile(command, args, { timeout: timeoutMs, windowsHide: true }, (error, stdout) => {
+          if (error !== null && (error as NodeJS.ErrnoException).code === 'ENOENT') {
+            resolve({ status: 'not-found', stdout: '' });
+            return;
+          }
+          resolve({ status: error === null ? 'ok' : 'failed', stdout: typeof stdout === 'string' ? stdout : '' });
         });
       }),
     resolveExecutable: (command, timeoutMs) =>

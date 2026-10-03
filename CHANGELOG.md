@@ -2,6 +2,43 @@
 
 本项目的接口变更遵循 D22 兼容承诺（工具名与参数名在 1.x 内不删不改；新增参数一律可选带默认值；返回字段只增不删）。
 
+## [Unreleased] 0.1.0 — 第六轮代码复核整改 + CI 首次运行修复（未发布）
+
+> 来源：`docs/review/ipynb-mcp-code-review-v6.md` 与 GitHub issue #1（CI 首次运行，10 个 job 中 8 个失败）。
+> **无工具名/参数名变更**；三处**新增返回字段/取值**（错误 detail 的 `errno`、`pre_existing`/`hint`，
+> 以及 `changed_cells[].content_changed`）。
+
+### Fixed — CI 首次运行（issue #1）
+
+- **非 Windows 平台上的单测全挂**：几处用例把 Windows 特有的路径语义写成了通用断言，其中一处还要求实现按**宿主**规则解析绝对路径 —— Linux 上 `C:/Users/...` 被当成相对路径拼在 cwd 之后。实现与测试同时收紧：新增 `absolutePath()` 按**目标平台**判绝对性；`config.test.ts` 改为三平台表驱动；`fence.test.ts` 的"另一块盘"改为 win32 独占并在 POSIX 上先断言前置条件；大小写折叠用例改为按平台断言各自的规则。**没有删除或放宽任何断言**。
+- **"capable interpreter" 探针与 sidecar 真实依赖不一致**：探针只验 `import ipykernel`（SPEC §5.2 的字面要求），而 sidecar 启动即需要 `jupyter_client`。CI 的 integration job 因此在一个"看起来有能力"的解释器上失败于内部错误，真实用户机器上（kernelspec 指向被裁剪的环境）同样会踩到。现在探针验 sidecar 真正需要的模块集合，回报**缺失的模块名**与恰好需要的安装命令；CI 显式 `pip install ipykernel jupyter_client`（D-038）。
+- **`I15` 在 Windows 上失败**：根因是用例自身的相位错误 —— "未改动"快照是在独占句柄已经生效之后读的，于是 `readFile` 自己抛 EBUSY。快照移到加锁之前，用例拆成**读相位**（处理程序的读撞上锁）与**写相位**（读成功之后锁才出现，用钩子确定性触发），并补上了 issue 要求的"读取阶段撞独占"覆盖；`notebook_locked` 的 detail 现在带 `errno`。
+- **vitest 的 unhandled rejection**（"may cause false positive"）：`[I7]` 现在在杀掉 sidecar **之前**挂上 rejection handler，消除未观察窗口。
+- macOS 的 unit 矩阵只跑声明的 LTS（macOS runner 按 10 倍计费，与 §9 排除 macOS integration 同一理由）。
+
+### Fixed — 第六轮报告
+
+- **写前闸门漏检 mime 值的类型**（GATE-5，🔴）：原来只检查 `data` 是对象，于是一个普通用户 cell（`display({'text/plain': 5}, raw=True)`）写出的文件被 nbformat 拒绝，而 run 报 `write_back.performed: true` 且无 warning。现在按 nbformat 的 schema 检查每个 mime 值（字符串或全字符串数组；`application/json` 例外）、`stream.text` 与 `error.traceback` 的元素类型、`execution_count >= 0`。**执行路径同时归一化**：不可表示的值被丢弃并追加一条 `output_truncated` warning —— 闸门拦在写入那一刻会让整次 run 的成果全部丢失（D-040）。
+- **非字符串图片值曾以 `internal` 结束整个 run**（CRASH-1）：`display({'image/png': 123}, raw=True)` 让 `base64.replace` 抛 TypeError。现在值先做类型收窄，走既有的 `image_materialize_failed` 路径。
+- **`stream.name` 的白名单比 nbformat 严**（GATE-6）：nbformat 的 schema 只要求它是字符串（无 enum），原来的 stdout/stderr 白名单拒绝合法文件并让该 cell 永久不可编辑。
+- **自造了第 12 个 warning 码**（WARN-CODE-1）：`notebook_preexisting_content` 不在 SPEC §7 的闭集内，按白名单解析返回值的客户端会丢弃这条唯一提示。改用既有的 `file_changed_externally`（D-039），并且 **`notebook_run` 现在也返回它**（此前只写日志，模型看到 `warnings: []`）；失败路径的 `detail.warnings` 也不再恒为空。
+- **缩进检查器的 `if` 覆盖是死代码**（INDENT-HOLE）：脚本读的是 `node.statement`，而 `IfStatement` 只有 `thenStatement`/`elseStatement`；脚本是 `.mjs`、不进 tsconfig，类型检查抓不到。重写后覆盖 `then`/`else`/`switch`（case 标签与 case 体分开判）/`try`/`catch`/`finally`/四种循环/函数·方法·箭头·访问器体，并加**每次运行都执行的自测**（11 个错位样本 + 1 个干净样本）。用它发现并修好了 5 个文件里 68 行真实错位，另加一条"语句必须独占一行"的检查 —— 它立刻抓到两处被早前批量编辑合并的 `describe(... {  it(...`。
+- **终态可以被二次翻转**（NEW5-REPRO）：`notebook_run_cancel` 立刻落地 `cancelled`（§4.8 规则 1），而后台任务随后可能把它改写成 `completed`。`RunStore.settle()` 现在是终态的**唯一写者**；成功路径的 `progress.completed` 也按实际执行数收口（不再停在 total−1）；写回前复查 abort（stale 分析可能耗时，期间的取消必须走终态）。
+- **一次纯重排不该算"我们改写了这个 cell"**：`move_cell` 不再进闸门作用域（`changed_cells[].content_changed` 区分改写与重排），并且 `selfcheck_failed` 的 `detail` 现在带 `pre_existing` 与 `hint`，指明唯一的出路是 `clear_outputs`/`set_cell_type`。
+- **版本号双真源**（DEP-2）：`server.ts` 从 `package.json` 读版本，单测与 `pnpm smoke` 各断言一次。
+- `isAbortCause` 的两份同构实现（QUAL-2）合并到 `core/errors.ts`；传输层注释与 sidecar 的具名常量对齐（FID-6）；stderr 尾巴只在 transport 真的失联时附带（NEW-6）。
+- **Linux 可本地复现**：`scripts/linux-check.sh` 把 tracked 文件复制到 WSL 的 Linux 文件系统、按 lockfile 安装并跑 typecheck/lint/单测。CI 的失败全在非 Windows 上，而在 Windows 上"全绿"正是这些问题的成因。
+
+### Tests
+
+- 新增 `tests/unit/interpreter.test.ts`（探针与 sidecar 依赖一致，含源码解析的漂移守卫）、`run-store.test.ts`（终态单写者）、`server-version.test.ts`、`warning-codes.test.ts`（码在闭集内 + 编辑路径返回）、`[GATE-5][CRASH-1]` ×3、`[I15]` 读/写相位两条、`[GATE-1]` 的重排用例。
+- `pnpm smoke` 11 → **19** 项（新增版本一致性断言）。
+- 本轮所有守卫都做了变异验证：GATE-1（去掉 scope → 变红）、`[NEW-3][FRAME-1]`（换成行为等价的二次实现 → 36 s，变红）、探针（清单退回只有 ipykernel → 3 条变红）、I15（Windows 集成实跑）。
+
+### Deviations
+
+- 见 `docs/DEVIATIONS.md` **D-001 ~ D-040**（本轮新增 D-038 ~ D-040，并收窄 D-037 的措辞）。
+
 ## [Unreleased] 0.1.0 — 第五轮代码复核整改（未发布）
 
 > 来源：`docs/review/ipynb-mcp-code-review-v5.md`。**无工具名/参数名变更**；一处**行为修正**

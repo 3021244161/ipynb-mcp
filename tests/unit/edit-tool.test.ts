@@ -269,8 +269,11 @@ describe('[GATE-1] pre-existing content cannot lock the notebook', () => {
     // would inform the operator while the model, the actual consumer, went on
     // believing the file was clean.
     const warnings = body['warnings'] as Array<Record<string, unknown>>;
-    expect(warnings.some((warning) => warning['code'] === 'notebook_preexisting_content')).toBe(true);
-    expect(String(warnings.find((w) => w['code'] === 'notebook_preexisting_content')?.['message'])).toContain(
+    // file_changed_externally is the §7 code whose trigger matches: the content
+    // came from outside this tool. A 12th code would be outside the closed set
+    // (review v6 WARN-CODE-1).
+    expect(warnings.some((warning) => warning['code'] === 'file_changed_externally')).toBe(true);
+    expect(String(warnings.find((w) => w['code'] === 'file_changed_externally')?.['message'])).toContain(
       'output_metadata_missing',
     );
 
