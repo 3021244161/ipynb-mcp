@@ -179,8 +179,14 @@ export function createServer(ctx: ToolContext): McpServer {
         // leaving it to prose, and `.int()` is not decoration: the tool layer
         // validates 1..86400, which a fractional value like 0.5 passed while
         // being meaningless as a timeout (review v4 NEW-2).
+        // A STRING, not `z.enum`: a schema enum makes the SDK answer an invalid
+        // value with a -32602 protocol error before the handler runs, while
+        // SPEC §4.1.12 / U27 require `invalid_arguments` from the tool layer. The
+        // accepted set is stated here for the model and enforced in the handler,
+        // so validation lives in exactly one place (review v4 NEW-2, resolved in
+        // v7 after the review showed the two layers disagreeing).
         mode: z
-          .enum(['auto', 'resume', 'replay', 'full'])
+          .string()
           .optional()
           .describe("Execution mode: 'auto' (default) | 'resume' | 'replay' | 'full'"),
         timeout_seconds: z.number().int().optional().describe('Per-cell timeout in seconds (1..86400; default from server config)'),

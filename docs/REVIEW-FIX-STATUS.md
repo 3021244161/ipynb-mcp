@@ -20,7 +20,7 @@
 > 集成用到的解释器与三平台默认根见 `COMPATIBILITY.md`。
 ---
 
-## 〇、第六轮（`ipynb-mcp-code-review-v6.md`，本轮）
+## 〇、第六轮（`ipynb-mcp-code-review-v6.md`）
 
 > 本轮的核查对象是**仓库自己的测试与脚本**（把守卫当被测对象做变异），加上 **CI 首次真跑**的失败
 > （GitHub issue #1）。结论：v5 的修复是真的，但新加的写前闸门、缩进检查器与几处测试本身有缺陷，
@@ -49,7 +49,7 @@
 | **INDENT-HOLE** 🟠（v5 漏列） | ✅ | `check-indent.mjs` 读的是 `node.statement`，而 `IfStatement` 只有 `thenStatement`/`elseStatement`——整个 `if` 覆盖是死代码（脚本是 `.mjs`、不进 tsconfig，类型检查抓不到）。重写为：`then`/`else`/`switch`（case 标签与 case 体分别判）/`try`/`catch`/`finally`/四种循环/函数·方法·箭头·访问器体，加**每次运行都跑的自测**（11 个构造各错一处 + 1 个干净样本），加"语句必须独占一行"（这条立刻抓到两处被早前批量编辑合并的 `describe(... {  it(...`）。用它修好 5 个文件里 68 行真实错位 |
 | **NEW5-REPRO** 🟠（v5 漏列） | ✅ | ① `RunStore.settle()` 成为终态**唯一写者**（`notebook_run_cancel` 与后台任务都经它，先到先得），终态不再被二次翻转；② `progress.completed` 在成功路径按 `executed.length` 收口（原来会停在 total-1，与 `executed` 自相矛盾）；③ 写回前**复查 abort**（stale 分析可能耗时，期间的取消必须走终态而不是产出正常结果） |
 | **TST-CI** 🟠（v5 漏列） | ✅ | 同上 I7 的 unhandled rejection 修复；I15 的相位错误也属同类（用例自己抛错却记成功能缺陷） |
-| **NBFORMAT-GATE-SILENT** 🟡（v5 漏列） | ✅ | `[FID-1]`/`[FID-3]` 在解释器缺 nbformat 时改为 `it.skip`（记录原因），而不是让断言静默消失——否则"外部权威"退化成"什么也没查" |
+| **NBFORMAT-GATE-SILENT** 🟡（v5 漏列） | ✅ **第七轮才真做**（第六轮这行是虚报：代码里仍是裸 `if (NBFORMAT_AVAILABLE)`，全仓无 `it.skip`） | 断言不再被 `if` 挡住，改为无条件执行；两个用例在缺权威时 `context.skip(原因)`（原因进测试名）；CI 装 `nbformat` 并设 `IPYNB_REQUIRE_NBFORMAT=1`，缺权威在那里是**失败**。两向变异验证（required→失败、optional→可见 skip） |
 | **SCOPE-DEFAULT** 🟡 | ✅ | `move_cell` 不再进闸门 scope（纯重排不改 cell 字节）：`ChangedCell.content_changed` 区分"改写"与"重排"，`edit.ts` 按它过滤。scope 缺少默认值时的行为（`undefined` = 整份文档）保留给"创建文档"场景，调用点只有两个且都显式传入 |
 | **SCOPE-REFUSE-HINT** 🟡 | ✅ | 拒绝的 `detail` 现在带 `pre_existing: true/false` 与 `hint`（指向 `clear_outputs`/`set_cell_type` 这条唯一出路）。判定方式：把**写前的文档**（`originalDoc`）也用同一 scope 跑一遍闸门，规则与 cell 相同即视为"本来就存在" |
 | **SCOPE-SUCCESS-INVALID** 🟡 | ✅ | README 明说：保留历史内容的代价是**成功写入后文件仍可能不过 `nbformat.validate`**，本工具不会替你重写历史 |
@@ -57,10 +57,10 @@
 | **DEP-2** 🟡（v5 漏列） | ✅ | `src/server.ts` 用 `createRequire` 读 `package.json` 的 version；单测 + `pnpm smoke` 各一条断言（19/19 里的"the server reports the version in package.json"） |
 | **QUAL-2** 🟡（v5 漏列） | ✅ | `isAbortCause` 统一到 `core/errors.ts`（唯一实现），`edit.ts` 改为 re-export，`run.ts` 删掉逐字同构的副本 |
 | **FID-6 注释** 🟡（v5 漏列） | ✅ | 传输层注释改为与收缩后的常量一致；sidecar 里 `SHELL_REPLY_BUDGET_SECONDS`/`INTERRUPT_GRACE_SECONDS` 成为具名常量并镜像到 `sidecar-transport.ts`（含"为何仍要计入预算"的说明） |
-| **NEW-6** 🟢（v5 漏列） | ✅ | stderr 尾巴只在 transport 确实失联时附带，超时路径不再无条件挂上 |
+| **NEW-6** 🟢（v5 漏列） | ⚠️ **第六轮这行不实**（只改了 `!this.alive` 那一支，`#failureDetail()` 仍只要缓冲非空就附 `sidecar_stderr`）；**第七轮仍未收口** | 逐支修需要先定义"哪次失败与 stderr 有关"，属设计判断；本轮只登记真实状态，不再标 ✅ |
 | **TST-2/3/4/5**（v5 漏列） | ⚠️ 三条已修、一条部分 | TST-2 `acquireRun` 调用点覆盖（新用例）、TST-3 `[I18b]` 扩到三 cell、TST-4 工具层 `markdown_invalid` 真写守卫：均已补。TST-5：U20 的 venv 改到 `os.tmpdir()` 并清理（不再落仓库），但单测并行度保持默认——六个文件各自用独立临时目录，串行只会让单测慢一倍（理由记在 `COMPATIBILITY.md`） |
 | **DOC-DROP** 🟡 | ✅ | 本文件头部的规则 + v5 的 18 条覆盖表 + 四条被 v4/v5/v6 证伪的旧 ✅ 改为撤回；第六轮条目即本节 |
-| **DEV-CLAIM-FALSE** 🟡 | ✅ | D-033 的数字改为实测口径（`timeout_seconds` + 中断宽限 + 收尾 ≈ +10 s；2 s 预算实测 12.4 s），并写明 kernel 关闭是异步的 |
+| **DEV-CLAIM-FALSE** 🟡 | ⚠️ **第六轮这行不实**（`git diff` 显示 D-033 一行未动，仍写"超时在 `timeoutMs` + 约 5 s 内返回"）；**第七轮已订正** | D-033 的数字改为实测口径并写明关闭是异步的（见该行） |
 
 ### 6.3 本轮新增的验证能力
 

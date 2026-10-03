@@ -241,6 +241,16 @@ describe('[step9][U27] schema-level violations raise invalid_arguments', () => {
     const readError = await callTool('notebook_read', { path: '' });
     const readBody = JSON.parse(assertSingleTextBlock(readError));
     expect(readBody['code']).toBe('invalid_arguments');
+
+    // NEW-2, resolved: an out-of-range ENUM VALUE must also be
+    // `invalid_arguments`, not the SDK's -32602 protocol error. `mode` used to be
+    // a schema `enum`, so the SDK answered before the handler ran and the model got
+    // a protocol error instead of the documented code (review v4 NEW-2).
+    const modeError = await callTool('notebook_run', { path: nb, mode: 'bogus' });
+    expect(modeError.isError).toBe(true);
+    const modeBody = JSON.parse(assertSingleTextBlock(modeError));
+    expect(modeBody['code']).toBe('invalid_arguments');
+    expect(String(modeBody['detail']['field'])).toBe('mode');
   }, 60_000);
 
   it('[ROB-5] cell_indexes is deduped and capped before rendering', async () => {
