@@ -19,7 +19,8 @@
 // Falsifiability (AGENTS §9): `--selftest` runs every rule against a mutated corpus
 // and requires each mutation to be caught. Run `node scripts/check-docs.mjs --selftest`.
 
-import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -41,17 +42,155 @@ function read(relative) {
 }
 
 /**
+ * A digest over the document's own entry ids, so the declared count is not self-certifying.
+ *
+ * The v10 rule asked the table to END at the number the header declared, which catches a lost
+ * row — unless the editor also adjusts the number. The reviewer did exactly that (delete the
+ * last row, change `entries: 54` to `53`) and both the check and the self-test stayed green,
+ * because the count and the table are the same document and nothing outside it was consulted
+ * (review v11 V11-11).
+ *
+ * This line is that outside reference: it is derived from the ids, so any edit that adds,
+ * removes or renames one changes it, and the only way to make the check pass again is to run
+ * the tool that prints the new value (`node scripts/check-docs.mjs --print-digest`) — which is
+ * a deliberate act, recorded in the diff, rather than a number adjusted in passing.
+ *
+ * It is not a security mechanism and does not pretend to be one: someone determined to hide a
+ * deletion can recompute the digest. It makes the ACCIDENT impossible, which is the class of
+ * failure the v9 splice and the v11 deletion both belong to.
+ */
+function entriesDigest(ids) {
+  return createHash('sha256').update([...ids].sort().join('\n')).digest('hex').slice(0, 16);
+}
+
+/** The digest the document declares about itself, or null when it declares none. */
+function declaredDigest(lines) {
+  for (const line of lines) {
+    const match = /^>\s*digest:\s*([0-9a-f]+)\s*$/.exec(line);
+    if (match !== null) {
+      return match[1];
+    }
+  }
+  return null;
+}
+
+/**
+ * Words that turn a status row into a CLAIM that something was changed in the code.
+ *
+ * `docs/REVIEW-FIX-STATUS.md` says of itself that "every ✅ must carry a grep-able artefact",
+ * and v11 found the rule broken for the first time since v8: a row claimed two fixes and
+ * neither existed — the ghost symbol `callWarnings` was still in `src/run.ts`, and the
+ * tautological assertion was still in `tests/unit/json-exact.test.ts` (review v11 V11-4).
+ * Discipline did not hold; a cheap mechanical check does.
+ */
+const FIX_CLAIM_WORDS = ['已订正', '已删除', '已改名', '已移除', '已重命名', 'named', 'renamed', 'removed', 'deleted'];
+
+/**
+ * A backticked token in a claimed row must EXIST somewhere in the tree.
+ *
+ * Deliberately shallow: it does not check that the artefact proves the claim, only that the
+ * thing named is real. That is enough for the failure it is aimed at — a row asserting that a
+ * symbol was renamed, while the symbol it names appears nowhere in the repository.
+ */
+function claimProblems(file, text) {
+  const problems = [];
+  const root = REPO_ROOT;
+  for (const [index, line] of text.split('\n').entries()) {
+    if (!line.startsWith('|') || !line.includes('✅')) {
+      continue;
+    }
+    if (!FIX_CLAIM_WORDS.some((word) => line.includes(word))) {
+      continue;
+    }
+    // Only the shapes that name a symbol or a path: an inline-code span, or `path:line`.
+    const tokens = [...line.matchAll(/`([^`]+)`/g)]
+      .map((match) => match[1])
+      .filter((token) => /^[\w./-]+(\.\w+)?(:\d+)?$/.test(token))
+      .filter((token) => !/^\d+$/.test(token));
+    if (tokens.length === 0) {
+      problems.push(
+        `${file}:${String(index + 1)}: a ✅ row claims a change but names no symbol or file to grep for`,
+      );
+      continue;
+    }
+    const missing = tokens.filter((token) => !exists(token));
+    if (missing.length === tokens.length) {
+      problems.push(
+        `${file}:${String(index + 1)}: a ✅ row claims a change, but none of its artefacts exist in the tree: ${missing.join(', ')}`,
+      );
+    }
+  }
+  void root;
+  return problems;
+}
+
+/**
+ * Which tree a symbol named in a status row must live in.
+ *
+ * ONLY code, and deliberately not `docs`: the row that makes the claim is itself a document, so
+ * `grepTree(docs, token)` found the token in the claim and every claim satisfied its own check.
+ * That is the "期望自我循环" shape in its purest form — the guard proving the guard — and it was
+ * caught by testing the gate against a symbol that exists nowhere (review v11 V11-4's gate).
+ */
+const CODE_DIRS = ['src', 'tests', 'scripts', 'python'];
+
+/** Whether a token from a status row can be found in the repository (path or symbol). */
+function exists(token) {
+  const [pathPart] = token.split(':');
+  // A PATH may point anywhere, docs included — the artifact is then the document itself.
+  if (existsSync(path.join(REPO_ROOT, pathPart))) {
+    return true;
+  }
+  // A bare symbol is looked for in code only.
+  if (pathPart.length < 4) {
+    return true;
+  }
+  return CODE_DIRS.some((dir) => grepTree(path.join(REPO_ROOT, dir), pathPart));
+}
+
+/** Is `needle` present in any text file under `dir`? Depth-first, with the usual exclusions. */
+function grepTree(dir, needle) {
+  if (!existsSync(dir)) {
+    return false;
+  }
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name === 'node_modules' || entry.name === '.git') {
+      continue;
+    }
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (grepTree(full, needle)) {
+        return true;
+      }
+      continue;
+    }
+    if (!/\.(ts|js|mjs|py|md|json|sh)$/.test(entry.name)) {
+      continue;
+    }
+    if (readFileSync(full, 'utf8').includes(needle)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * The entry count the document declares about itself, or null when it declares none.
  *
- * The count lives next to the thing it counts (a `entries: NN` line in the header block)
- * so that adding a row and updating the count are the same edit. A document without the
- * declaration is not failed for it — only the two rules that need it are skipped — but
- * the reviewer's two mutations (delete the last row, append one) are both caught by it,
- * which is the falsifiability the v10 review asked for.
+ * The count lives next to the thing it counts (an `entries: NN` line in the header block) so
+ * that adding a row and updating the count are the same edit. A document without the
+ * declaration is not failed for it — only the two rules that need it are skipped — but the
+ * reviewer's two mutations (delete the last row, append one) are both caught by it, which is
+ * the falsifiability the v10 review asked for.
+ *
+ * The scan is over the whole document rather than its first lines, and the pattern accepts a
+ * decorated form (`entries: 54 rows`): `declareCount` used to look at the first 12 lines with a
+ * strict regex, so a harmless rewording of the header switched the rule OFF, and a rule that is
+ * off looks exactly like a rule that passes (review v11 V11-11).
  */
 function declareCount(lines, doc) {
-  const pattern = new RegExp(`^>\\s*entries:\\s*(\\d+)\\s*$`);
-  for (const line of lines.slice(0, 12)) {
+  const pattern = /(?:^|\s)entries:\s*(\d+)/;
+  for (const line of lines.slice(0, 40)) {
     const match = pattern.exec(line);
     if (match !== null) {
       return Number(match[1]);
@@ -112,6 +251,25 @@ export function inspectDocument(doc, text) {
       `${doc.file}: the table ends at ${doc.idPrefix}${String(highest).padStart(3, '0')} but its header declares ${String(declaredTotal)} entries — a row was lost from the end, or appended without updating the count`,
     );
   }
+  // The outside reference: the ids themselves. See `entriesDigest`.
+  //
+  // A document that declares a count but NO digest is a problem, not a pass: the v11 mutation
+  // (delete the last row, decrement the count) survives the count rule alone, so removing the
+  // digest line would switch off the only rule that catches it — and a rule that is off looks
+  // exactly like a rule that passes (review v11 V11-11, second half).
+  const digest = declaredDigest(lines);
+  if (digest === null) {
+    problems.push(
+      `${doc.file}: no \`> digest:\` line, so the declared entry count cannot be cross-checked; run \`node scripts/check-docs.mjs --print-digest\` and add it`,
+    );
+  } else {
+    const actual = entriesDigest([...seen.keys()]);
+    if (actual !== digest) {
+      problems.push(
+        `${doc.file}: the declared digest ${digest} does not match the entries (${actual}) — a row was added, removed or renamed without running \`node scripts/check-docs.mjs --print-digest\``,
+      );
+    }
+  }
 
   // A row is ONE line with the table's arity. Cells are split on ` | ` rather than on
   // every `|`: the deviation text legitimately contains pipes (a regex, a `||`), and
@@ -169,6 +327,7 @@ function inspectRepository() {
     problems.push(...inspectDocument(doc, read(doc.file)));
   }
   problems.push(...inspectOpenQuestions(read('SPEC.md'), read('docs/OPEN_QUESTIONS.md')));
+  problems.push(...claimProblems('docs/REVIEW-FIX-STATUS.md', read('docs/REVIEW-FIX-STATUS.md')));
   return problems;
 }
 
@@ -240,7 +399,25 @@ function selftest() {
       expect: 'appended without updating the count',
     },
     {
-      name: 'a row lost a cell boundary (the v9 symptom at row scale)',
+      name: 'the last entry was deleted AND the count adjusted (the v11 reproduction)',
+      // The mutation the count rule alone cannot see: the table and the declared count are the
+      // same document, so they can be made to agree. The digest is what refuses.
+      text:
+        lastRow === null
+          ? null
+          : editLine(original, `| ${lastRow} |`, () => null).replace(
+              /^(>\s*entries:\s*)\d+/m,
+              (_all, prefix) => `${prefix}${String(Number(lastRow.slice(2)) - 1)}`,
+            ),
+      expect: 'does not match the entries',
+    },
+    {
+      name: 'the digest line was removed (a rule that is off must not look like a pass)',
+      text: /^> digest:.*\n/m.test(original) ? original.replace(/^> digest:.*\n/m, '') : null,
+      expect: 'no `> digest:` line',
+    },
+    {
+      name: 'a row was spliced onto the pasted copy (the v9 symptom, at row scale)',
       // Derived: turn the last cell separator into a bare pipe, so the row loses a cell
       // however its final column happens to be worded.
       text: lastRow === null ? null : editLine(original, `| ${lastRow} |`, (line) => line.replace(/ \| ([^|]*) \|$/, ' |$1|')),
@@ -337,7 +514,24 @@ function selftest() {
   );
 }
 
-if (process.argv.includes('--selftest')) {
+/**
+ * Print the digest the authority documents should declare.
+ *
+ * The deliberate path for a legitimate edit: add or remove a row, then run this and paste the
+ * value. A wrong digest is a FAILURE rather than a warning, because it means the table changed
+ * without anyone saying so — which is the shape of both the v9 splice and the v11 deletion.
+ */
+function printDigest() {
+  for (const doc of AUTHORITY_DOCS) {
+    const text = read(doc.file);
+    const ids = [...text.matchAll(doc.idPattern)].map((match) => match[1]);
+    process.stdout.write(`${doc.file}: entries: ${String(ids.length)} digest: ${entriesDigest(ids)}\n`);
+  }
+}
+
+if (process.argv.includes('--print-digest')) {
+  printDigest();
+} else if (process.argv.includes('--selftest')) {
   selftest();
 } else {
   const problems = inspectRepository();
