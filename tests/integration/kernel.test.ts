@@ -163,24 +163,54 @@ describe('[I-smoke] sidecar transport with a real kernel', () => {
   });
 
   it('interrupts a long-running cell (I5 path: interrupt -> error with KeyboardInterrupt)', async () => {
+    // Own kernel, explicitly: this case can END the session (see below), so it must not inherit one
+    // from a previous case and must not leave that expectation behind.
+    await registry.getOrCreate({
+      notebookPath,
+      interpreterPath: interpreter,
+      kernelSpecName: 'python3',
+      language: 'python',
+    });
     const result = await registry.execCell(notebookPath, {
       code: 'import time\nwhile True:\n    time.sleep(0.1)',
       silent: false,
       storeOutputs: true,
       timeoutMs: 2_500,
     });
-    // Either the interrupt lands (status error, KeyboardInterrupt) or the
-    // kernel cannot be interrupted (status timeout) — both are acceptable
-    // per SPEC §5.8; a hang would fail the test timeout.
+    // Either the interrupt lands (status error, KeyboardInterrupt) or the kernel cannot be
+    // interrupted (status timeout) — both are acceptable per SPEC §5.8; a hang would fail the test
+    // timeout.
     expect(['error', 'timeout']).toContain(result.result.status);
     if (result.result.status === 'error') {
       expect(result.result.rawOutputs[0]).toMatchObject({ ename: 'KeyboardInterrupt' });
     }
+
+    // SPEC §4.7 rule 6: "出现 timeout → 该 kernel 标记死亡并关闭". So after a cell that timed out the
+    // session is GONE, on every platform — and that is a behaviour worth asserting rather than a
+    // detail to work around, because the whole point of the rule is that a kernel which ignored an
+    // interrupt cannot be trusted to keep running the user's work.
+    //
+    // The suite used to depend on the opposite — the following case read the session left behind
+    // here — which passed only where the interrupt LANDS (Linux, status `error`, no shutdown) and
+    // broke on Windows, where the sidecar reports `timeout` and the registry closes the kernel. That
+    // is why the next case now starts its own kernel and this one says what it expects.
+    if (result.result.status === 'timeout') {
+      const after = await registry.findByNotebook(notebookPath);
+      expect(after, 'a timed-out cell must not leave a live session behind').toBeNull();
+    }
   }, 120_000);
 
   it('kernel status reports aliveness (I9 prerequisite)', async () => {
+    // Started here rather than inherited: see the comment above about §4.7 rule 6.
+    const started = await registry.getOrCreate({
+      notebookPath,
+      interpreterPath: interpreter,
+      kernelSpecName: 'python3',
+      language: 'python',
+    });
     const session = await registry.findByNotebook(notebookPath);
     expect(session).not.toBeNull();
+    expect(session!.kernelId).toBe(started.kernelId);
     expect(session!.alive).toBe(true);
   });
 

@@ -304,3 +304,53 @@ describe('[V9-5] the model is told when a value cannot be represented exactly', 
     expect(payload['warnings']).toEqual([]);
   });
 });
+
+describe('[V13-1] a large string is read in one slice, not one character at a time', () => {
+  /**
+   * The reader used to append a character per loop iteration, so a 200 kB json payload (SHAP
+   * values, a base64 plot, a dataframe) became a 200 000-link cons-string chain that V8 held and
+   * flattened. The real-usage trial measured the consequence on a 37.5 MiB notebook:
+   * `parseNotebook` retained 1198 MiB of heap — sixteen times the file, against `JSON.parse`
+   * needing one — and `notebook_run` then crossed the 2048 MiB default heap and died, taking every
+   * kernel on the server with it while the client saw only `-32000 Connection closed`.
+   *
+   * WHAT MAKES THIS GUARD DISCRIMINATE. A `expect(parsed).toBe(payload)` assertion cannot see the
+   * defect at all: the chain flattens to the right string, so a correct value and a
+   * character-at-a-time value are indistinguishable by content. Two probe assertions do the work
+   * instead, and both were verified red against the old reader:
+   *
+   *   1. TIME, with a bound two orders of magnitude above the measured cost. The old reader took
+   *      ~2.6 s for this input (and that was the cheap symptom — it also allocated hundreds of MB);
+   *      the slicing reader takes ~3 ms. A performance bound that only catches a 100-fold
+   *      regression is exactly the right shape here, because it cannot fail for machine noise while
+   *      still failing for the defect it exists to catch.
+   *   2. ALLOCATION, via `process.memoryUsage().heapUsed` around the parse. This one is a
+   *      *lower* bound on the defect rather than a threshold on the fix, so it is stated as a
+   *      ratio: the parse must not retain more than a few times the payload.
+   *
+   * The probe-run assertion is present because a timing assertion whose subject never executes is
+   * vacuously true (AGENTS §9): the payload length is checked to be what the bound assumes.
+   */
+  it('[V13-1] reads a 2 MiB payload in bounded time and without quadratic allocation', () => {
+    const payload = 'x'.repeat(2 * 1024 * 1024);
+    const text = `{"blob":${JSON.stringify(payload)}}`;
+    // The probe must be about the input we think it is: a bound stated for 2 MiB means nothing if
+    // the payload silently became 2 kB.
+    expect(payload.length).toBe(2 * 1024 * 1024);
+    expect(text.length).toBeGreaterThan(payload.length);
+
+    const before = process.memoryUsage().heapUsed;
+    const started = performance.now();
+    const parsed = parseJsonExact(text);
+    const elapsed = performance.now() - started;
+    const retained = process.memoryUsage().heapUsed - before;
+
+    expect(parsed).toEqual({ blob: payload });
+    // A correct value proves the reader works, not that it is linear; the two bounds below are what
+    // a character-at-a-time implementation fails.
+    expect(elapsed, `2 MiB took ${elapsed.toFixed(0)} ms`).toBeLessThan(1_500);
+    // `JSON.parse` retains about one copy of the payload here; the string-chain reader retained
+    // hundreds. A factor of 8 leaves room for the engine's own bookkeeping and none for a chain.
+    expect(retained, `retained ${(retained / 1024 / 1024).toFixed(1)} MiB`).toBeLessThan(payload.length * 8);
+  });
+});

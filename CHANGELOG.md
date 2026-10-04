@@ -2,6 +2,50 @@
 
 本项目的接口变更遵循 D22 兼容承诺（工具名与参数名在 1.x 内不删不改；新增参数一律可选带默认值；返回字段只增不删）。
 
+## [Unreleased] 0.1.0 — 真实使用实测整改（发布前）
+
+> 来源：`docs/review/ipynb-mcp-changejob-real-usage-trial.md`（5 个真实 ChangeJob notebook 端到端实测）。
+> **无工具名/参数名变更**，**无新增返回字段**。
+
+### Fixed — 37 MB 以上的 notebook 会让 server 进程 OOM 硬崩（🔴 实测阻塞项）
+
+37.5 MiB 的 xgboost 调参 notebook 调 `notebook_run` 时 node 进程撞上 2048 MiB 默认堆，以 `FATAL ERROR: Ineffective mark-compacts near heap limit` 退出。客户端只看到 `MCP error -32000: Connection closed` —— **没有错误码、没有可读的失败信息**，而且**该 server 名下所有 notebook 的 kernel 一起死**。实测阈值：4 / 16 / 24.7 MB 通过，32.9 / 38.4 MB 崩。
+
+根因不是"多份整文档副本"，而是**自研 JSON 解析器的 `readString` 逐字符拼接**（`result += char`）：一个 200 kB 的 json 载荷（SHAP 值、base64 图、dataframe）会变成 20 万节的 cons-string 链。实测 `parseNotebook` 单独占用 **1198 MiB 堆**，是文件的 **16 倍**，而对照的 `JSON.parse` 只需 **1 倍**。
+
+改为**整段复制**：一次 `indexOf` 找到下一个 `"` 或 `\`，无转义的整段一次 `slice` 取出；只有真正的转义序列才逐字符处理。语义一字未改（与 `JSON.parse` 逐条对照的 87 条语义矩阵全绿）。
+
+**结果：峰值 RSS 2238.9 MiB → 922.7 MiB，同一个文件从"崩"变成"完整跑完"**（真 kernel、`write_back` 正常）；在 `--max-old-space-size=768` 下也成功。
+
+### Fixed — 超时的终态码取决于平台（CI 实测）
+
+CI 的 `integration (ubuntu-latest, py 3.12)` 抓到：同一个超时 cell 在 interrupt 无效处（Windows）报 `exec_timeout`，在 interrupt **生效**处（Linux，内核抛 `KeyboardInterrupt` 后转 idle）报 **`internal`** —— 后者是"本工具内部出了无法归类的问题"的码，于是**要了 deadline 也拿到了 deadline 的调用方被告知工具坏了**。SPEC §4.7 规则 6 把 `timeout` 写进 `status` 枚举并规定它标记内核死亡，这个判定不可能取决于某个平台的 interrupt 是否落地。
+
+sidecar 现在记住"已送出超时所需的 interrupt"，收尾时无条件判定为 `timeout`。附带加固：iopub 上的 `error` 也成为 `error` 的判据（`execute_reply` 是可能不到达的第二条消息，只认它会让一个已经把 traceback 收齐的 cell 报 `ok`）。
+
+### Fixed — 守卫死于自己的输出（CI 实测）
+
+`check-connection-sweep.py` 在 CI 的 cp1252 控制台上因报告里的 `→` 抛出 `UnicodeEncodeError` —— **崩的是通过那一行**，判据恰好在无话可说时死掉。两处 Python 入口现在把 stdio 重配置为 UTF-8。
+
+sidecar 里的同族隐患更严重：`send()` 用 `ensure_ascii=False`，用户 cell 的 traceback（可含任意 Unicode）会在写入时抛异常，异常逃出 `main`，**进程连同所有 kernel 一起死**，客户端只看到 `Connection closed`。`send()` 现在在编码失败时退回 `ensure_ascii=True`。
+
+### Fixed — 测试对"超时后内核必须死亡"的隐式依赖
+
+`tests/integration/kernel.test.ts` 的 I9 用例依赖前一个 interrupt 用例**留下**的 kernel，而这只在 interrupt 生效的平台成立（Windows 报 `timeout` → 注册表按 §4.7 规则 6 关闭内核）。现在 interrupt 用例自带 kernel 并**显式断言**"超时后句柄必须消失"，I9 用例自己启动内核。
+
+### Tests
+
+- `tests/unit/json-exact.test.ts` 新增 `[V13-1]`：2 MiB 载荷的**分配探针**（阈值 8 倍）。**变异验证**：把逐字符版本写回去，只有这一条红并打印 `retained 61.4 MiB`，其余 9 条全绿。
+- 新增 `tests/integration/v12-timeout-status.test.ts`：真 kernel 断言超时 cell 的 `status === "timeout"` 且不含未执行的输出。
+- 新增测量脚本 `scripts/measure-parse.mjs`、`scripts/measure-stages.mjs`、`scripts/measure-real-notebook.mjs`（后两者可用于任何 notebook）。
+- 真实使用实测的驱动脚本入库：`scripts/trial-changejob.mjs`、`scripts/trial-scenarios.mjs`（缩进已规范化）。
+- 单测 **597**（30 文件）；集成 **74**（12 文件）。
+
+### Docs
+
+- `docs/DEVIATIONS.md`：D-059（整段读取）、D-060（超时判定与平台无关）、D-061（守卫不得死于自己的输出）。
+- `docs/review/ipynb-mcp-changejob-real-usage-trial.md` 入库（实测报告原件）。
+
 ## [Unreleased] 0.1.0 — 第十二轮代码复核整改（发布前最后一轮）
 
 > 来源：`docs/review/ipynb-mcp-code-review-v12.md`（评级 **C**：1 条 🔴 + 2 条 🟠）。

@@ -520,28 +520,34 @@ class Reader {
 
   private readString(): string {
     this.index += 1; // opening quote
-    let result = '';
+    let result: string | null = null;
     for (;;) {
       if (this.atEnd()) {
         throw new SyntaxError('Unterminated string in JSON');
       }
-      const char = this.text[this.index]!;
-      this.index += 1;
-      if (char === '"') {
-        return result;
+      // BULK COPY, and this is not an optimisation detail — it is the difference between reading a
+      // notebook and running out of memory. The character-at-a-time version appended one character
+      // per iteration, so a 200 kB json payload (SHAP values, a base64 plot, a dataframe) became a
+      // 200 000-link cons-string chain that V8 held and flattened. Measured on the trial's 37.5 MiB
+      // notebook: `parseNotebook` retained 1198 MiB of heap — sixteen times the file, against
+      // `JSON.parse` needing one — and `notebook_run` then crossed the 2048 MiB default heap and
+      // died, taking every kernel on the server with it while the client saw only
+      // `-32000 Connection closed` (review: real-usage trial).
+      //
+      // So the run up to the next `"` or `\` is copied in ONE `slice`, and per-character work is
+      // left only where the format requires it: an escape sequence, which is the rare case in a
+      // notebook. `tests/unit/json-exact.test.ts` [V13-1] holds this down with an allocation probe
+      // that fails against the character-at-a-time reader.
+      const quote = this.text.indexOf('"', this.index);
+      if (quote < 0) {
+        throw new SyntaxError('Unterminated string in JSON');
       }
-      if (char !== '\\') {
-        // RFC 8259: an unescaped control character is not allowed in a string, and both
-        // authorities agree — `JSON.parse` says "Bad control character in string literal",
-        // Python's `json.loads` says "Invalid control character". Accepting them was worse
-        // than lenient: the next write ESCAPES the character, so an invalid file became
-        // valid and the user's bytes changed, silently (review v11 V11-8①).
-        if (char.charCodeAt(0) < 0x20) {
-          throw new SyntaxError('Bad control character in string literal in JSON');
-        }
-        result += char;
-        continue;
+      const backslash = this.text.indexOf('\\', this.index);
+      if (backslash < 0 || quote < backslash) {
+        // No escape before the closing quote: the remainder is one slice.
+        return this.appendChecked(result, this.text.slice(this.index, quote), quote + 1);
       }
+      result = this.appendChecked(result, this.text.slice(this.index, backslash), backslash + 1);
       const escape = this.text[this.index]!;
       this.index += 1;
       switch (escape) {
@@ -582,6 +588,29 @@ class Reader {
           throw new SyntaxError(`Invalid escape in JSON: \\${escape}`);
       }
     }
+  }
+
+  /**
+   * Append a bulk-copied run, rejecting raw control characters, and advance past the delimiter.
+   *
+   * RFC 8259 forbids an unescaped control character in a string, and both authorities agree —
+   * `JSON.parse` says "Bad control character in string literal", Python's `json.loads` says "Invalid
+   * control character". Accepting them was worse than lenient: the next write ESCAPES the character,
+   * so an invalid file became valid and the user's bytes changed, silently (review v11 V11-8①).
+   *
+   * The check belongs HERE and not on the escape path: the rule forbids RAW control characters,
+   * while an escape may denote one — `JSON.parse('"nul\\u0000here"')` yields a NUL, and the escaped
+   * form is the only legal way to write it. An earlier version of this fix also rejected `\u0000`
+   * and broke that case, which the existing semantics test caught.
+   */
+  private appendChecked(result: string | null, chunk: string, nextIndex: number): string {
+    for (let offset = 0; offset < chunk.length; offset += 1) {
+      if (chunk.charCodeAt(offset) < 0x20) {
+        throw new SyntaxError('Bad control character in string literal in JSON');
+      }
+    }
+    this.index = nextIndex;
+    return result === null ? chunk : result + chunk;
   }
 
   private readLiteral<T>(word: string, value: T): T {
