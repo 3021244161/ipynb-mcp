@@ -80,6 +80,28 @@ interface Rendered {
   readonly payload: Record<string, unknown>;
 }
 
+/** A notebook with one broken image per cell, so the warnings must be attributable. */
+function notebookWithBrokenImagePerCell(cellCount: number): string {
+  return JSON.stringify({
+    nbformat: 4,
+    nbformat_minor: 5,
+    metadata: {
+      kernelspec: { name: 'python3', display_name: 'Python 3' },
+      language_info: { name: 'python' },
+    },
+    cells: Array.from({ length: cellCount }, (_, index) => ({
+      cell_type: 'code',
+      id: `c${String(index)}`,
+      metadata: {},
+      source: 'display_img()',
+      execution_count: index + 1,
+      // `'not base64!'` fails the decode in every cell, so the ONLY thing that can tell the
+      // warnings apart is the cell index (review v11 V11-10).
+      outputs: [{ output_type: 'display_data', data: { 'image/png': 'not base64!' }, metadata: {} }],
+    })),
+  });
+}
+
 async function readFull(json: string): Promise<Rendered> {
   const notebook = parseNotebook(new TextEncoder().encode(json), hasher);
   const rendered = await renderReadResult({
@@ -291,6 +313,28 @@ describe('[V9-3] one unservable block must not fail the whole call', () => {
     const result = toCallToolResult({ payload, imageBlocks: [{ data: PNG_B64, media_type: 'image/png' }] });
     expect(imageBlocksOf(result.content)).toHaveLength(1);
     expect((result.content[0] as { text: string }).text).toBe(JSON.stringify(payload));
+  });
+});
+
+describe('[V11-10] an image failure names its cell, so dedup cannot lose attribution', () => {
+  it('[V11-10] three broken images produce three messages that say WHICH cells', async () => {
+    // The message used to carry only the output index, and every cell's outputs start at 0, so
+    // all three cells produced the byte-identical line "failed to decode image at output 0".
+    // The read path then printed it three times and the run path deduplicated it to one: the
+    // first is unusable, the second discards the answer (review v11 V11-10, measured).
+    const rendered = await readFull(notebookWithBrokenImagePerCell(3));
+    const warnings = (rendered.payload['warnings'] ?? []) as Array<{ code: string; message: string }>;
+    const failures = warnings.filter((warning) => warning.code === 'image_materialize_failed');
+    expect(failures).toHaveLength(3);
+    const messages = failures.map((warning) => warning.message);
+    expect(new Set(messages).size, `messages were not distinct: ${JSON.stringify(messages)}`).toBe(3);
+    for (const [index, message] of messages.entries()) {
+      expect(message, 'the cell index is what identifies it').toContain(`cell ${String(index)}`);
+      expect(message).toContain('artifact_path and image_index stay null');
+    }
+    // Exactly the shape the dropped-mime warning already had: `cell N (output M)`.
+    expect(messages[0]).toContain('cell 0 (output 0)');
+    expect(messages[2]).toContain('cell 2 (output 0)');
   });
 });
 

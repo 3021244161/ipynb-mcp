@@ -5,7 +5,13 @@
 
 import { createWarning, type Warning } from '../../core/errors.js';
 import { mapRawOutputs, rawOutputsOfCell, collectOutputWarnings, type OutputItem } from '../../core/outputs.js';
-import { cellSource, hasStableCellIds, readNotebookMetadata, type NotebookFile } from '../../core/parse.js';
+import {
+  cellSource,
+  executionCountForDisplay,
+  hasStableCellIds,
+  readNotebookMetadata,
+  type NotebookFile,
+} from '../../core/parse.js';
 import { applyImagePolicy, shouldReturnImages, type ImagesPolicy } from '../../fs/artifact.js';
 
 const SUMMARY_PREVIEW_CHARS = 160;
@@ -65,7 +71,10 @@ export async function renderReadResult(input: RenderReadInput): Promise<RenderRe
       cell_index: index,
       cell_id: cell.id ?? null,
       cell_type: cell.cell_type,
-      execution_count: cell.cell_type === 'code' ? (cell.execution_count ?? null) : null,
+      // `executionCountForDisplay`, not the field itself: a count written as
+      // `9007199254740993` is held as an exact-number marker internally, and handing the
+      // marker to the model publishes a structure that exists nowhere (review v11 V11-6).
+      execution_count: cell.cell_type === 'code' ? executionCountForDisplay(cell) : null,
       source_preview: lines.slice(0, sourcePreviewCount),
       source_line_count: lines.length,
       source_truncated: sourceTruncated,
@@ -85,6 +94,9 @@ export async function renderReadResult(input: RenderReadInput): Promise<RenderRe
         inlineTextChars: input.inlineTextChars,
         maxImageBytes: input.maxImageBytes,
         hasher: input.hasher,
+        // So an image failure can name the cell, which is what makes the per-cell warnings
+        // distinguishable instead of three identical lines (review v11 V11-10).
+        cellIndex: index,
       });
       const returnImages = shouldReturnImages(input.imagesPolicy, input.includeOutputs === 'full');
       // applyImagePolicy treats maxImages as an ABSOLUTE call-wide cap and
@@ -131,15 +143,29 @@ export async function renderReadResult(input: RenderReadInput): Promise<RenderRe
 
       cellPayload['outputs_summary'] = input.includeOutputs === 'summary' ? summarizeOutputs(mapped.items) : null;
       cellPayload['outputs'] = input.includeOutputs === 'full' ? mapped.items : null;
-      if (input.includeOutputs === 'full') {
-        // Per-output problems ride on the item; `warnings[]` is what a client
-        // reads, so they are lifted here as well (review v9 V9-5). Neither is a
-        // failure: nothing was dropped and the file still holds the value.
+      if (mapped.items.length > 0) {
+        // Per-output problems are lifted into the CALL-level `warnings[]`, which is the
+        // field a client reads.
+        //
+        // This used to run only for `full`, and that was a silent-rounding bug on the
+        // DEFAULT path (review v11 V11-5): `mapRawOutputs` had already projected
+        // `9007199254740993` to `…992` and `1e400` to `null`, and `summary` — the default,
+        // the token-cheapest, the one SPEC §4.3 recommends — showed those values in its
+        // preview with `warnings: []`. The model reads `…992`, the file says `…993`, and
+        // nothing anywhere says so: SPEC §5.4's "no silent truncation" applies to the summary
+        // preview exactly as much as to a full output.
+        //
+        // The `include_outputs: "none"` branch above returns before this point, on purpose:
+        // that caller asked not to see the outputs at all, so there is nothing to qualify.
+        // (Measured before the fix: default 0 warnings, summary 0, full 3, none 0 — the first
+        // two were the bug.)
         for (const lifted of collectOutputWarnings([{ outputs: mapped.items }])) {
           if (!warnings.some((warning) => warning.message === lifted.message)) {
             warnings.push(createWarning(lifted.code, lifted.message));
           }
         }
+      }
+      if (input.includeOutputs === 'full') {
         if (mapped.items.some((item) => item.kind === 'stream' && item.truncated)) {
           if (!warnings.some((warning) => warning.code === 'output_truncated')) {
             warnings.push(createWarning(

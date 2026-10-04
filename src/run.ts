@@ -367,7 +367,7 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
   const executedCellsSet = new Set<number>();
   // Mime values dropped because nbformat cannot store them, collected across the
   // whole call so ONE warning can report this, any truncation, and any value the
-  // JSON channel cannot carry exactly — see `callWarnings` below. Each entry keeps
+  // JSON channel cannot carry exactly — see `pushCallWarnings` below. Each entry keeps
   // the cell it came from.
   const droppedMimes: DroppedMime[] = [];
   // Guards the failure-path write-back against running twice for one run.
@@ -509,6 +509,10 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
             inlineTextChars: deps.config.inlineTextChars,
             maxImageBytes: deps.config.maxImageBytes,
             hasher: deps.hasher,
+            // The cell index, so a failure message names it: without this every cell's broken
+          // image produced the same string, and the run path's dedup collapsed them into one
+          // (review v11 V11-10).
+          cellIndex: index,
           });
           // Materialize images for run results (auto policy: always for runs).
         const returnImages = shouldReturnImages(deps.imagesPolicy, true);

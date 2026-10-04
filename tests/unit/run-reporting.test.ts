@@ -271,6 +271,36 @@ describe('[V7-2][V8-10] output_truncated is emitted once, and carries both facts
     expect(short).toContain(`application/x-bogus-${String(DROPPED_MIME_DETAIL_LIMIT - 1)}`);
   });
 
+  it('[V11-7] one long mime name cannot size the message either', () => {
+    // V10-9 capped the number of ENTRIES, and the reviewer showed that is not a cap on the
+    // message: a single 20 000 character mime name produced a 20 176 character warning, and
+    // the growth was linear in the name. The invariant has to be about the message.
+    const longName = `application/x-${'b'.repeat(20_000)}`;
+    const warning = outputTruncatedWarning([{ cellIndex: 0, mime: longName }], 0);
+    expect(warning).not.toBeNull();
+    const message = warning!.message;
+    expect(message.length, `message was ${String(message.length)} characters`).toBeLessThan(400);
+    expect(message).toContain('application/x-');
+    // The cut is visible, so a shortened name is not read as the real one.
+    expect(message).toContain('…');
+    // …and a name that fits is left exactly as it was.
+    const short = outputTruncatedWarning([{ cellIndex: 2, mime: 'application/vnd.plotly.v1+json' }], 0)!;
+    expect(short.message).toContain('application/vnd.plotly.v1+json');
+    expect(short.message).not.toContain('…');
+  });
+
+  it('[V11-7] the bound holds for the worst combination of the two limits', () => {
+    // Eight maximum-length names is the largest message the entry cap allows, so this is the
+    // number the invariant is really about: 8 × (64 + a cell label) + framing, under 1 KB.
+    const dropped = Array.from({ length: DROPPED_MIME_DETAIL_LIMIT }, (_, index) => ({
+      cellIndex: index,
+      mime: `application/x-${String(index)}-${'z'.repeat(500)}`,
+    }));
+    const message = outputTruncatedWarning(dropped, 0)!.message;
+    expect(message.length).toBeLessThan(1000);
+    expect(message).toContain(`dropped ${String(DROPPED_MIME_DETAIL_LIMIT)}`);
+  });
+
   it('is silent when nothing was lost — the case a blanket push would break', () => {
     // Without this, `outputTruncatedWarning` could return a warning unconditionally
     // and every case above would still pass.

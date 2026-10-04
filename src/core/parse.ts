@@ -4,7 +4,7 @@
 // array stays array) byte-for-byte after a round trip.
 
 import { IpynbError, type JsonValue } from './errors.js';
-import { parseJsonExact, stringifyJsonExact } from './json-exact.js';
+import { isExactNumber, parseJsonExact, plainNumber, stringifyJsonExact } from './json-exact.js';
 
 export interface Hasher {
   sha256Hex(input: string | Uint8Array): string;
@@ -51,8 +51,13 @@ export function parseNotebook(rawBytes: Uint8Array, hasher: Hasher): NotebookFil
     // builds the same tree for every other value (see core/json-exact.ts).
     doc = parseJsonExact(new TextDecoder().decode(rawBytes));
   } catch (cause) {
-    throw new IpynbError('parse_failed', 'notebook file is not valid JSON', {
-      cause: String(cause),
+    // The message must describe the CAUSE, because "not valid JSON" is a claim about the
+    // authority and it was false in two ways (review v11 V11-8): a document too deeply nested
+    // for our reader is valid JSON that this tool cannot read, and saying otherwise sends the
+    // caller looking for a syntax error that is not there.
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    throw new IpynbError('parse_failed', 'notebook file could not be parsed as JSON', {
+      cause: detail,
     });
   }
   if (!isPlainObject(doc)) {
@@ -82,6 +87,10 @@ export function parseNotebook(rawBytes: Uint8Array, hasher: Hasher): NotebookFil
         cell_type: String(cellType),
       });
     }
+    // Remember the FILE's spelling of the count before the view normalizes it (v11 V11-6):
+    // the model needs a number, the `execution_count` rule needs the form, and the write
+    // needs neither touched. See `RAW_EXECUTION_COUNT`.
+    normalizeExecutionCount(cell as unknown as NotebookCell);
   }
   return {
     doc: doc as unknown as NotebookDoc,
@@ -122,6 +131,154 @@ export function cellSourceHash(cell: NotebookCell, hasher: Hasher): string {
   return `sha256:${hasher.sha256Hex(cellSource(cell))}`;
 }
 
+/**
+ * The cell's execution count as the MODEL should see it: a number or null, never a marker.
+ *
+ * `execution_count` reaches a response through a different route than a json output value
+ * (`render/read.ts` copies the field straight out of the document), so the recursive
+ * projection that protects `application/json` did not cover it and the internal marker was
+ * published verbatim — `{"__ipynb_exact_number__": "9007199254740993"}`, a structure that
+ * exists nowhere in the file and is documented nowhere (review v11 V11-6).
+ *
+ * The count is normalized ONCE, where the file is read (`parseNotebook`), rather than at
+ * each exit: a response and a refusal detail that disagreed about the same cell would be a
+ * worse bug than the one being fixed. Non-marker values (a string, a boolean, `null`) are
+ * left exactly as the file had them, so the rules can still report them.
+ */
+export function cellExecutionCount(cell: NotebookCell): unknown {
+  return cell.execution_count;
+}
+
+/**
+ * The count as the FILE spells it, kept on the cell out of the serializer's way.
+ *
+ * The normalization above is lossy in the one case the `execution_count` rule is about: `3.0`
+ * and `3` both become the double `3`, so a rule reading the normalized field could no longer
+ * tell that nbformat rejects the first spelling ("3.0 is not of type 'integer', 'null'").
+ * This property keeps the literal, and it is NON-ENUMERABLE, so `stringifyJsonExact` never
+ * sees it and the write still emits exactly what the file held (review v11 V11-6).
+ */
+const RAW_EXECUTION_COUNT = '__ipynb_raw_execution_count__';
+
+/** The file's literal spelling of the count, when it was not already a plain integer. */
+const RAW_EXECUTION_LITERAL = '__ipynb_raw_execution_literal__';
+
+/**
+ * Normalize the count for the model, remembering the file's spelling for the rule.
+ *
+ * Called from `parseNotebook`, so both exits — `render/read.ts` and
+ * `findStructuralProblem` — read the same value. The raw literal is stored as a
+ * non-enumerable property rather than in a side table because it has to survive on the very
+ * object the rule is handed (`structuredClone` is not in this path; see the marker's own
+ * note in `json-exact.ts` for why that matters elsewhere).
+ */
+function normalizeExecutionCount(cell: NotebookCell): void {
+  const raw: unknown = cell.execution_count;
+  const flattened = plainNumber(raw);
+  if (flattened === null) {
+    return;
+  }
+  // Both facts have to survive on this one field, so it becomes an accessor with a hidden
+  // backing value:
+  //   - a READER (the response, the rule, `executionCountForDisplay`) gets `flattened`, the
+  //     number the file means;
+  //   - the write path gets the marker back from the hidden value (see
+  //     `restoreExecutionCountMarkers`), because a plain `Object.entries` walk — which is
+  //     what the serializer does — sees only what the getter returns.
+  // Overwriting the field with the number instead — the first attempt — silently rounded
+  // `9007199254740993` to `…992` on the next write, which is the very defect this module
+  // exists to prevent, so the accessor is worth its cost.
+  Object.defineProperty(cell, RAW_EXECUTION_COUNT, {
+    value: raw,
+    enumerable: false,
+    writable: true,
+    configurable: true,
+  });
+  // The SPELLING, for the one rule that is about the form rather than the value: nbformat
+  // rejects `3.0` and accepts `3`, and after flattening the two are the same number.
+  if (isExactNumber(raw)) {
+    Object.defineProperty(cell, RAW_EXECUTION_LITERAL, {
+      value: raw.__ipynb_exact_number__,
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
+  }
+  Object.defineProperty(cell, 'execution_count', {
+    get: () => flattened,
+    set: (next: unknown) => {
+      // A caller that assigns a new count replaces the file's spelling too; keeping the old
+      // literal would make the rule judge a value that is no longer there.
+      delete (cell as unknown as Record<PropertyKey, unknown>)[RAW_EXECUTION_LITERAL];
+      Object.defineProperty(cell, RAW_EXECUTION_COUNT, {
+        value: next,
+        enumerable: false,
+        writable: true,
+        configurable: true,
+      });
+    },
+    enumerable: true,
+    configurable: true,
+  });
+}
+
+/** The count as a NUMBER the rules can compare, or null when the file had no number there. */
+function rawExecutionCount(cell: NotebookCell): number | null {
+  const record = cell as unknown as Record<PropertyKey, unknown>;
+  const remembered = record[RAW_EXECUTION_COUNT];
+  if (typeof remembered === 'number') {
+    return remembered;
+  }
+  const flattened = plainNumber(remembered);
+  if (flattened !== null) {
+    return flattened;
+  }
+  return typeof cell.execution_count === 'number' ? cell.execution_count : null;
+}
+
+/** The literal the file used for the count, when it is still known (for the rule's form). */
+function rawExecutionLiteral(cell: NotebookCell): string | null {
+  const record = cell as unknown as Record<PropertyKey, unknown>;
+  const original = record[RAW_EXECUTION_LITERAL];
+  return typeof original === 'string' ? original : null;
+}
+
+/** The execution count as it should appear in a response (`number | null`). */
+export function executionCountForDisplay(cell: NotebookCell): number | null {
+  const value = cellExecutionCount(cell);
+  return typeof value === 'number' ? value : null;
+}
+
+/**
+ * Put the count markers back before the tree is written.
+ *
+ * The count is an accessor whose getter returns the flattened number, so a plain
+ * `Object.entries` walk — which is what `stringifyJsonExact` does — sees the number and would
+ * write `9007199254740992` where the file said `…993`. The hidden backing value is the only
+ * place the marker still exists, so the write path re-attaches it.
+ *
+ * The alternative — making the getter return the marker and projecting at every exit — was
+ * rejected because the exits are plural (`render/read.ts`, `detail.problem`, anything added
+ * later) and one missed exit publishes a structure that exists nowhere, which is exactly the
+ * v11 V11-6 defect. There is one writer and there are many readers, so the reader-facing
+ * value is the normalized one and the writer converts.
+ */
+function restoreExecutionCountMarkers(notebook: NotebookFile): void {
+  for (const cell of notebook.cells) {
+    const record = cell as unknown as Record<PropertyKey, unknown>;
+    const hidden = record[RAW_EXECUTION_COUNT];
+    if (!isExactNumber(hidden)) {
+      continue;
+    }
+    Object.defineProperty(cell, 'execution_count', {
+      value: hidden,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+  }
+}
+
 /** Serialize with Jupyter's 1-space indent and trailing newline (SPEC §5.5.4). */
 export function serializeNotebook(notebook: NotebookFile): string {
   // SPEC §5.5.6: code cells without execution_count get null on write.
@@ -130,6 +287,7 @@ export function serializeNotebook(notebook: NotebookFile): string {
       cell.execution_count = null;
     }
   }
+  restoreExecutionCountMarkers(notebook);
   // The exact serializer, paired with `parseJsonExact` above: a number this file
   // holds as text goes back out as the same text. SPEC §5.5.7's fidelity claim
   // ("logically unchanged", not "minimal diff") is about escaping and formatting;
@@ -197,6 +355,19 @@ export interface SelfCheckScope {
  * limited to cells this write is responsible for, and pre-existing problems are
  * reported as a warning instead (see `structuralWarning`).
  */
+function requireParsed(serialized: string, hasher: Hasher): NotebookFile {
+  try {
+    return parseNotebook(new TextEncoder().encode(serialized), hasher);
+  } catch (cause) {
+    if (cause instanceof IpynbError && cause.code === 'nbformat_unsupported') {
+      throw new IpynbError('selfcheck_failed', 'serialized notebook failed self check', { cause: cause.code });
+    }
+    throw new IpynbError('selfcheck_failed', 'serialized notebook failed self check', {
+      cause: cause instanceof Error ? cause.message : String(cause),
+    });
+  }
+}
+
 export function selfCheckNotebook(
   serialized: string,
   hasher: Hasher,
@@ -294,6 +465,13 @@ function escapeHatchFor(problem: Record<string, JsonValue>): string {
   if (rule === 'execution_count_negative') {
     return 'clear_outputs does not change the count itself, but this tool stops checking a cell that has no outputs, so the edit is accepted; the count stays in the file and nbformat.validate still rejects it until the count is gone, which set_cell_type to markdown does by removing it';
   }
+  if (rule === 'execution_count_not_an_integer') {
+    // `1.5` is what reaches here: nbformat wants `"type": ["integer", "null"]`. Note what is
+    // NOT here — a claim that the file was already broken, or a complaint about `3.0`, which
+    // nbformat parses as the integer 3. The v10 wording covered both rules at once and was
+    // therefore accurate about neither (review v11 V11-6).
+    return 'nbformat requires a whole number of executions here; clear_outputs stops this tool checking the cell, and set_cell_type to markdown removes the count entirely';
+  }
   if (rule === 'non_code_cell_has_execution_count') {
     // `clear_outputs` is refused here ("requires a code cell"), so recommending it —
     // which is what the shared message did — sent the model into `invalid_ops`.
@@ -307,19 +485,6 @@ function escapeHatchFor(problem: Record<string, JsonValue>): string {
 
 /** The fixed prefix {@link structuralWarning} puts on its message (D-041). */
 export const PREEXISTING_CONTENT_PREFIX = 'pre-existing-content: ';
-
-function requireParsed(serialized: string, hasher: Hasher): NotebookFile {
-  try {
-    return parseNotebook(new TextEncoder().encode(serialized), hasher);
-  } catch (cause) {
-    if (cause instanceof IpynbError && cause.code === 'nbformat_unsupported') {
-      throw new IpynbError('selfcheck_failed', 'serialized notebook failed self check', { cause: cause.code });
-    }
-    throw new IpynbError('selfcheck_failed', 'serialized notebook failed self check', {
-      cause: String(cause),
-    });
-  }
-}
 
 /**
  * The nbformat minor version whose schema this project implements (4.5). Above
@@ -409,16 +574,28 @@ export function findStructuralProblem(
     // the count rule's hint is the one that gets them unstuck.
     const outputsWereCleared =
       clearedOutputCellIndexes !== undefined && clearedOutputCellIndexes.has(index);
-    const count = cell.execution_count;
+    const count = rawExecutionCount(cell);
+    const literal = rawExecutionLiteral(cell);
     const noOutputsToCount = cell.outputs === undefined || (Array.isArray(cell.outputs) && cell.outputs.length === 0);
-    if (
-      !outputsWereCleared &&
-      !noOutputsToCount &&
-      count !== undefined &&
-      count !== null &&
-      (!Number.isInteger(count) || count < 0)
-    ) {
-      return { cell_index: index, rule: 'execution_count_negative', execution_count: count };
+    // "Is this a whole number" is asked of the VALUE, which is what nbformat judges: the
+    // schema says `"type": ["integer", "null"]` and `"minimum": 0`, so a count of
+    // `9007199254740993` is VALID (Python integers have no 2^53 ceiling) while `-1` and `1.5`
+    // are not. The v10 rule asked `Number.isInteger` of the value and was right about the
+    // value; what v11 caught (V11-6) was that the value it was handed had already been
+    // flattened from a marker, so it could not tell the big integer from a different number —
+    // and the refusal it produced described a legal file as a pre-existing violation.
+    const integerForm = count !== null && Number.isInteger(count);
+    const negative = count !== null && (count < 0 || Object.is(count, -0));
+    if (!outputsWereCleared && !noOutputsToCount && count !== null && (!integerForm || negative)) {
+      // TWO rules, split by v11 (V11-6), because "the count is not a whole number" and "the
+      // count is negative" have different causes and different escape hatches — and because
+      // one message covering both could only be accurate about one of them.
+      return {
+        cell_index: index,
+        rule: integerForm ? 'execution_count_negative' : 'execution_count_not_an_integer',
+        execution_count: count,
+        ...(literal === null ? {} : { execution_count_literal: literal }),
+      };
     }
     const outputs = cell.outputs;
     if (outputs === undefined) {

@@ -57,6 +57,21 @@ export interface ApplyPolicyResult {
  * image_limit / image_materialize_failed warnings. Items are mutated in place
  * on the image fields; decodeFailed images never materialize.
  */
+/**
+ * A materialize failure that NAMES the cell, so callers can be told apart after dedup.
+ *
+ * The message used to carry only the output index, and every cell's outputs start at 0 — so
+ * three cells each holding a broken image produced three identical strings: the read path
+ * printed the same line three times with no way to tell where they came from, and the run path
+ * deduplicated them to one, discarding exactly the "which cells" information the model needs
+ * (review v11 V11-10). The cell is part of the message now, which makes both behaviours
+ * correct: identical messages mean identical facts, and distinct facts stay distinct.
+ */
+function imageFailureMessage(image: ExtractedImage, reason: string): string {
+  const where = image.cellIndex === null ? `output ${String(image.outputIndex)}` : `cell ${String(image.cellIndex)} (output ${String(image.outputIndex)})`;
+  return `image at ${where} ${reason}; artifact_path and image_index stay null`;
+}
+
 export async function applyImagePolicy(
   items: OutputItem[],
   extractedImages: readonly ExtractedImage[],
@@ -87,7 +102,7 @@ export async function applyImagePolicy(
     if (image.decodeFailed) {
       warnings.push(createWarning(
         'image_materialize_failed',
-        `failed to decode image at output ${image.outputIndex}; artifact_path and image_index stay null`,
+        imageFailureMessage(image, 'failed to decode'),
       ));
       continue;
     }
@@ -99,7 +114,7 @@ export async function applyImagePolicy(
     if (base64 === null) {
       warnings.push(createWarning(
         'image_materialize_failed',
-        `image at output ${image.outputIndex} has no returnable base64 payload; artifact_path and image_index stay null`,
+        imageFailureMessage(image, 'has no returnable base64 payload'),
       ));
       continue;
     }

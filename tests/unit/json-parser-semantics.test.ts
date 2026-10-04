@@ -22,7 +22,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { isExactNumber, parseJsonExact, stringifyJsonExact } from '../../src/core/json-exact.js';
+import { MAX_JSON_DEPTH, isExactNumber, parseJsonExact, stringifyJsonExact } from '../../src/core/json-exact.js';
 
 /**
  * Structural equality that also distinguishes `-0` from `0`.
@@ -154,6 +154,71 @@ const SEMANTIC_CASES: readonly Case[] = [
   { name: 'escaped delimiters inside strings', text: '{"a":"{]},\\":\\""}' },
   { name: 'whitespace around every token', text: ' \t\r\n{ "a" : [ 1 , 2 ] , "b" : { } } \n' },
 ];
+
+describe('[V11-8] the parser boundaries: stricter where the format is strict, and honest about its own limits', () => {
+  it('[V11-8] an unescaped control character is rejected, exactly as JSON.parse rejects it', () => {
+    // RFC 8259 forbids raw control characters in a string. This reader accepted them, and the
+    // consequence was not leniency: the next write ESCAPED the character, so an invalid file
+    // became valid and the user's bytes changed, silently (review v11 V11-8①).
+    const samples = [
+      '"tab\there"',
+      '"nul\u0000here"',
+      '"lf\nhere"',
+      '"cr\rhere"',
+      '"unit\u001fhere"',
+      '{"key\twith\tabs":1}',
+    ];
+    for (const sample of samples) {
+      expect(() => JSON.parse(sample), `JSON.parse must reject ${JSON.stringify(sample)}`).toThrow();
+      expect(() => parseJsonExact(sample), `we must reject ${JSON.stringify(sample)}`).toThrow(SyntaxError);
+    }
+    // The ESCAPED forms are still accepted, and still mean the control character.
+    expect(parseJsonExact('"tab\\there"')).toBe('tab\there');
+    expect(parseJsonExact('"nul\\u0000here"')).toBe('nul\u0000here');
+  });
+
+  it('[V11-8] nesting past the limit is a SyntaxError naming the limit, not a stack overflow', () => {
+    // A 12 000-deep array used to exhaust the stack and surface as `parse_failed` / "not valid
+    // JSON" — a false statement about the document that also made a legal file unreadable
+    // (review v11 V11-8②). The limit is ours, so the message says so.
+    const within = `${'['.repeat(MAX_JSON_DEPTH - 1)}1${']'.repeat(MAX_JSON_DEPTH - 1)}`;
+    expect(() => parseJsonExact(within), 'the limit is inclusive').not.toThrow();
+
+    const beyond = `${'['.repeat(MAX_JSON_DEPTH)}1${']'.repeat(MAX_JSON_DEPTH)}`;
+    let raised: unknown = null;
+    try {
+      parseJsonExact(beyond);
+    } catch (cause) {
+      raised = cause;
+    }
+    expect(raised, 'deeper than the limit must throw').toBeInstanceOf(SyntaxError);
+    expect(String((raised as Error).message)).toContain(String(MAX_JSON_DEPTH));
+    // …and it is NOT a stack overflow, which is what an unbounded reader produced.
+    expect(raised).not.toBeInstanceOf(RangeError);
+
+    // The same input through the built-in parser is fine, which is why "not valid JSON" was
+    // the wrong thing to tell the caller.
+    expect(() => JSON.parse(beyond)).not.toThrow();
+  });
+
+  it('[V11-8] an array hole serializes as null, never as invalid JSON', () => {
+    // The parser cannot create a hole, but `stringifyJsonExact` is a public serializer and
+    // `map` + `join` wrote `[1,,3]` — bytes no JSON reader accepts (review v11 V11-8③).
+    const holey: unknown[] = [1];
+    holey[2] = 3;
+    expect(JSON.stringify(holey)).toBe('[1,null,3]');
+    expect(stringifyJsonExact(holey)).toBe('[1,null,3]');
+    expect(stringifyJsonExact(holey, 1)).toBe(JSON.stringify(holey, null, 1));
+
+    const empty: string[] = [];
+    empty.length = 3;
+    expect(stringifyJsonExact(empty)).toBe(JSON.stringify(empty));
+    // Every rendering of a hole is valid JSON, which is the property that matters.
+    for (const text of [stringifyJsonExact(holey), stringifyJsonExact(holey, 1), stringifyJsonExact(empty)]) {
+      expect(() => JSON.parse(text), text).not.toThrow();
+    }
+  });
+});
 
 describe('[V10-6] the hand-written parser matches JSON.parse on JavaScript-semantics edges', () => {
   for (const testCase of SEMANTIC_CASES) {

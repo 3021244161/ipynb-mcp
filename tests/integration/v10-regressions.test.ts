@@ -281,6 +281,68 @@ describe('[V10-6] a __proto__ key in a notebook survives read, edit and validati
   });
 });
 
+describe('[V11-6] a count in any legal spelling stays a number the model can use', () => {
+  /** A cell whose count is legal for nbformat but not a plain JS-safe integer. */
+  const COUNT_NOTEBOOK = (literal: string, withOutputs: boolean): string =>
+    `{\n "cells": [\n  {\n   "cell_type": "code",\n   "execution_count": ${literal},\n   "id": "c0",\n   "metadata": {},\n   "outputs": [${withOutputs ? '\n    {\n     "name": "stdout",\n     "output_type": "stream",\n     "text": "x\\n"\n    }\n   ' : ''}],\n   "source": [\n    "x = 1"\n   ]\n  }\n ],\n "metadata": {\n  "kernelspec": {\n   "display_name": "Python 3",\n   "language": "python",\n   "name": "python3"\n  },\n  "language_info": {\n   "name": "python"\n  }\n },\n "nbformat": 4,\n "nbformat_minor": 5\n}\n`;
+
+  it('[V11-6] a huge count is returned as a number, not as our internal marker', async () => {
+    const target = path.join(workspace, 'big-count.ipynb');
+    await writeFile(target, COUNT_NOTEBOOK('9007199254740993', true), 'utf8');
+    // The authority: this file is VALID nbformat (verified against nbformat 5.10 while
+    // writing this case — Python integers have no 2^53 ceiling).
+    const skip = nbformatSkipReason(resolvedTestInterpreter());
+    if (skip === null) {
+      expect(validateNotebook(target, resolvedTestInterpreter()).ok).toBe(true);
+    }
+
+    const body = bodyOf(await handleNotebookRead(context(), { path: target, include_outputs: 'full' }));
+    const cell = (body['cells'] as Array<Record<string, unknown>>)[0]!;
+    // ① The model sees a number. Before the fix it saw
+    // `{"__ipynb_exact_number__": "9007199254740993"}` — a structure that exists nowhere.
+    expect(typeof cell['execution_count'], JSON.stringify(cell)).toBe('number');
+    expect(cell['execution_count']).toBe(Number('9007199254740993'));
+    expect(JSON.stringify(body)).not.toContain('__ipynb_exact_number__');
+  });
+
+  it('[V11-6] editing a VALID file is not refused, and no hint claims it was already broken', async () => {
+    // The second half of the finding: with outputs present the count rule fired and told the
+    // caller their file "already violated" a rule that nbformat does not have.
+    const target = path.join(workspace, 'big-count-edit.ipynb');
+    await writeFile(target, COUNT_NOTEBOOK('9007199254740993', true), 'utf8');
+    const outcome = await handleNotebookEdit(context(), {
+      path: target,
+      ops: [{ op: 'replace_source', cell_index: 0, expected_text: 'x = 1', new_text: 'x = 2' }],
+    });
+    const body = bodyOf(outcome as Awaited<ReturnType<typeof handleNotebookRead>>);
+    expect(body['code'], `a legal count must not block an edit: ${JSON.stringify(body)}`).toBeUndefined();
+    // …and the digits are still in the file, unchanged.
+    expect(await readFile(target, 'utf8')).toContain('"execution_count": 9007199254740993');
+  });
+
+  it('[V11-6] a count nbformat rejects is refused, with a hint that fits the reason', async () => {
+    // `1.5` is what nbformat rejects: the schema is `"type": ["integer", "null"]`. The rule is
+    // split in two so each message can be accurate — the v10 wording covered `-1` and `1.5`
+    // with one sentence, and it described a legal file as a pre-existing violation.
+    const target = path.join(workspace, 'float-count.ipynb');
+    await writeFile(target, COUNT_NOTEBOOK('1.5', true), 'utf8');
+    const outcome = await handleNotebookEdit(context(), {
+      path: target,
+      ops: [{ op: 'replace_source', cell_index: 0, expected_text: 'x = 1', new_text: 'x = 2' }],
+    });
+    const body = bodyOf(outcome as Awaited<ReturnType<typeof handleNotebookRead>>);
+    expect(body['code'], JSON.stringify(body)).toBe('selfcheck_failed');
+    const detail = body['detail'] as Record<string, unknown>;
+    expect(detail['problem']).toMatchObject({ rule: 'execution_count_not_an_integer' });
+    const hint = String(detail['hint'] ?? '');
+    expect(hint).toContain('whole number of executions');
+    // The wording written for `-1` must not be used for a count that is merely fractional,
+    // and the count itself is reported without our marker.
+    expect(hint).not.toContain('negative');
+    expect(JSON.stringify(detail)).not.toContain('__ipynb_exact_number__');
+  });
+});
+
 describe('[V10-4] the hint is judged by the authority, not by our own gate', () => {
   /** A code cell that nbformat rejects for its negative count, with stale outputs. */
   const NEGATIVE_COUNT = `${[
