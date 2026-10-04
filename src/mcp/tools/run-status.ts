@@ -43,6 +43,12 @@ export async function handleRunStatus(
         performed: handle.writeBack.performed,
         backup_path: handle.writeBack.backupPath,
       },
+      // `true` while the background task is still unwinding: the terminal state above is
+      // already final, but `executed` / `warnings` / `write_back` will still be replaced
+      // with what the run actually did. Without this field a cancelled run reports an
+      // empty, self-consistent "nothing happened" for as long as the in-flight cell runs —
+      // and then the file changes underneath the client (review v11 V11-3).
+      facts_pending: handle.factsPending,
       error: handle.error,
       warnings: handle.warnings,
     };
@@ -68,6 +74,13 @@ export async function handleRunCancel(
       // so it could return `state: "running"` — a value the §4.8 response enum
       // does not contain (review v3 QUAL-8). The background task then writes
       // the completed cells back under this same terminal state.
+      //
+      // Publishing a terminal state before its facts exist is only honest if the payload
+      // SAYS the facts are outstanding, so `facts_pending` is raised here and the rule that
+      // owns it is `RunHandle.factsPending` (review v11 V11-3). The alternative — holding
+      // the state open until the cell finishes — was rejected because §4.8 rule 1 is
+      // explicit and the model would keep waiting on a cell it just asked to stop.
+      handle.factsPending = true;
       handle.abortReason = 'cancelled';
       handle.abortController.abort();
       // The first writer wins: the background task may already have settled the
@@ -87,6 +100,10 @@ export async function handleRunCancel(
       run_id: handle.runId,
       state: handle.state,
       kernel_shutdown: false,
+      // SPEC §4.8's cancel response is three fields and this is a fourth; it is the same
+      // fact the status payload carries, and a caller that acts on `state: "cancelled"`
+      // alone needs it here most (D-055).
+      facts_pending: handle.factsPending,
     };
     return { payload: payload as JsonValue };
   });

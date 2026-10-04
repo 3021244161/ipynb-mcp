@@ -20,6 +20,27 @@ export interface RunHandle {
   error: { code: string; message: string } | null;
   warnings: Warning[];
   imageBlocks: RunImageBlock[];
+  /**
+   * Are the facts (`executed`, `warnings`, `write_back`) still being gathered?
+   *
+   * `notebook_run_cancel` publishes the terminal state IMMEDIATELY (SPEC §4.8 rule 1) while
+   * the in-flight cell keeps running, and everything that cell's run has to report arrives
+   * only when the background task unwinds. So for a window — the remainder of the in-flight
+   * cell, 25 s on Windows where the kernel interrupt does nothing — the status of a run that
+   * has already executed cells and may rewrite the file is `cancelled` + `executed: []` +
+   * `warnings: []` + `write_back: {performed: false}`. A client is entitled to read that as
+   * "nothing ran, nothing was written, nothing was lost", and to run the notebook again.
+   *
+   * The terminal state is a promise about the run, and the facts are the promise's content:
+   * they must either arrive with it or be declared outstanding. This field is that
+   * declaration (review v11 V11-3; the rule is AGENTS §9's "terminal state and facts arrive
+   * together").
+   *
+   * INVARIANT: `facts_pending` is false exactly when nothing more will be written to this
+   * handle. The background task clears it in its last statement, after the terminal state
+   * and the facts have both been written.
+   */
+  factsPending: boolean;
   readonly createdAt: number;
   finishedAt: number | null;
   readonly abortController: AbortController;
@@ -53,6 +74,7 @@ export class RunStore {
       error: null,
       warnings: [],
       imageBlocks: [],
+      factsPending: false,
       createdAt: this.#now(),
       finishedAt: null,
       abortController: new AbortController(),

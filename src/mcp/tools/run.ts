@@ -288,7 +288,17 @@ async function executeBackgroundRun(
     }
   } finally {
     handle.progress.currentCellIndex = null;
+    // Progress is now truth: the counts above describe what the run did, so the snapshot
+    // stops being a "not yet" (a run that is still executing a cell has already reported
+    // everything it will report about the cells before it).
+    handle.progress.completed = handle.executed.length;
     ctx.runStore.finish(handle.runId);
+    // LAST statement of the task, and the only writer of this field going down: everything
+    // a client can read about this run is in the handle by now, so the terminal state and
+    // its facts are simultaneously true. The reverse order would publish "facts complete"
+    // one step before they were (review v11 V11-3; the invariant is documented on
+    // `RunHandle.factsPending`).
+    handle.factsPending = false;
   }
 }
 
