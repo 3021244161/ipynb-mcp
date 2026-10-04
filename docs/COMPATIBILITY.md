@@ -33,7 +33,7 @@
 
 **其他实测项（第九轮本机实跑）**：`pnpm typecheck` exit 0；`pnpm lint` 0 警（oxlint **71 文件 / 99 规则** + `scripts/check-format.mjs` + `scripts/check-indent.mjs`（**28 个自测样本**）+ `scripts/check-docs.mjs`（**7 个自测变异**，真文档对照通过））；
 `pnpm smoke` **26/26**（真 stdio server + 真 SDK 客户端，含 `data:` URL 图片的读写与 `nbformat.validate`）；
-`pnpm check:package` **ok（140 文件，20 个变异全被抓到）**；`npm pack --dry-run` **140 项**，含 `lib/bin.js`（shebang ✓）与 `python/ipynb_sidecar.py`；
+`pnpm check:package` **ok（140 文件，22 个变异全被抓到）**；`npm pack --dry-run` **140 项**，含 `lib/bin.js`（shebang ✓）与 `python/ipynb_sidecar.py`；
 `git ls-files --eol` 全树 LF（110 个 tracked 文件，0 CRLF / 0 mixed）。
 
 > **macOS 在 unit 矩阵里只跑 Node 22。** macOS runner 按 10 倍计费，而这一层的目的是发现平台特有的路径/大小写语义，
