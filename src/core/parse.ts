@@ -222,14 +222,17 @@ export function selfCheckNotebook(
       before !== null &&
       String(before['rule']) === String(problem['rule']) &&
       before['cell_index'] === problem['cell_index'];
+    // The hint is ALWAYS there, not only for a pre-existing violation (review v10 V10-4).
+    // The fix for a refusal is the same operation either way, and a caller that did not
+    // pass `originalDoc` used to get a bare `pre_existing: false` with no way forward —
+    // the "one retry succeeds" contract (SPEC §4.1.11) needs the operation named.
+    const hint = sameProblem
+      ? `this cell already violated ${String(problem['rule'])} before the change; ${escapeHatchFor(problem)}`
+      : `this write would store content nbformat rejects (${String(problem['rule'])}); ${escapeHatchFor(problem)}`;
     throw new IpynbError('selfcheck_failed', 'serialized notebook failed the nbformat structure check', {
       problem: problem as JsonValue,
-      ...(sameProblem
-        ? {
-            pre_existing: true,
-            hint: `this cell already violated ${String(problem['rule'])} before the change; ${escapeHatchFor(problem)}`,
-          }
-        : { pre_existing: false }),
+      pre_existing: sameProblem,
+      hint,
     });
   }
   if (scope.onPreExistingProblem !== undefined) {
@@ -276,11 +279,12 @@ export function structuralWarning(problem: Record<string, JsonValue>): string {
  * while the model was told to try the other one (review v8 V8-14).
  *
  * v8's own fix then claimed `clear_outputs` "resets the cell execution count", which
- * SPEC §4.5 rule 5 forbids and `edit.ts` deliberately does not do. What is true is
- * narrower and worth saying precisely: once that operation has emptied the outputs,
- * the cell's count is not judged any more (see `SelfCheckScope`'s
- * `clearedOutputCellIndexes`), so the file becomes valid WITHOUT the count changing.
- * A hint is a promise (review v9 V9-8), so it says exactly that.
+ * SPEC §4.5 rule 5 forbids and `edit.ts` deliberately does not do. v9's wording fixed
+ * that half and over-claimed the other: it ended "**so the file becomes valid**", and
+ * the authority disagrees — after `clear_outputs` the count is still `-1` in the file
+ * and Python's `nbformat.validate` still rejects it (review v10 V10-4). "This gate stops
+ * checking it" and "the file is valid nbformat" are different statements, and only the
+ * first one is ours to make.
  *
  * The mapping stays explicit rather than generic because the next rule added will not
  * necessarily be cleared by either operation.
@@ -288,7 +292,7 @@ export function structuralWarning(problem: Record<string, JsonValue>): string {
 function escapeHatchFor(problem: Record<string, JsonValue>): string {
   const rule = String(problem['rule']);
   if (rule === 'execution_count_negative') {
-    return 'clear_outputs does not change the count itself, but once the outputs are gone the count is no longer checked, so the file becomes valid; set_cell_type to markdown removes the count entirely';
+    return 'clear_outputs does not change the count itself, but this tool stops checking a cell that has no outputs, so the edit is accepted; the count stays in the file and nbformat.validate still rejects it until the count is gone, which set_cell_type to markdown does by removing it';
   }
   if (rule === 'non_code_cell_has_execution_count') {
     // `clear_outputs` is refused here ("requires a code cell"), so recommending it —
@@ -388,23 +392,28 @@ export function findStructuralProblem(
     //
     // WHEN THE RULE APPLIES — the v9 correction. It is about a count that belongs to a
     // set of outputs, so a cell with NO outputs has no count this rule can be about.
-    // That is a fact about the cell, not about the request that happens to be running:
-    // v8 exempted "this request emptied the outputs" (`clearedOutputCellIndexes`),
-    // which made the file acceptable for exactly one call and refused the model's NEXT
-    // edit with the very rule the hint had just said was handled (review v9 V9-8).
-    // SPEC §4.5 rule 5 keeps `execution_count` out of `clear_outputs` reach, so the
-    // count really does stay in the file; `outputs: []` is what makes it harmless.
+    // "No outputs" means the key is absent (`outputs` is optional) or the array is empty:
+    // requiring `[]` exactly left a cell with no `outputs` key permanently refused, which
+    // the probe in `v10` caught — the same lockout in a different spelling.
     //
-    // A negative count on a cell that HAS outputs is still refused, which is the shape
-    // a caller produces by writing one (`replace_source` cannot touch the count, so
-    // the only way to introduce it is a store/output rewrite that keeps outputs).
+    // That is a fact about the cell, not about the request that happens to be running:
+    // v8 exempted only "this request emptied the outputs" (`clearedOutputCellIndexes`),
+    // which made the file acceptable for exactly one call and refused the model's NEXT
+    // edit with the very rule the hint had just said was handled (review v9 V9-8). SPEC
+    // §4.5 rule 5 keeps `execution_count` out of `clear_outputs` reach, so the count
+    // really does stay in the file; `outputs: []` is what makes it harmless.
+    //
+    // A negative count on a cell that HAS outputs is still refused, and it is refused
+    // BEFORE the output-shape rules: telling a caller to "clear the outputs" when the
+    // outputs themselves are also malformed is still the operation that clears both, so
+    // the count rule's hint is the one that gets them unstuck.
     const outputsWereCleared =
       clearedOutputCellIndexes !== undefined && clearedOutputCellIndexes.has(index);
     const count = cell.execution_count;
-    const outputsAlreadyEmpty = Array.isArray(cell.outputs) && cell.outputs.length === 0;
+    const noOutputsToCount = cell.outputs === undefined || (Array.isArray(cell.outputs) && cell.outputs.length === 0);
     if (
       !outputsWereCleared &&
-      !outputsAlreadyEmpty &&
+      !noOutputsToCount &&
       count !== undefined &&
       count !== null &&
       (!Number.isInteger(count) || count < 0)

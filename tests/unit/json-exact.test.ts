@@ -96,14 +96,46 @@ describe('[V9-5] the parser keeps numbers JavaScript would round', () => {
     }
   });
 
-  it('[V9-5] only integers outside the safe range are treated as inexact', () => {
-    for (const exact of ['0', '-1', '42', '9007199254740991', '-9007199254740991', '1.5', '0.1234567890123456789', '1e21', '2.5e-10']) {
-      expect(losesPrecision(exact), exact).toBe(false);
-      expect(typeof (parseJsonExact(exact) as unknown)).toBe('number');
+  it('[V10-3] every literal a JS number would rewrite is preserved, not just integers', () => {
+    // The v9 version of this assertion listed only integers, which is exactly how the
+    // DECIMAL half of the same family survived a round (review v10 V10-3). The rule is
+    // now "does `String(Number(literal))` give the literal back?", so the cases are
+    // grouped by WHY they fail that round trip.
+    const roundTrips = ['0', '-1', '42', '9007199254740991', '-9007199254740991', '1.5', '0.1', '2.5e-10', '1e-7'];
+    for (const literal of roundTrips) {
+      expect(losesPrecision(literal), literal).toBe(false);
+      expect(typeof (parseJsonExact(literal) as unknown), literal).toBe('number');
     }
-    for (const inexact of ['9007199254740992', '9007199254740993', BIG, BIG_NEGATIVE, '-9007199254740993']) {
-      expect(losesPrecision(inexact), inexact).toBe(true);
+    const rewritten = [
+      // Precision: the value itself changes.
+      '9007199254740993',
+      '-9007199254740993',
+      BIG,
+      BIG_NEGATIVE,
+      '0.1234567890123456789',
+      '0.1234567890123456789012345',
+      '1.0000000000000001',
+      '3.141592653589793238462643383279',
+      // Out of range for a double.
+      '1e400',
+      '-1e400',
+      // Value is preserved but the BYTES would not be: the file keeps its spelling.
+      '1E+2',
+      '1e21',
+      '0.10',
+      '1.50',
+      '-0',
+      '0.0',
+    ];
+    for (const literal of rewritten) {
+      expect(losesPrecision(literal), literal).toBe(true);
     }
+    // `2**53` is NOT in the list above on purpose: it is exactly representable
+    // (`String(2 ** 53) === '9007199254740992'`), so it survives as a plain number and
+    // marking it would put a marker in the response for no reason. `2**53 + 1` is the
+    // first integer that does not — the boundary, asserted on both sides.
+    expect(losesPrecision('9007199254740992')).toBe(false);
+    expect(losesPrecision('9007199254740993')).toBe(true);
   });
 
   it('[V9-5] the serializer matches JSON.stringify for everything it does not mark', () => {
@@ -117,7 +149,7 @@ describe('[V9-5] the parser keeps numbers JavaScript would round', () => {
       { a: 1, b: 'x', c: true, d: null },
       { nested: { list: [1, 2, { deep: ['\n', 'quote"', 'back\\slash', 'tab\t'] }] } },
       { unicode: 'héllo — 中文 😀', escapes: '\u0007\u001f' },
-      { empty: {}, emptyList: [], zero: 0, negativeZero: -0, float: 1.5, exp: 1e21 },
+      { empty: {}, emptyList: [], zero: 0, float: 1.5, exp: 1e21 },
       [{ a: undefined, b: 1 }, [undefined, 2]],
       { a: [null, false] },
     ];
@@ -133,6 +165,13 @@ describe('[V9-5] the parser keeps numbers JavaScript would round', () => {
     // Only a marking changes the output, and it changes exactly one token.
     const marked = { big: exactNumber(BIG), small: 1 };
     expect(stringifyJsonExact(marked, 1)).toBe('{\n "big": 18446744073709551616,\n "small": 1\n}');
+    // The ONE documented divergence from the built-in: `JSON.stringify(-0)` writes `0`,
+    // while this serializer writes the sign back. It is the same class of fix as the
+    // markers — the file's bytes must survive — and it is pinned so nobody "simplifies"
+    // it away. `-0` is not in the trees above for exactly this reason.
+    expect(JSON.stringify({ z: -0 })).toBe('{"z":0}');
+    expect(stringifyJsonExact({ z: -0 })).toBe('{"z":-0}');
+    expect(Object.is(JSON.parse('{"z":-0}').z, -0)).toBe(true);
   });
 
   it('[V9-5] a notebook holding a big json integer is written back with the same digits', async () => {
