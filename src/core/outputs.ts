@@ -5,7 +5,7 @@
 
 import type { JsonValue } from './errors.js';
 import { decodeBase64ToBytes, encodeBase64, isBase64Shaped } from './base64.js';
-import { isExactNumber, isNegativeZero } from './json-exact.js';
+import { denotationIsNonzero, isExactNumber, isNegativeZero } from './json-exact.js';
 // Value types are imported, not redefined: the execution path and the write gate
 // must answer "is this representable?" identically (review v6 GATE-5).
 import { isJsonMime, isRepresentableMimeValue, type Hasher, type NotebookCell } from './parse.js';
@@ -647,10 +647,21 @@ function jsonValueOf(value: unknown): { value: JsonValue; warnings: OutputWarnin
  *
  * The literal and the phrase "not representable exactly" are matched by the test suite
  * and by the round-trip cases, so both are load-bearing wording.
+ *
+ * FOUR cases, and each one exists because the others' sentence was false about it:
+ *   - out of range → `null`, so the message must not promise `Infinity` (V11-12①);
+ *   - `-0` → the VALUE is exact and only the sign is lost (V11-1), so no precision claim;
+ *   - underflow → the value really did change (to zero) and the magnitude is gone
+ *     (v12 V12-1); this case must be tested BEFORE the negative-zero one, because
+ *     `-1e-400` is "negative" and "zero" by every test that does not look at its mantissa;
+ *   - everything else → the rounded value, which is what a JSON client will read.
  */
 function inexactNumberMessage(literal: string): string {
   const asNumber = Number(literal);
-  if (isNegativeZero(literal)) {
+  if (asNumber === 0 && denotationIsNonzero(literal)) {
+    return `json value ${literal} underflows to zero in a double; the exact digits are in this warning and in the file, but a JSON client reads it as 0`;
+  }
+  if (isNegativeZero(literal) && !denotationIsNonzero(literal)) {
     return `json value ${literal} is negative zero; the value is exact but its sign is not carried by a JSON response, so a client reads it as 0 (the file keeps ${literal})`;
   }
   if (!Number.isFinite(asNumber)) {

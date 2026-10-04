@@ -20,7 +20,13 @@ import path from 'node:path';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { isExactNumber, normalizedSpelling, parseJsonExact, stringifyJsonExact } from '../../src/core/json-exact.js';
+import {
+  isExactNumber,
+  losesPrecision,
+  normalizedSpelling,
+  parseJsonExact,
+  stringifyJsonExact,
+} from '../../src/core/json-exact.js';
 import { mapRawOutputs, rawOutputsOfCell } from '../../src/core/outputs.js';
 import { parseNotebook, serializeNotebook } from '../../src/core/parse.js';
 import { hasher } from '../../src/hash.js';
@@ -64,6 +70,17 @@ const FORMS = [
   { literal: '1E+2', warned: false, why: 'JS spells it 100, which is the same digits' },
   { literal: '2.5e-10', warned: false, why: 'a small exponent that round-trips' },
   { literal: '1e400', warned: true, why: 'overflows a double entirely' },
+  // UNDERFLOW — the mirror of the line above, and the v12 blocker (V12-1). A nonzero mantissa
+  // whose double is zero is a value change, so it is protected and reported. These rows exist
+  // in BOTH directions: `1e-320` is a subnormal and survives, `0e-400` denotes zero and merely
+  // changes spelling, and neither may be swept up by the underflow rule.
+  { literal: '1e-400', warned: true, why: 'underflows to zero' },
+  { literal: '1e-324', warned: true, why: 'underflows to zero (just below the subnormal range)' },
+  { literal: '2e-400', warned: true, why: 'underflows to zero' },
+  { literal: '-1e-400', warned: true, why: 'underflows to negative zero' },
+  { literal: '1e-320', warned: false, why: 'a SUBNORMAL: small, but a double holds it' },
+  { literal: '5e-324', warned: false, why: 'the smallest positive subnormal' },
+  { literal: '0e-5', warned: false, why: 'an exponent with nonzero digits but a zero mantissa' },
   { literal: '-0', warned: true, why: 'negative zero: the sign is a fact the response cannot carry' },
   { literal: '0.0', warned: false, why: 'trailing zero on a zero' },
 ] as const;
@@ -245,7 +262,8 @@ function warnedLiterals(messages: readonly string[]): string[] {
     const match =
       /json value (\S+) was not representable exactly/.exec(message) ??
       /json value (\S+) is outside the range/.exec(message) ??
-      /json value (\S+) is negative zero/.exec(message);
+      /json value (\S+) is negative zero/.exec(message) ??
+      /json value (\S+) underflows to zero/.exec(message);
     if (match !== null) {
       found.push(match[1]!);
     }
@@ -397,18 +415,72 @@ describe('[V10-3] every number literal the file holds survives the write-back', 
     }
   });
 
-  it('[V10-3][V11-1] a value that survives as a double stays a plain number', () => {
-    // The over-correction to avoid: marking everything would put a marker (and a
-    // warning) on `0.1`, and a warning that appears for correct values is noise the model
-    // learns to ignore. The v11 round found the over-correction had already shipped — the
-    // expectation is the table's, and the VALUE check below is deliberately weaker than
-    // `String(parsed) === literal`, because `100.0` and `1E+2` are allowed to become
-    // `100`: same digits, same number.
+  it('[V10-3][V11-1][V12-1] a value that survives as a double stays a plain number', () => {
+    // The over-correction to avoid: marking everything would put a marker (and a warning) on
+    // `0.1`, and a warning that appears for correct values is noise the model learns to ignore.
+    //
+    // THE ASSERTION HERE USED TO BE CO-EXTENSIVE WITH THE CODE IT GUARDS, which is why the
+    // v12 regression (`1e-400` → `0`, silently) could not have been caught by adding a row to
+    // this table: `String(parseJsonExact('1e-400'))` and `String(Number('1e-400'))` are BOTH
+    // `'0'`, so the check agreed with the bug (review v12 V12-1, "守卫与被测判据同构").
+    //
+    // What each form must satisfy now is written independently of the implementation:
+    //   - the value the model receives is the double the writer would produce for it;
+    //   - the FILE holds that same double's own spelling (`String(Number(literal))`), so an
+    //     underflow cannot hide behind a comparison of two zeroes.
+    // The file half is asserted below, against the bytes.
     for (const form of FORMS.filter((entry) => !entry.warned)) {
       const parsed = parseJsonExact(form.literal);
       expect(typeof parsed, `${form.literal} (${form.why})`).toBe('number');
       expect(isExactNumber(parsed)).toBe(false);
       expect(String(parsed)).toBe(String(Number(form.literal)));
+      const written = writeOnce(notebookText(form.literal));
+      expect(storedJsonValueText(written), `${form.literal} (${form.why})`).toBe(
+        String(Number(form.literal)),
+      );
+    }
+  });
+
+  it('[V12-1] a literal that underflows to zero keeps its digits and says so', () => {
+    // The v12 blocker, as a property rather than as four rows: a literal whose MANTISSA is
+    // nonzero and whose double is zero denotes a number the double cannot hold — so it must be
+    // preserved on disk and reported, exactly like overflow (`1e400` → null + warning). The
+    // v11 early return (`value === 0 → isNegativeZero`) called these "no information lost" and
+    // replaced them with `0` on the next write, and it reported `-1e-400` as "negative zero …
+    // the value is exact", two false statements in one sentence.
+    const underflows = ['1e-400', '1e-324', '1e-330', '2e-400', '-1e-400', '-1e-330', '-2e-400'];
+    for (const literal of underflows) {
+      expect(losesPrecision(literal), `${literal} must be protected`).toBe(true);
+      const written = writeOnce(notebookText(literal));
+      // ① the file keeps the literal, byte for byte — the assertion the old table could not make
+      expect(storedJsonValueText(written), literal).toBe(literal);
+      // ② the model is told, and the sentence describes underflow rather than negative zero
+      const item = jsonItem(literal);
+      expect(item.warnings, literal).toHaveLength(1);
+      expect(item.warnings[0]!.message, literal).toContain('underflows to zero');
+      expect(item.warnings[0]!.message, literal).not.toContain('negative zero');
+      // ③ the value the model receives is the zero a client would read, not a marker. `-1e-400`
+      // underflows to NEGATIVE zero, and the response channel prints that as `0` — the sign is
+      // gone (the same loss the `-0` case reports) but it is not why this case exists: the whole
+      // magnitude is gone, which is what the sentence says.
+      expect(Object.is(item.value, 0) || Object.is(item.value, -0), `${literal} → ${String(item.value)}`).toBe(true);
+    }
+    // The same literals with a zero MANTISSA are NOT underflows: they denote zero and only
+    // change spelling. `0e-400` in particular must not be caught by a check that looks for a
+    // nonzero digit anywhere in the literal — its EXPONENT has four of them.
+    for (const zero of ['0', '0.0', '0e0', '0e-5', '0.0e-400', '0.00e10']) {
+      expect(losesPrecision(zero), `${zero} denotes zero`).toBe(false);
+      expect(storedJsonValueText(writeOnce(notebookText(zero))), zero).toBe(String(Number(zero)));
+    }
+    // …and the NEGATIVE zero family stays what it always was: exactly zero, sign not carried, so
+    // its own sentence and its own bytes. `-0.0` belongs here rather than in the list above —
+    // "denotes zero" is true of it and is not the question; the sign is.
+    for (const negativeZero of ['-0', '-0.0', '-0e0', '-0.0e-400']) {
+      expect(losesPrecision(negativeZero), negativeZero).toBe(true);
+      expect(storedJsonValueText(writeOnce(notebookText(negativeZero))), negativeZero).toBe(negativeZero);
+      const message = jsonItem(negativeZero).warnings[0]!.message;
+      expect(message, negativeZero).toContain('negative zero');
+      expect(message, negativeZero).not.toContain('underflows');
     }
   });
 });

@@ -510,9 +510,9 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
             maxImageBytes: deps.config.maxImageBytes,
             hasher: deps.hasher,
             // The cell index, so a failure message names it: without this every cell's broken
-          // image produced the same string, and the run path's dedup collapsed them into one
-          // (review v11 V11-10).
-          cellIndex: index,
+            // image produced the same string, and the run path's dedup collapsed them into one
+            // (review v11 V11-10).
+            cellIndex: index,
           });
           // Materialize images for run results (auto policy: always for runs).
         const returnImages = shouldReturnImages(deps.imagesPolicy, true);
@@ -529,7 +529,16 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
             },
           );
         for (const warning of policyResult.warnings) {
-          if (!warnings.some((existing) => existing.code === warning.code)) {
+          // Deduplicated by MESSAGE, not by code.
+          //
+          // By code was the v11 behaviour and it threw away attribution: each cell's image
+          // failure had a distinct message ("image at cell 1 (output 0) failed to decode"), but
+          // the code `image_materialize_failed` is the same for all of them, so three broken
+          // images in three cells produced ONE warning that named only `cell 0` (review v12
+          // V12-3). The read path already dedupes by message; these lines are the run path
+          // catching up, and with the message carrying the cell (D-057) identical messages now
+          // really do mean identical facts.
+          if (!warnings.some((existing) => existing.message === warning.message)) {
             warnings.push(warning);
           }
         }
@@ -591,7 +600,7 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
           // one (review v6 GATE-5/CRASH-1).
           const sanitized = dropUnrepresentableOutputs(converted);
           // Collected, not warned here: the warning is emitted once per call by
-          // `callWarnings`, which carries truncation, dropped values and values the
+          // `pushCallWarnings`, which carries truncation, dropped values and values the
           // JSON channel cannot represent exactly. Pushing per cell let the first
           // fact silence the others (review v8 V8-10), and doing it inline made the
           // rule untestable (review v8 V8-4).

@@ -343,6 +343,58 @@ describe('[V11-6] a count in any legal spelling stays a number the model can use
   });
 });
 
+describe('[V12-1] a literal that underflows to zero survives an unrelated edit', () => {
+  /** A notebook whose cell 0 holds `literal` in a json output and whose cell 1 is editable. */
+  const TWO_CELLS = (literal: string): string =>
+    `{\n "cells": [\n  {\n   "cell_type": "code",\n   "execution_count": 1,\n   "id": "c0",\n   "metadata": {},\n   "outputs": [\n    {\n     "data": {\n      "application/json": ${literal}\n     },\n     "metadata": {},\n     "output_type": "display_data"\n    }\n   ],\n   "source": [\n    "x"\n   ]\n  },\n  {\n   "cell_type": "code",\n   "execution_count": null,\n   "id": "c1",\n   "metadata": {},\n   "outputs": [],\n   "source": [\n    "y = 1"\n   ]\n  }\n ],\n "metadata": {},\n "nbformat": 4,\n "nbformat_minor": 5\n}\n`;
+
+  it('[V12-1] editing the OTHER cell leaves the underflowing literal on disk', async () => {
+    // The v12 blocker: the value cannot be held by a double (it becomes zero), so a write must
+    // keep the literal — and the READ side must not hand the model a bare `0` with no
+    // explanation. v11 had an early return that treated every zero as "exactly zero".
+    for (const literal of ['1e-400', '1e-324', '2e-400', '-1e-400']) {
+      const target = path.join(workspace, `underflow-${literal.replace(/[^0-9a-zA-Z]/g, '_')}.ipynb`);
+      await writeFile(target, TWO_CELLS(literal), 'utf8');
+      // The file is legal nbformat before and after; the digits are what must not move.
+      const skip = nbformatSkipReason(resolvedTestInterpreter());
+      if (skip === null) {
+        expect(validateNotebook(target, resolvedTestInterpreter()).ok, literal).toBe(true);
+      }
+
+      const outcome = await handleNotebookEdit(context(), {
+        path: target,
+        ops: [{ op: 'replace_source', cell_index: 1, expected_text: 'y = 1', new_text: 'y = 2' }],
+      });
+      const body = bodyOf(outcome as Awaited<ReturnType<typeof handleNotebookRead>>);
+      expect(body['code'], `${literal}: ${JSON.stringify(body)}`).toBeUndefined();
+      const written = await readFile(target, 'utf8');
+      expect(written, `${literal} must survive the write`).toContain(`"application/json": ${literal}`);
+      expect(written).toContain('"y = 2"');
+
+      // …and the response says what happened instead of quietly reporting zero.
+      const read = bodyOf(await handleNotebookRead(context(), { path: target, include_outputs: 'full' }));
+      const warnings = (read['warnings'] ?? []) as Array<{ message: string }>;
+      const joined = warnings.map((warning) => warning.message).join('\n');
+      expect(joined, `${literal} must be reported`).toContain(literal);
+      expect(joined, `${literal} must be described as underflow`).toContain('underflows to zero');
+      expect(joined, 'the negative-zero sentence is false here').not.toContain('negative zero');
+    }
+  });
+
+  it('[V12-1] the same literals are reported on the DEFAULT read path too', async () => {
+    // The v11 V11-5 rule, applied to the new warnings: whatever the default output mode shows
+    // must be qualified. Without this the fix would only exist in `full`, which is the bug v11
+    // fixed one layer down.
+    const target = path.join(workspace, 'underflow-default.ipynb');
+    await writeFile(target, TWO_CELLS('1e-400'), 'utf8');
+    const body = bodyOf(await handleNotebookRead(context(), { path: target }));
+    const warnings = (body['warnings'] ?? []) as Array<{ message: string }>;
+    const joined = warnings.map((warning) => warning.message).join('\n');
+    expect(joined).toContain('1e-400');
+    expect(joined).toContain('underflows to zero');
+  });
+});
+
 describe('[V10-4] the hint is judged by the authority, not by our own gate', () => {
   /** A code cell that nbformat rejects for its negative count, with stale outputs. */
   const NEGATIVE_COUNT = `${[

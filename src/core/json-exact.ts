@@ -148,15 +148,35 @@ export function losesPrecision(literal: string): boolean {
 /**
  * Would replacing this literal with the double change what it conveys?
  *
- * The double's shortest round-trip spelling (`String(Number(literal))`) is the reference:
- * a canonical form that denotes the same number. The literal is compared with it by
- * normalizing both to the same shape, and only a real difference counts — which is why
- * `0.1000000000000000055511151231257827021181583404541015625` is accepted (it is exactly
- * `Number('0.1')`, 55 digits and all) while `0.10000000000000001` is not (it names a
- * different double).
+ * The double's shortest round-trip spelling (`String(Number(literal))`) is the reference: a
+ * canonical form that denotes the same number. The literal is compared with it by normalizing
+ * both to the same shape, and only a real difference counts — which is why
+ * `0.1000000000000000055511151231257827021181583404541015625` is accepted (its digits are the
+ * double named by `0.1`, and the short form says the same thing in three characters).
  *
- * `-0` never reaches here as a loss: it is zero, and `Number('-0')` is zero. The sign is
- * a separate fact about the RESPONSE channel, reported by its own message.
+ * ZERO IS THE EDGE THAT NEEDS ITS OWN HANDLING, and the v11 version of this function got it
+ * wrong in the worst available way (review v12 V12-1). It read:
+ *
+ *     if (value === 0) return isNegativeZero(literal);
+ *
+ * which is right about `-0` and catastrophically wrong about UNDERFLOW: `1e-400`, `1e-330`,
+ * `1e-324` and `2e-400` all become the double zero while denoting a nonzero number, so the
+ * early return called them "no information lost" and the next write replaced them with `0` —
+ * a silent change of the value, on disk, triggered by editing an unrelated cell. That is the
+ * exact failure this module exists to prevent, and the v10 rule it replaced had protected these
+ * literals. The negative half was just as bad in a different way: `-1e-400` kept its digits but
+ * was reported as "negative zero … the value is exact", two false statements per sentence.
+ *
+ * So zero is now split into the three cases it actually has:
+ *
+ *   - `-0`: exactly zero, sign not carried by a JSON response → reported, digits kept (`-0`);
+ *   - a literal whose MANTISSA is zero (`0`, `0.0`, `0e0`, `0e-5`, `0.0e-400`): it denotes zero
+ *     and the double holds it. Nothing is lost, and normalizing `0e-5` to `0` is the same
+ *     no-information rewrite as `100.0` → `100` — NOT an underflow, which is why the check is
+ *     about the mantissa's digits and not about `/[1-9]/` matching a digit in the exponent;
+ *   - a literal with a nonzero mantissa that evaluates to zero (`1e-400`): UNDERFLOW. The
+ *     value changes, so the literal stays and the model is told, which also makes this case
+ *     symmetric with overflow (`1e400` → null + warning), as D-056's first invariant requires.
  */
 function losesInformation(literal: string): boolean {
   const value = Number(literal);
@@ -164,13 +184,22 @@ function losesInformation(literal: string): boolean {
     return true;
   }
   if (value === 0) {
-    // `-0` is exactly zero, so no digit is lost — but the RESPONSE channel cannot carry
-    // the sign (`JSON.stringify(-0)` is `0`) while the file can, and this flag is also
-    // what keeps the literal alive for the write-back. So it is reported, and it is
-    // reported as a sign fact rather than as a precision loss (review v11 V11-1).
-    return isNegativeZero(literal);
+    return isNegativeZero(literal) || denotationIsNonzero(literal);
   }
   return !insignificantFormatting(literal);
+}
+
+/**
+ * Does this literal denote a nonzero number, even though a double cannot hold it?
+ *
+ * Only the mantissa matters: `1e-400` denotes 10⁻⁴⁰⁰ and underflows, while `0e-400` denotes
+ * zero and merely changes spelling. Testing the whole literal for a nonzero digit would call
+ * the second one an underflow, because its EXPONENT has digits in it.
+ */
+export function denotationIsNonzero(literal: string): boolean {
+  const match = /^-?(\d*)(?:\.(\d*))?/.exec(literal);
+  const mantissa = `${match?.[1] ?? ''}${match?.[2] ?? ''}`;
+  return /[1-9]/.test(mantissa);
 }
 
 /**
@@ -186,9 +215,8 @@ function losesInformation(literal: string): boolean {
  *     which is the silent rewrite this module exists to prevent. Meanwhile `0.1` FAILS it
  *     (the double is not the rational 1/10), so the ordinary float in every notebook was
  *     reported as unrepresentable;
- *   - "are the digit sequences equal": rejects the 55-digit
- *     `0.1000000000000000055511151231257827021181583404541015625`, which names
- *     `Number('0.1')` exactly and loses nothing at all.
+ *   - "are the digit sequences equal": symmetric but blind in the other direction, and it
+ *     cannot be the rule either (see the `warned` table for what each literal does).
  *
  * What the review actually specified (and it is the one rule that gets every measured case
  * right) is narrower and simpler: normalize away the spellings that carry NO information,
@@ -197,10 +225,16 @@ function losesInformation(literal: string): boolean {
  *
  *   - a `+` on the exponent, and leading zeros in it (`1e+100` → `1e100`, `e-07` → `e-7`);
  *   - a trailing `.0` or trailing zeros in the fraction (`100.0` → `100`, `0.10` → `0.1`,
- *     `2.0` → `2`, and the 55-digit case → `0.1`);
+ *     `2.0` → `2`);
  *   - exponent notation for a magnitude `String()` prints in full (`1e2` → `100`,
- *     `1.5e3` → `1500`), and the reverse (`1e21` stays exponent notation, which is what
- *     `String()` uses too).
+ *     `1.5e3` → `1500`), and the reverse — `1e21` is compared as `1e21` against the
+ *     `String()` form `1e+21`, so it does NOT match and keeps its marker (v12 V12-2 caught
+ *     the v11 note here claiming the opposite).
+ *
+ * The corrections this comment needed are themselves the evidence for the rule that a
+ * documented example must be run: the 55-digit case is REPORTED (it is a different spelling
+ * of `0.1` and the table says `warned: true`), not "accepted" as the v11 note said, and
+ * `0.10000000000000001` is reported because the double it names is not `Number('0.1')`.
  *
  * After normalization the comparison is with `String(Number(literal))` — the double's
  * shortest form — so the cases that must still be reported fall out for free:
