@@ -48,6 +48,12 @@ patch-tmp*
 /patch-*.cjs
 /probe-*.cjs
 
+# 同类事故第六次（v9）：mutate-pkg.mjs 又被跟踪进了版本库。变异脚本与探针
+# 一样是「当场看一眼」的工具，长期检查器放 scripts/ 并接进 pnpm lint。
+/mutate-*.mjs
+/mutate-*.cjs
+/mutate-*.js
+
 # 提交信息草稿（用 `git commit -F` 时产生；`git add -A` 会误收）
 # 三次都踩到了（commit-msg.txt / msg*.txt / m1.txt），所以把整个家族列全：
 # 根目录下任何「短名字 + .txt」都按草稿处理，正式文档一律放 docs/。

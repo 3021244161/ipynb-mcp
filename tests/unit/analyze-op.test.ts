@@ -214,9 +214,9 @@ describe('[U20][D2] non-Python kernels report method skipped', () => {
       throw new Error(`start_kernel is broken with a capable interpreter: ${kernelReady.reason}`);
     }
 
-    // No venv is created here any more: `interpreter()` resolved (and validated)
-    // the one this case will use, and created a venv only if the base interpreter
-    // can serve it (see prepareTestVenv).
+    // No venv is created here any more: the shared `prepareVenv` resolved (and
+    // validated) the one this case will use, and built a venv only if the base
+    // interpreter could serve it.
     const { KernelRegistry } = await import('../../src/kernel/registry.js');
     const { runNotebook } = await import('../../src/run.js');
     const { mkdtemp, mkdir, rm, writeFile } = await import('node:fs/promises');

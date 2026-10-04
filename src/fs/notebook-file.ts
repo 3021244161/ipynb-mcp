@@ -274,5 +274,3 @@ async function writeNotebookFileUnlocked(
   const contentHashAfter = `sha256:${options.hasher.sha256Hex(serialized)}`;
   return { backupPath, contentHashAfter, serialized };
 }
-
-

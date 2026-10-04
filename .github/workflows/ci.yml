@@ -79,6 +79,11 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm build
+      # V8-6: the connection-file sweep DELETES files this tool did not create, so its
+      # rules are guarded by their own checker. It runs in this job rather than in
+      # `pnpm lint` because it needs a Python interpreter, and AGENTS §3 requires the
+      # default suite to pass on a machine that has none.
+      - run: python scripts/check-connection-sweep.py
       # V8-9: the tarball shipped a compiled copy of the sidecar and nothing
       # checked the artifact at all. Asserting its SHAPE here means a stray
       # `__pycache__` or a lost entry point fails the build instead of reaching

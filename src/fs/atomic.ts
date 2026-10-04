@@ -206,7 +206,6 @@ export function isLockError(cause: unknown): boolean {
   );
 }
 
-/** The errno behind a lock error, for the `notebook_locked` detail. */
 /**
  * The raw `errno` behind a filesystem failure, or null.
  *

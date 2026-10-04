@@ -86,53 +86,187 @@ class KernelEntry:
 # its own leftovers.
 CONNECTION_PREFIX = "ipynb-mcp-"
 
+# `tempfile._RandomNameSequence.characters`, i.e. the alphabet of the suffix mkstemp
+# appends. Spelled out here because the attribution rule below has to verify the shape
+# the writer actually produces, and this is the only external fact in it.
+MKSTEMP_SUFFIX_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789_"
+
 # Fallback only, and deliberately conservative. The PRIMARY test for "nobody is using
 # this file" is the pid in its name: `tempfile.mkstemp` is called with
 # `prefix=f"ipynb-mcp-{kernel_id}-{os.getpid()}-"`, so the owning process is right
-# there in the filename and `os.kill(pid, 0)` answers the question directly. Age alone
+# there in the filename and a liveness probe answers the question directly. Age alone
 # was wrong in both directions: a kernel running longer than this still owns its file,
 # and a file orphaned after the last sidecar started would never be swept at all
 # (review v8 V8-6).
 #
-# So age is applied in a different shape depending on what the platform can tell us —
-# see the two constants below. A single "one hour and it is fair game" rule let a live
-# sidecar's file be swept on Windows, where pid liveness is not testable.
+# So age is applied in a different shape depending on what the value of the pid test
+# is — see the three constants below. A single "one hour and it is fair game" rule let
+# a live sidecar's file be swept on Windows, where pid liveness was not testable.
 ORPHAN_CONNECTION_AGE_SECONDS = 3600
 
-# Where pid liveness is NOT testable (Windows), an old file is only removed when it
-# cannot be attributed to a process at all. A week is far longer than any test run and
-# longer than a normal working session, so a file this old with no readable pid is
-# certainly debris rather than something in use.
+# The age a file must reach when the name CANNOT be attributed to a process, or when
+# this platform cannot judge the pid it names. A week is far longer than any test run
+# and longer than a normal working session, so a file this old is certainly debris
+# rather than something in use.
 UNATTRIBUTABLE_CONNECTION_AGE_SECONDS = 7 * 24 * 3600
+
+# The age a file must reach when its owner is known and known to be GONE, but this
+# platform has no liveness probe at all. Same reasoning as the orphan grace below, only
+# longer: without a probe, "the owner is gone" is not a fact anybody established, so
+# this is the honest reading of a name we can parse but not verify. Windows is NOT in
+# this class any more — it probes with `OpenProcess`/`WaitForSingleObject` and therefore
+# uses ORPHAN_CONNECTION_AGE_SECONDS like everyone else (review v9 V8-6).
+UNPROBEABLE_CONNECTION_AGE_SECONDS = 24 * 3600
 
 
 def _owner_pid(name: str) -> int | None:
     """The pid embedded in a connection file's name, or None if there is none.
 
-    `ipynb-mcp-<kernelId>-<pid>-<random>.json`; the kernelId may itself contain `-`,
-    so this walks from the end looking for the first all-digit field.
+    THE RULE, in full — attribution is positional and the shape must match, because
+    guessing here deletes a file that may belong to a running process:
+
+      `ipynb-mcp-` + `<kernelId>` + `-` + `<pid>` + `-` + `<random>` + `.json`
+
+      * the name must end in the literal `.json`;
+      * the LAST `-`-separated field is `<random>`, mkstemp's suffix: one or more
+        characters, all from MKSTEMP_SUFFIX_CHARS, and `tempfile` emits exactly eight;
+      * the field BEFORE it is `<pid>`: two or more decimal digits, and the whole
+        field (no `.`, no stray characters);
+      * `<kernelId>` is everything between the prefix and those two fields, and is not
+        interpreted at all — it is user-supplied and may contain `-`, digits, or both.
+
+    Anything else returns None, i.e. "this file cannot be attributed". That is the
+    point: the previous rule ("the first all-digit field counting back from the end")
+    read mkstemp's random suffix as a pid whenever the suffix happened to be all
+    digits (p ~ 3.5e-5 per file), and the owner it invented was usually gone — so it
+    deleted a live process's connection file, HMAC key included (review v9 V8-6).
+    A name we cannot attribute is not a name we may act on by age alone; the caller
+    applies UNATTRIBUTABLE_CONNECTION_AGE_SECONDS instead.
     """
-    for field in reversed(name.split("-")):
-        head = field.split(".")[0]
-        # At least two digits: single-digit fields are far more likely to be part of a
-        # kernelId than a pid, and guessing wrong means deleting someone's file.
-        if head.isdigit() and len(head) >= 2:
-            return int(head)
+    if not name.endswith(".json"):
+        return None
+    fields = name[: -len(".json")].split("-")
+    # fields[0] is "ipynb" for any name the caller considers; require our prefix so
+    # this function stays honest when called directly (the sweep filters as well).
+    if len(fields) < 4 or fields[0] != "ipynb" or fields[1] != "mcp":
+        return None
+    # Order matters and is easy to invert: the LAST field is mkstemp's random suffix,
+    # the one BEFORE it is the pid. Stated one per line for exactly that reason.
+    random_field = fields[-1]
+    pid_field = fields[-2]
+    if not random_field or any(ch not in MKSTEMP_SUFFIX_CHARS for ch in random_field):
+        return None
+    # At least two digits: single-digit fields are far more likely to be part of a
+    # kernelId that leaked into the wrong position than a pid, and guessing wrong means
+    # deleting someone's file. `isdigit` is True for non-ASCII digits, which `int()`
+    # would then misread, so restrict it to ASCII as well. The upper bound rejects a
+    # number no pid can be (2^31 outruns every real pid space) rather than passing a
+    # nonsense value to the liveness probe, where "no such pid" would read as "the
+    # owner is gone" and delete a file whose name we merely failed to parse.
+    if not (pid_field.isascii() and pid_field.isdigit()) or not (2 <= len(pid_field) <= 10):
+        return None
+    pid = int(pid_field)
+    return pid if pid < 2**31 else None
+
+
+def _windows_owner_is_alive(pid: int) -> bool | None:
+    """Real liveness probe for Windows: True, False, or None if not permitted.
+
+    `os.kill(pid, 0)` is NOT a liveness probe on Windows — CPython implements it as
+    `TerminateProcess` — so the sweep used to answer "cannot tell" for every file and
+    fall through to the most conservative age rule. That silently reinstated the bug
+    the pid rule exists to fix: the files a crashed run leaves behind sat in %TEMP%
+    for a week instead of the hour the old rule allowed (review v9 V8-6 measured 6 of
+    10 files with long-dead owners).
+
+    `OpenProcess` + `WaitForSingleObject` is the liveness test the OS actually offers:
+    an exited process is a signalled object, so a zero timeout returns WAIT_OBJECT_0
+    for "gone" and WAIT_TIMEOUT for "still running". It cannot kill anything — the
+    handle is opened query-only and closed immediately — and it imports nothing
+    outside the standard library, so it costs the sidecar no new dependency
+    (`tasklist` would: a spawned process per file, in a function that runs at startup).
+
+    `None` (not `False`) when the process exists but we may not query it: "cannot
+    tell" must never be paraphrased into "safe to delete".
+    """
+    api = _windows_process_api()
+    if api is None:
+        return None
+    kernel32 = api["kernel32"]
+    handle = None
+    for access in (api["limited"], api["full"]):
+        handle = kernel32.OpenProcess(access, False, pid)
+        if handle:
+            break
+        # 87 is "no such process" in OpenProcess's vocabulary. Anything else (5, most
+        # often: a protected or higher-integrity process) means the process may well be
+        # there and we simply cannot look at it.
+        if api["last_error"]() != api["invalid_parameter"]:
+            return None
+    if not handle:
+        return False
+    try:
+        verdict = kernel32.WaitForSingleObject(handle, 0)
+    finally:
+        kernel32.CloseHandle(handle)
+    if verdict == api["wait_object_0"]:
+        return False
+    if verdict == api["wait_timeout"]:
+        return True
+    # WAIT_FAILED and anything else: an unusable handle is not evidence of death.
     return None
+
+
+_WINDOWS_PROCESS_API: dict | None = None
+
+
+def _windows_process_api() -> dict | None:
+    """Load and cache the kernel32 entry points the liveness probe needs, once.
+
+    Cached because the sweep calls the probe per candidate file and re-declaring four
+    prototypes (and re-loading the DLL) for each is pointless work at startup, on the
+    path the user waits for. Returns None if the API cannot be loaded at all, which the
+    caller must treat as "no probe here", never as "the owner is gone".
+    """
+    global _WINDOWS_PROCESS_API
+    if _WINDOWS_PROCESS_API is None:
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            kernel32.WaitForSingleObject.restype = wintypes.DWORD
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            _WINDOWS_PROCESS_API = {
+                "kernel32": kernel32,
+                "last_error": ctypes.get_last_error,
+                "limited": 0x1000 | 0x00100000,  # PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE
+                "full": 0x0400,  # PROCESS_QUERY_INFORMATION
+                "invalid_parameter": 87,  # ERROR_INVALID_PARAMETER
+                "wait_object_0": 0x0,  # WAIT_OBJECT_0
+                "wait_timeout": 0x102,  # WAIT_TIMEOUT
+            }
+        except Exception:  # pragma: no cover - only on a broken ctypes install
+            return None
+    return _WINDOWS_PROCESS_API
 
 
 def _owner_is_alive(pid: int) -> bool | None:
     """Whether `pid` names a live process: True, False, or None if unknowable.
 
-    Only meaningful where `os.kill(pid, 0)` is a liveness test, which Windows is not:
-    a pid can be reused, and CPython surfaces the failure as
-    `OSError: <class 'OSError'> returned a result with an exception set` rather than a
-    clean ESRCH. `None` means the caller must fall back to an age rule.
+    The invariant this function exists to protect is one-directional, and both branches
+    below keep it: `False` is only ever returned for a pid that was positively observed
+    to be gone, and a pid we cannot observe returns `None` so the caller falls back to
+    an age rule instead of deleting. `None` never means "probably dead".
     """
     if pid <= 0:
         return False
     if sys.platform == "win32":
-        return None
+        return _windows_owner_is_alive(pid)
     try:
         os.kill(pid, 0)
         return True
@@ -144,7 +278,7 @@ def _owner_is_alive(pid: int) -> bool | None:
         return None
 
 
-def sweep_orphan_connection_files() -> int:
+def sweep_orphan_connection_files(directory: str | None = None) -> int:
     """Delete our own abandoned connection files from the temp directory.
 
     The files carry the kernel's HMAC key, so leaving them behind is a (small) leak
@@ -152,11 +286,18 @@ def sweep_orphan_connection_files() -> int:
     for the paths that cannot — a SIGKILLed sidecar, a host crash, a CI job torn
     down mid-run, which is where the 45 files the v7 review found came from.
 
-    Deliberately narrow: only files matching our own name prefix, only in the
-    interpreter's temp directory, only when the owning pid is provably gone, and never
-    fatal — a sweep that fails must not stop kernels from working. Where pid liveness
-    cannot be tested at all (Windows), only a file with no readable pid AND older than
-    a week is removed, because "one hour old" is not evidence that nothing owns it.
+    Deliberately narrow: only files matching our own name prefix, only in the sweep
+    directory, only when the owning pid is provably gone, and never fatal — a sweep
+    that fails must not stop kernels from working. A file whose name cannot be
+    attributed to a process, or whose pid this platform cannot judge, is removed only
+    after UNATTRIBUTABLE_CONNECTION_AGE_SECONDS, because "one hour old" is not evidence
+    that nothing owns it.
+
+    `directory` exists so the rule can be tested against a temporary directory of
+    purpose-built names instead of the machine's real %TEMP% (that is what
+    `scripts/check-connection-sweep.py` does); production callers pass nothing. It is
+    an argument rather than a module constant precisely so a test cannot redirect the
+    real sweep by accident.
 
     This is the ONLY place the sidecar touches a file it did not create, which is why
     it is registered as D-046 rather than left as an implicit exception to the module
@@ -164,7 +305,7 @@ def sweep_orphan_connection_files() -> int:
     """
     removed = 0
     try:
-        temp_dir = tempfile.gettempdir()
+        temp_dir = directory if directory is not None else tempfile.gettempdir()
         if not os.path.isdir(temp_dir):
             return 0
         now = time.time()
@@ -194,11 +335,21 @@ def sweep_orphan_connection_files() -> int:
                     alive = _owner_is_alive(pid)
                     if alive is True:
                         continue
-                    if alive is None and age <= UNATTRIBUTABLE_CONNECTION_AGE_SECONDS:
-                        # This platform cannot judge the pid, so age has to carry the
-                        # whole argument — and an hour does not.
-                        continue
-                    if alive is False and age <= ORPHAN_CONNECTION_AGE_SECONDS:
+                    # The ladder is ordered by how much the platform actually knows,
+                    # and the age it demands differs accordingly: a pid observed to be
+                    # gone needs only the short grace period, "the probe was refused for
+                    # this one pid" gets a day, and a platform with no probe at all has
+                    # to be maximally conservative. Collapsing the middle case into the
+                    # last is what made Windows wait a week per file (review v9 V8-6);
+                    # collapsing it into the FIRST is what would delete a live owner's
+                    # file, so `None` is never allowed to become `False`.
+                    if alive is False:
+                        limit = ORPHAN_CONNECTION_AGE_SECONDS
+                    elif _liveness_probe_available():
+                        limit = UNPROBEABLE_CONNECTION_AGE_SECONDS
+                    else:
+                        limit = UNATTRIBUTABLE_CONNECTION_AGE_SECONDS
+                    if age <= limit:
                         # A just-exited kernel removes its own file; racing that path
                         # buys nothing.
                         continue
@@ -215,6 +366,32 @@ def sweep_orphan_connection_files() -> int:
     if removed:
         send_log("info", f"removed {removed} orphaned connection file(s) from {temp_dir}")
     return removed
+
+
+def _liveness_probe_available() -> bool:
+    """Whether `_owner_is_alive` can return a verdict on this platform at all.
+
+    Used only to pick the fallback age: a platform that CAN probe but was refused
+    permission for one particular pid is a different case from a platform that has no
+    probe, and only the second one is allowed to be maximally conservative. Without
+    this distinction every file on Windows waited a week (review v9 V8-6).
+    """
+    return sys.platform != "win32" or _windows_probe_usable()
+
+
+def _windows_probe_usable() -> bool:
+    """Whether the Windows ctypes probe can load. False ⇒ behave like the old fallback.
+
+    Checked separately from the probe itself because the two answers mean different
+    things: this one says "the question can be asked on this host", while a `None` from
+    the probe says "it was asked and refused". Only the first decides the fallback age.
+    """
+    try:
+        import ctypes
+
+        return hasattr(ctypes, "WinDLL")
+    except Exception:  # pragma: no cover - ctypes ships with CPython
+        return False
 
 
 KERNELS: dict[str, KernelEntry] = {}
@@ -689,6 +866,16 @@ def main() -> int:
         worker.join(timeout=5)
     op_shutdown_all({})
     _remove_leftover_connection_files()
+    # ...and only now sweep, for a reason that is about ordering and not about tidiness
+    # (review v9 V8-6: the startup-only sweep left this on the table). At this point our
+    # own files are already unlinked above, so nothing here can be ours, and the rules
+    # that protect a live owner are the same ones that ran at startup — a file whose
+    # owner is still alive is skipped no matter how old it is, so a concurrent sidecar
+    # is never at risk. What this buys: a session that runs for hours and leaks a file
+    # mid-session (a SIGKILLed kernel grandchild, a failed start) no longer waits for
+    # the NEXT sidecar to clean up after it. Deliberately the last thing before exit:
+    # the sweep is best-effort and must never delay or replace the shutdown above.
+    sweep_orphan_connection_files()
     return 0
 
 
