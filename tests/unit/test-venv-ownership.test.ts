@@ -11,7 +11,7 @@
 // file. These cases drive the REAL helper against isolated directories, so a future
 // "clean up after ourselves" edit cannot quietly reintroduce the ownership bug.
 
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -73,6 +73,24 @@ async function loadVenvDir(name: string, owned: boolean): Promise<TestVenvModule
   return module;
 }
 
+/** Everything in a directory, with each file's bytes — for "was it touched?" assertions. */
+function snapshotTree(root: string): Record<string, string> {
+  const snapshot: Record<string, string> = {};
+  const walk = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        snapshot[`${path.relative(root, full)}/`] = '<dir>';
+        walk(full);
+        continue;
+      }
+      snapshot[path.relative(root, full)] = readFileSync(full, 'utf8');
+    }
+  };
+  walk(root);
+  return snapshot;
+}
+
 describe('[V8-12] prepareVenv only deletes a venv it created', () => {
   it('leaves a foreign venv in place and falls back to the base interpreter', async () => {
     // No marker: this suite did not create it. Pointing IPYNB_TEST_VENV at a real
@@ -83,6 +101,29 @@ describe('[V8-12] prepareVenv only deletes a venv it created', () => {
     expect(existsSync(module.TEST_VENV_DIR)).toBe(true);
     expect(chosen).not.toBe(module.TEST_VENV_PY);
     expect(chosen).toBe(module.BASE_PYTHON);
+  });
+
+  it('[V11-9] a foreign venv is not WRITTEN to either, and never acquires our marker', async () => {
+    // The v10 assertion above could not see the real defect, because it only asked whether the
+    // directory still existed: the helper said "leaving it alone" and then built a venv INTO
+    // that directory and stamped our marker there, so the NEXT run's deletion branch was
+    // legitimate and the user's environment — contents and all — was removed (review v11
+    // V11-9, reproduced by driving the real helper twice). "Not ours" has to mean not written
+    // to, so this case compares the whole tree byte for byte.
+    const module = await loadVenvDir('foreign-untouched', false);
+    const before = snapshotTree(module.TEST_VENV_DIR);
+    expect(Object.keys(before)).not.toContain(MARKER);
+
+    const first = module.prepareVenv({ modules: IMPOSSIBLE });
+    expect(first).toBe(module.BASE_PYTHON);
+    expect(snapshotTree(module.TEST_VENV_DIR), 'the foreign directory changed').toEqual(before);
+    expect(existsSync(path.join(module.TEST_VENV_DIR, MARKER)), 'our marker was planted').toBe(false);
+
+    // The second call is the one that used to be lethal: with a marker present it deleted the
+    // directory. Driving it twice is the whole point of the case.
+    const second = module.prepareVenv({ modules: IMPOSSIBLE });
+    expect(second).toBe(module.BASE_PYTHON);
+    expect(snapshotTree(module.TEST_VENV_DIR), 'the second call removed or rewrote it').toEqual(before);
   });
 
   it('removes its OWN venv when that venv cannot serve the sidecar', async () => {
@@ -100,7 +141,8 @@ describe('[V8-12] prepareVenv only deletes a venv it created', () => {
     // is the ownership half: the failure may not be implemented by deleting whatever
     // sits at the path.
     const module = await loadVenvDir('required', false);
+    const before = snapshotTree(module.TEST_VENV_DIR);
     expect(() => module.prepareVenv({ modules: IMPOSSIBLE, requireVenv: true })).toThrow(/IPYNB_TEST_REQUIRE_VENV/);
-    expect(existsSync(module.TEST_VENV_DIR)).toBe(true);
+    expect(snapshotTree(module.TEST_VENV_DIR)).toEqual(before);
   });
 });

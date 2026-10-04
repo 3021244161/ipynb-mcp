@@ -105,16 +105,35 @@ function resolveVenv(options: PrepareVenvOptions): string {
     return TEST_VENV_PY;
   }
 
-  // An existing but unusable venv: delete it if it is ours, and say so if it is not.
-  if (existsSync(TEST_VENV_DIR)) {
-    if (existsSync(path.join(TEST_VENV_DIR, VENV_MARKER))) {
-      rmSync(TEST_VENV_DIR, { recursive: true, force: true });
-    } else {
-      process.stderr.write(
-        `[test-venv] ${TEST_VENV_DIR} cannot import ${modules.join(', ')} and was not ` +
-          'created by this suite; leaving it alone and using the base interpreter\n',
+  // A directory at the venv path that this suite did not create is NOT OURS TO TOUCH — and
+  // that has to mean "not written to" as well as "not deleted".
+  //
+  // The v10 comment said "leaving it alone" while the code below went on to build a venv INTO
+  // that same directory and stamp its marker there; on the next run the marker made the
+  // deletion branch legitimate, so the user's environment (and its contents) were removed
+  // (review v11 V11-9). `IPYNB_TEST_VENV` is documented as a way to point the suite at an
+  // environment you already have, which makes this reachable by following the README.
+  //
+  // The tradeoff is explicit: a caller who points `IPYNB_TEST_VENV` at an environment missing
+  // a module gets the base interpreter instead of a repaired copy of their environment.
+  // `IPYNB_TEST_REQUIRE_VENV=1` turns that into a loud failure rather than a silent fallback.
+  if (existsSync(TEST_VENV_DIR) && !existsSync(path.join(TEST_VENV_DIR, VENV_MARKER))) {
+    if (requireVenv) {
+      throw new Error(
+        `IPYNB_TEST_REQUIRE_VENV=1 but ${TEST_VENV_DIR} cannot import ${modules.join(', ')} and this ` +
+          'suite did not create it; point IPYNB_TEST_VENV at a usable environment or remove it yourself',
       );
     }
+    process.stderr.write(
+      `[test-venv] ${TEST_VENV_DIR} cannot import ${modules.join(', ')} and was not ` +
+        'created by this suite; leaving it untouched and using the base interpreter\n',
+    );
+    return BASE_PYTHON;
+  }
+
+  // From here the directory is either absent or ours, so the suite may rebuild it.
+  if (existsSync(TEST_VENV_DIR)) {
+    rmSync(TEST_VENV_DIR, { recursive: true, force: true });
   }
 
   // Only build one from an interpreter that can actually serve it.
