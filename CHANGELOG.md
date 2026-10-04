@@ -2,6 +2,55 @@
 
 本项目的接口变更遵循 D22 兼容承诺（工具名与参数名在 1.x 内不删不改；新增参数一律可选带默认值；返回字段只增不删）。
 
+## [Unreleased] 0.1.0 — 第十一轮代码复核整改（未发布）
+
+> 来源：`docs/review/ipynb-mcp-code-review-v11.md`。
+> **无工具名/参数名变更**；**唯一新增返回字段**：`notebook_run_status` 与 `notebook_run_cancel` 的 `facts_pending`（登记 **D-055**，纯新增，不轮询的旧客户端行为不变）。
+
+### Fixed — 对模型陈述假事实（🟠）
+
+- **完全精确、只是写法不同的数字被报成"无法精确表示"**（🟠）：判据是"写法和 `String(Number(literal))` 是否相同"——也就是**字节**问题，却被当成了**值**问题。于是 Python 自己 `json.dumps` 的日常输出（`100.0`、`1.5e-07`、`2.5e-05`）全部被标成"was not representable exactly"，**任何含小数的 DataFrame/`float` 结果都中招**；真警报（`2**64`、`1e400`）淹没在噪声里。判据改为**值**：只去掉无信息的写法差异（指数正号与前导零、尾随 `.0` 与多余零、`String()` 的整数写法）后仍与 `String(Number(literal))` 不同的，才算损失。`-0` 仍标记，但改说"符号无法经 JSON 通道传递"。代价是 `100.0`/`1E+2` 现在写成 `100`——值相同、文件仍合法，符合 SPEC §5.5.7 的"逻辑不变，而非字节最小 diff"。见 **D-056**。
+- **守卫无法证伪自己**（🟠，同一条的根因）：v10 的矩阵用**被测函数**推导期望值（`inexactLiteralsIn()` 内部调用 `losesPrecision`），所以判据错了，24 条用例照样全绿。现在两张表都把期望**写死**（`json-exact.test.ts` 的两组显式字面量、`json-number-forms.test.ts` 的 37 条规范化器期望），并新增 `[V11-1]` 规范化器对照表。
+
+### Fixed — 终态与事实不同时到达（🟠）
+
+- **取消后的"空壳终态"**（🟠，V10-7 的修复在最常见流程下等于没修）：`notebook_run_cancel` 按 SPEC §4.8 规则 1 **立刻**发布 `state: "cancelled"`，而 `executed`/`warnings`/`write_back` 要等在途 cell 结束、后台任务收尾才补上。于是在**整个在途 cell 的剩余时长**里（Windows 上 interrupt 无效，25 秒的 cell 就是 25 秒），客户端读到的是一份自洽而虚假的载荷：`cancelled` + `executed: []` + `warnings: []` + `write_back.performed: false`；**然后文件在它背后被改写**。模型有充分理由断定"什么都没发生"并重跑——恰好是规则 3 想避免的行为。现在终态**要么带着事实，要么声明事实还没到**：新增 `facts_pending`，由后台任务在最后一条语句里清回 `false`。这类缺陷**在单元测试里看不见**（它只存在于两次查询之间），所以用例是真的：真 kernel、真取消、取消后**立刻**读一次 status。见 **D-055**。
+
+### Fixed — 默认出口静默舍入（🟠）
+
+- **默认 read 路径（`summary`）把舍入后的数字给模型，且零警告**（🟠）：`mapRawOutputs` 已经把 `9007199254740993` 投影成 `…992`、把 `1e400` 投影成 `null` 并生成了逐项警告，但**提升到调用级 `warnings[]` 的那段代码只在 `include_outputs: "full"` 时执行**。而 `summary` 正是 SPEC §4.3 的默认出口、也是 README 推荐的省 token 用法。现在 `none` 之外的每个出口都提升，`none`（用户主动不看）保持沉默，并有一条"干净输入不产生警告"的反向用例。
+
+### Fixed — 内部标记与不实提示（🟡）
+
+- **内部 marker 从 `execution_count` 漏进模型可见响应**（🟡）：`jsonValueOf` 的递归投影只覆盖 json **值**，而 `execution_count` 由另一条路（`render/read.ts`）直接透传，于是 `9007199254740993` 被发成 `{"__ipynb_exact_number__": "9007199254740993"}`——一个文件里不存在、文档里也没有的结构。计数现在在**读入时归一化一次**（accessor：读者拿到数字，写者仍拿到 marker，字节不变），规则另拆出 `execution_count_not_an_integer`，hint 不再用为 `-1` 写的措辞去描述一个数值合法的大整数。
+- **`1e400` 交付 `null`，文案却说客户端会读到 `Infinity`**（🟢）：文案必须描述**实际交付的载荷**，现在分三种情况生成（超范围 → null、`-0` → 符号、其余 → 舍入值）。
+
+### Fixed — 有界性与可归因性（🟡）
+
+- **警告 message 的上界只数"条目"、不限"单条长度"**（🟡）：v10 把明细截到 8 条，一个 20 000 字符的 mime **名**就把这条路重新打开（message ≈ 名字长度 + 70，线性）。现在每个 mime 名也被截到 64 字符，用例断言的是 `message.length`。见 **D-053** 的 v11 补充。
+- **图片降级警告不指名 cell**（🟡）：文案只有输出下标，而每个 cell 的 outputs 都从 0 开始，于是三个 cell 各自坏图产出三条**逐字节相同**的消息：read 打印三遍（分不清是哪个 cell）、run 去重成一条（丢掉的正是"哪几个 cell"）。现在文案是 `image at cell N (output M) …`，去重不再损失归因。见 **D-057**。
+
+### Fixed — parser 的三格边界（🟡）
+
+- ① **未转义控制字符**被接受（`JSON.parse` 与 Python 都拒绝），而下一次写入会把它**转义**——非法文件被悄悄改合法、用户字节被改而无警告；② **12 000 层嵌套**耗尽栈，报 `parse_failed` + "notebook file is not valid JSON"——对一份 `JSON.parse` 能接受的文档说假话，并让它永久不可读（现在有显式深度上限 512 与描述**原因**的文案）；③ **序列化器能产出非法 JSON**（`[1,,3]`：`map` 跳过空洞、`join` 渲染成空）。见 **D-058**。
+
+### Fixed — 测试与门禁自身（🟡）
+
+- **测试套件会写进并删除用户的 venv**（🟡）：`IPYNB_TEST_VENV` 指向的环境缺依赖时，helper 先说"leaving it alone"，随后把 venv 建进**同一个目录**并盖上"本套件创建"的 marker；下一次该目录不可用时，marker 让删除分支成立——**用户的 venv 连内容一起被删**。现在外来目录**完全不写**，直接回退基础解释器，用例做**字节级**目录快照两轮驱动。见 **D-055** 轮次的说明。
+- **状态表虚报**（🟡）：`REVIEW-FIX-STATUS.md` 有一行宣称两项已修，而两句都不成立（幽灵符号仍在、恒真断言一字未改）。已订正为 ⚠️ 并真修，同时加**机械门禁**：`✅` 行若声称"已订正/已删除/已改名"，必须点名一个**存在**的符号或路径——符号只在代码目录里找，否则那一行会在自己身上找到自己。
+- **`check-docs` 的计数可以自证**（🟡）：删掉末行再把 `entries` 减一，两个数依然一致。现在文档头部有一个**指纹**（`node scripts/check-docs.mjs --print-digest` 生成），任何增删改都必须重新生成它。
+
+### Tests
+
+- 新增集成 `tests/integration/v11-terminal-state.test.ts`（3 例，真 kernel）：取消后**立刻**读 status 的载荷断言、`facts_pending` 落地后的两向断言、两个载荷构造器的形状断言；变异验证——去掉 raise 后立刻红并打印出那个空壳载荷。
+- 新增集成 `tests/integration/v11-read-warnings.test.ts`（5 例，四种出口的矩阵）：默认/`summary` 必须报告舍入，`full` 同样，`none` 保持沉默，干净输入零警告。变异验证——只给 `full` 时默认与 summary 两条立刻红。
+- `tests/integration/v10-regressions.test.ts` 新增 3 例 V11-6（大整数计数可读可编辑、`1.5` 被拒且 hint 符合原因）。
+- `tests/unit/json-parser-semantics.test.ts` 新增 `[V11-8]` 三例（6 个控制字符样本、深度两侧边界、空洞与 `JSON.stringify` 对照）。
+- `tests/unit/json-number-forms.test.ts` 重写为**显式表**（26 形态 × 8 位置）+ 37 条规范化器期望。
+- `tests/unit/image-blocks.test.ts` 新增 `[V11-10]`（三 cell 坏图 → 三条互不相同的消息）。
+- `tests/unit/test-venv-ownership.test.ts` 新增 `[V11-9]`（外来目录字节级未变、两轮驱动、无 marker）。
+- 单测 **552 → 600**（32 文件）；集成 **58/8 → 69/10 文件**；`check-docs --selftest` 变异 **10 → 12**。
+
 ## [Unreleased] 0.1.0 — 第十轮代码复核整改（未发布）
 
 > 来源：`docs/review/ipynb-mcp-code-review-v10.md`。

@@ -1,6 +1,6 @@
 # 代码审查整改状态（review fix status）
 
-> **来源**：`docs/review/ipynb-mcp-code-review.md`（第一轮）、`…-v2.md`、`…-v3.md`、`…-v4.md`、`…-v5.md`、`…-v6.md`、`…-v7.md`、`…-v8.md`、`…-v9.md`、`…-v10.md`（第十轮 / 本轮）
+> **来源**：`docs/review/ipynb-mcp-code-review.md`（第一轮）、`…-v2.md`、`…-v3.md`、`…-v4.md`、`…-v5.md`、`…-v6.md`、`…-v7.md`、`…-v8.md`、`…-v9.md`、`…-v10.md`、`…-v11.md`（第十一轮 / 本轮）
 > **权威**：`SPEC.md` + `AGENTS.md`。整改只做「实现与被 SPEC 判定不符」的部分；
 > SPEC 自身的缺陷按 AGENTS §0 记入 `DEVIATIONS.md` 后按 SPEC 继续。
 >
@@ -21,10 +21,53 @@
 > 这正是 P0-a 要的结果：在唯一会自动运行的环境里，产物合法性**确实被外部权威检查过**（此前 `nbformat` 不在依赖闭包里，三条断言被 `if` 静默跳过而套件仍全绿）。
 > 集成用到的解释器与三平台默认根见 `COMPATIBILITY.md`。
 >
-> **上面这段门禁数字是第六轮当时的快照**（不随轮次改动）。**当前数字见第十轮段的开篇**。
+> **上面这段门禁数字是第六轮当时的快照**（不随轮次改动）。**当前数字见第十一轮段的开篇**。
 ---
 
-## 〇、第十轮（`ipynb-mcp-code-review-v10.md`，本轮）
+## 〇、第十一轮（`ipynb-mcp-code-review-v11.md`，本轮）
+
+> 本轮的三条 🟠 有一个共同点：**都在 v10 的"已修"里**。V10-3 的修复（保护数值不被改写）把判据定成了"写法"，
+> 于是**对模型陈述假事实**；V10-7 的修复（装配 warnings）解决了"装配"没解决"**送达**"；V10-1 的修复（递归投射）
+> 只覆盖了 json **值**。这正是本项目反复出现的那一格：**守卫只覆盖被改的那一层**。
+>
+> 另外，v10 引入的**守卫本身**有三处无法证伪自己（期望值由被测函数推导、文档计数自证、状态表 ✅ 没有可 grep 的产物）。
+> 所以本轮除了修产品，还给这三处各加了一条机械门禁——**纪律守不住的东西，交给门禁守**。
+>
+> **门禁实测（第十一轮整改后，亲跑）**：`pnpm typecheck` exit 0 ｜ `pnpm lint` **0 警 0 错** +
+> `format check: ok` + `structural indent check: ok (28 self-test samples)` +
+> `documentation self-test: ok (12 mutation(s) detected, 0 skipped, control clean)` +
+> `documentation check: ok` ｜ 单测 **600 passed / 32 文件** ｜ 集成 **69 passed / 10 文件**（约 287 s）｜
+> `pnpm smoke` **26/26** ｜ `pnpm check:package` **ok（140 文件，22 变异）** ｜
+> `python scripts/check-connection-sweep.py` **PASS** ｜ `pnpm build` exit 0 ｜ 工作树干净。
+
+### 11.1 本轮条目（完整清单）
+
+| 条目 | 状态 | 处置与证据 |
+|---|---|---|
+| **V11-1** 🟠 完全精确、只是写法不同的数字被报成"无法精确表示" | ✅ | 判据从**写法**改为**值**：`normalizedSpelling(literal) === String(Number(literal))`，`normalizedSpelling` 只去掉无信息的写法差异（指数正号/前导零、尾随 `.0` 与多余零、整数写法）。`100.0`/`2.0`/`1e2`/`1.5e3`/`0.10`/`1.5e-07`/`2.5e-05`/`1e+100` 现在**零警告**；`2**64`/`1e21`/高精度小数/`1e400` 仍被保护。`-0` 单独一条"符号无法传递"的文案。登记 **D-056**。证据：`json-exact.test.ts` 的**显式表**（两组字面量写死）、`json-number-forms.test.ts` 的 26 形态 × 8 位置 + 37 条规范化器期望。**变异验证**：把判据退回"写法相同"→ 12 条红 |
+| **V11-1 附带** 🟠 守卫用被测函数推导期望值 | ✅ | `inexactLiteralsIn()` 删除，改为 `expectedWarnedLiterals()`（从**写死的 FORMS 表**推导，带数字 token 边界以免 `1e-07` 里的 `-0` 被当成字面量）。这正是 v11 说的"期望自我循环" |
+| **V11-2** 🟠 `structuredClone` 前提是反的，且撑住 marker 的全部身份保证 | ✅ | 实测确认（`isExactNumber(structuredClone(marker)) === false`、克隆后是**可扩展**的、序列化会把 marker **对象**写进文件），注释改为真话并写明**已知限制**而非不变量：marker 只保证不被**文件**伪造，任何克隆都会让它失效，因此**序列化路径必须使用未经克隆的原始文档**（今天确实如此：`structuredClone` 只用于比较用的快照）。新增 `[V11-2]` 断言把这条假设变成**测量**。D-050 的叙述同步订正 |
+| **V11-3** 🟠 取消后的"空壳终态" | ✅ | 新增 `facts_pending`（`RunHandle` + 两个载荷），取消时置 `true`，后台任务在**最后一条语句**里清 `false`。登记 **D-055**。证据：`tests/integration/v11-terminal-state.test.ts`（真 kernel：cell0 丢值完成 → cell1 在途 → 取消 → **立刻**读 status）。**变异验证**：去掉 raise → 用例立刻红并打印出评审实测的那个空壳载荷（`executed: []` / `warnings: []` / `write_back.performed: false`） |
+| **V11-4** 🟡 状态表虚报（两项宣称已修而都没修） | ✅ | 该行订正为 ⚠️ 并**真修**：幽灵符号 `callWarnings` → `pushCallWarnings`（可 `git grep`），恒真断言 `Number(literal) !== NaN` → `losesPrecision(literal)`。新增机械门禁：`✅` 行含"已订正/已删除/已改名"等词时必须点名一个**存在**的符号或路径。**变异验证**：不存在的符号 → 红；存在且点名 → 绿；什么都不点名 → 红。门禁**第一版失效**（在 `docs/` 里搜符号，于是那一行在自己身上找到自己），已修正为只在代码目录里搜 |
+| **V11-5** 🟠 默认出口（`summary`）静默舍入且零警告 | ✅ | 警告提升移出 `full` 分支，`none` 除外。证据：`tests/integration/v11-read-warnings.test.ts`（四种出口的矩阵 + 干净输入零警告）。**变异验证**：只给 `full` → 默认与 summary 两条红 |
+| **V11-6** 🟡 marker 从 `execution_count` 漏进响应；合法文件被拒且 hint 不实 | ✅ | 计数在 `parseNotebook` **归一化一次**：字段变成 accessor（**读者拿数字、写者拿 marker**，写回时由 `restoreExecutionCountMarkers` 还原，字节不变），规则拆出 `execution_count_not_an_integer`，hint 按规则分述（不再用 `-1` 的措辞描述大整数）。证据：`v10-regressions.test.ts` 的 3 条 V11-6（读大整数是数字、合法文件可编辑且字节不变、`1.5` 被拒且 hint 含 "whole number of executions"） |
+| **V11-7** 🟡 message 上界只数条目、不限单条长度 | ✅ | 每个 mime 名截到 64 字符（`DROPPED_MIME_NAME_LIMIT`），用例断言 `message.length`。证据：`run-reporting.test.ts` 的 `[V11-7]`（20 000 字符的名单条 < 400；八个最长名 < 1000；能放下的名字不被截） |
+| **V11-8** 🟡 parser 三格边界 | ✅ | ① 未转义控制字符拒绝（6 个样本与 `JSON.parse` 逐条对照）；② 显式深度上限 `MAX_JSON_DEPTH = 512` + 描述原因的 `parse_failed` 文案（不再断言"不是合法 JSON"）；③ 序列化按下标循环，空洞写 `null`。登记 **D-058** |
+| **V11-9** 🟡 测试套件会写进并删除用户的 venv | ✅ | 外来目录（存在但无 marker）**完全不写**：立刻回退 `BASE_PYTHON`（或按 `IPYNB_TEST_REQUIRE_VENV` 报错），不再往里 build、不再种 marker。证据：`test-venv-ownership.test.ts` 的 `[V11-9]`（**字节级**目录快照 + 两轮驱动 + 断言无 marker）。**变异验证**：去掉提前返回 → 第二条调用把目录删掉（评审实测的同一形态） |
+| **V11-10** 🟡 图片降级警告不指名 cell；read 不去重、run 去重 | ✅ | 文案改为 `image at cell N (output M) …`，`ExtractedImage` 新增 `cellIndex`，两处调用方传入。登记 **D-057**。证据：`image-blocks.test.ts` 的 `[V11-10]`（三 cell 坏图 → 三条互不相同的消息） |
+| **V11-11** 🟡 `check-docs` 还剩两格 | ✅ | ① 加**不可自证**的锚：文档头部 `> digest:`（编号的 sha256 前 16 位），由 `--print-digest` 生成；删末行 + 改计数 → **红**。② `declareCount` 放宽到 40 行且接受 `entries: 54 rows` 这类修饰，缺 digest 行本身也算问题（"规则被关掉"不能看起来像"规则通过"）。自测变异 **10 → 12** |
+| **V11-12①** 🟢 `1e400` 文案说会读到 `Infinity`，实际交付 `null` | ✅ | 文案按**实际交付的载荷**分三种生成（超范围 → null、`-0` → 符号、其余 → 舍入值）。 |
+| **V11-12②** 🟢 `['a','b']` 仍可能被 join 成 1 字节"图片" | ✅（登记为**已知行为**） | 采纳评审建议**不加**魔数检查（会误伤 Jupyter 自己的分行 base64），在 **D-054** 里写明这一格：从值本身无法分辨，属于已知行为而非缺陷。 |
+
+### 11.2 未做与残留
+
+- **E1–E9 真实第三方客户端**：仍 **0/9**，发布前最后一道非代码门（与前几轮相同）。
+- **macOS / arm64**：本轮未在 macOS 复跑任何东西；集成不在 macOS 上跑是 SPEC §9 的既定决策。
+- **`execution_count` 的写法规范化**：文件里写 `3.0` 时，本工具写回 `3`（值相同、nbformat 对**浮点拼写**本来就判 INVALID，而 `3.0` 经 Python `json` 解析后是整数 3，所以两种权威的结论不同）。这是一格**已知的字节级规范化**，未在 D-056 之外单独立项。
+- **`--images=never` 与超限时 artifact 已写**：v10 登记的固有序（先物化后组装）未动。
+- **`facts_pending` 的 spec 缺口**：SPEC §4.8 的 status 载荷与 cancel 载荷都没有这个字段，属于**新增返回字段**（D22 允许只增不改），已按 AGENTS §0 登记为 **D-055**。
+
+## 〇-0、第十轮（`ipynb-mcp-code-review-v10.md`）
 
 > 本轮的两条 🔴 有一条是**新引入的回归**，而且它比被修的那条更重：为 V9-5 换上自研 JSON parser 之后，
 > 对象键用 `result[key] = value` 承接，`__proto__` 命中的是 `Object.prototype` 的 **setter** —— 该键既不进对象也不进响应，
@@ -49,7 +92,7 @@
 | **V10-7** 🟠 中止类出口与后台 status 丢掉全部 warnings | ✅ | `failedRunError` 新增 `collected` 形参，`abortedRunError` 传入已收集的 warnings 与 droppedMimes；`executeBackgroundRun` 的 catch 把 `detail.warnings` 写回 `handle.warnings`；装配规则下沉到 core 的 `assembleCallWarnings`，四个终态出口共用。登记 **D-052**。证据：集成 `[V10-7]`（真 kernel：cell 0 丢值 → cell 1 在途取消 → 终态 `cancelled` 且 detail 里含 `cell 0: text/plain`；由 run 自己的 progress 事件驱动取消，不靠猜时长） |
 | **V10-4** 🟠 hint 声称"文件会变合法"而权威判它不合法 | ✅ | 文案改为分别陈述"本工具不再检查"与"计数仍在文件里、`nbformat.validate` 仍会拒绝"；`selfCheckNotebook` 的**首次拒绝路径也一律带 hint**（此前未传 `originalDoc` 时没有）。证据：集成 `[V10-4]` 两例——`clear_outputs` 之后**真 nbformat 仍 INVALID**（并断言消息含 `-1`）、`set_cell_type`→markdown 之后 **VALID**；单测断言旧措辞已消失 |
 | **V9-1 残留** 🟠 图片数组形式两条路径判据不同 + `[1,2,3]` 伪造图片 | ✅ | 共用 `imageValueText`：仅当元素全为字符串时 join；读入边界对图片 mime 保留数组形状、只在全字符串时 join，因此读路径与 run 路径交给 `mapRawOutputs` 的是同一种东西。登记 **D-054**。证据：`tests/unit/image-blocks.test.ts` 43 例（新增数字数组 / 混合数组 / 对象数组 / 空数组 / 嵌套数组 5 种非法形状，均断言零块 + `image_materialize_failed`） |
-| **V10-5** 🟡 警告装配无行为级判据 + 幽灵符号 + 恒真断言 + check-docs 两个盲点 | ✅ | 规则下沉到 core `assembleCallWarnings` 并用**真输入**直接单测；`callWarnings` 幽灵符号的注释已订正为 `pushCallWarnings`；恒真断言（`Number(literal) !== NaN`）随 v9 的用例重写而删除；`check-docs` 新增"**末尾条目被删**"与"**追加条目未改计数**"两条可失败规则——计数写在文档头部 `entries: NN`。证据：`tests/unit/run-reporting.test.ts` 的 `[V10-5]`（三事实一次装配、空事实静默、去重）；`check-docs --selftest` 10 个变异全红（含这两格） |
+| **V10-5** 🟡 警告装配无行为级判据 + 幽灵符号 + 恒真断言 + check-docs 两个盲点 | ⚠️ **部分（v11 复核订正）** | 规则下沉到 core `assembleCallWarnings` 并用**真输入**直接单测（这一半成立，v11 也是这么确认的）；`check-docs` 新增"末尾条目被删"与"追加条目未改计数"两条可失败规则。**v11 复核订正了本行原先的两个 ✅ 断言——当时两句都不成立**（V11-4）：`src/run.ts` 里 `callWarnings` 这个**并不存在**的符号的注释**没有**订正；`tests/unit/json-exact.test.ts` 的恒真断言 `Number(literal) !== NaN` **一字未改**（当时只重写了紧邻的那个 `it`）。**第十一轮已真修**：幽灵符号改名为 `pushCallWarnings`（可 `git grep pushCallWarnings`），恒真断言换成 `losesPrecision(literal)` 的真判据；并新增一条**机械门禁**防止再次虚报（见第十轮段的 V11-4 行）。证据：`tests/unit/run-reporting.test.ts` 的 `[V10-5]`；`check-docs --selftest` 12 个变异全红 |
 | **V10-8** 🟡 检查器会因**合法修订**变红 | ✅ | 自测的变异源改为**从当前文本推导**（最后一个编号 / 中间编号 / 下一个编号 / §12 的任一行），施加不了就**跳过并显著提示**，并设"可施加数量下限 5"防止容错退化成什么都不查；`editLine` 的 `throw` 改为返回 null 由调用方跳过。证据：把 SPEC §12 与 `OPEN_QUESTIONS.md` **同步**改一个词（verbatim 仍成立）→ `check` exit 0、`--selftest` exit 0（改前会 exit 1）；只改一边 → 两者都红 |
 | **V10-9①** 🟡 警告 message 无上界 | ✅ | 最多列 8 个 `(cell, mime)` 对，其余 `… and N more`，**计数保持精确**；上限常量在 core 导出，用例引用而非写死。登记 **D-053**。证据：`[V10-9]` 用例（300 项 → message < 400 字符、含 `dropped 300` 与 `… and 292 more`；正好 8 项时不出现 `more`） |
 | **V10-9②** 🟡 `analyze-op` 的 afterAll 判据与 helper 行为矛盾 | ✅ | 断言从"之前存在"收窄为"之前存在**且可用**"——不可用的共享 venv 被 helper 删除是登记过的设计，随后重建失败时路径合法地不存在，旧文案却指责测试删了不是自己创建的环境。 |
@@ -66,7 +109,7 @@
 - **两处仍值得将来处理的形状**（本轮未做，非阻塞）：① `--images=never` 与超限时，若某 cell 的块被 `result.ts` 丢弃，其 `artifact_path` 可能已指向刚写的文件——"先物化后组装"的固有序；② `run.test.ts` 的权威解释器用例依赖 `resolvedTestInterpreter()`，在没有 venv 的裸机上仍会走 base 解释器（这是设计，但值得在 CI 里断言它确实用了 venv）。
 
 
-## 〇-0、第九轮（`ipynb-mcp-code-review-v9.md`）
+## 〇-1、第九轮（`ipynb-mcp-code-review-v9.md`）
 
 > 本轮的两条 🔴 是**同一个错误的第四次与第五次形态**。v8 为修"data-URL 图片看得见读不出"只改了**解码/物化**那一层，
 > 断言停在内部 `OutputItem`（`bytes > 0`、`__decodeFailed === false`），而**内容块**那一层仍把文档里的 `data:` 原值交给 SDK
@@ -132,7 +175,7 @@ V9-3/D-047 则把"组装结果"这一层也纳入了闸门——**不能假定�
   （`git show HEAD:.github/workflows/ci.yml` → 第 90 行 `- run: pnpm smoke`，第 86 行 `- run: pnpm check:package`），所以"19/19 目前只是本机"这条不成立。
   本轮 smoke 的唯一缺口是**本轮尚未在 CI 上跑过**（本机 26/26，CI 结果看下一次运行）。
 
-## 〇-1、第八轮（`ipynb-mcp-code-review-v8.md`）
+## 〇-2、第八轮（`ipynb-mcp-code-review-v8.md`）
 
 > 第八轮的两条 TOP 都指向同一件事：**v7 的修复只覆盖了等价类的一半，而 v7 的复验也只跑了上一轮点名的那一格**。
 > 因此本轮把"修数据形状缺陷 = 补该字段全部合法类型的矩阵 + 逐项先红后绿"写进 `AGENTS.md` §9（见"新增硬规则"一节），
@@ -190,7 +233,7 @@ V9-3/D-047 则把"组装结果"这一层也纳入了闸门——**不能假定�
 > `fileParallelism: false` 加 `tests/unit/test-venv-ownership.test.ts` 的所有权用例（理由与证据见第九轮段对应两行）。
 
 
-## 〇-2、第七轮（`ipynb-mcp-code-review-v7.md`）
+## 〇-3、第七轮（`ipynb-mcp-code-review-v7.md`）
 
 > 第七轮的核查对象是**读方向**、**守卫之间的一致性**，以及**文档与代码是否相符**。
 > 它给出的三条 TOP：V7-1（读方向把合法的 `application/json` 静默改写/丢弃）、P0-a（唯一的外部权威在唯一的自动化环境里恒缺席）、
@@ -225,7 +268,7 @@ V9-3/D-047 则把"组装结果"这一层也纳入了闸门——**不能假定�
 | **V7-15** 🟡 两文档数字互斥 | ✅ | 以实测为准统一（见门禁段），并写明两份文档由同一次验收同时更新 |
 | **工作树未提交** 🟡 hygiene | ✅ | `AGENTS.md` 的改动已随本轮提交入库 |
 | **NEW-6** 🟢 stderr 尾巴挂到无关失败上 | ⚠️ **仍未收口** | 第六轮那行是虚报（只改了 `!this.alive` 一支）；本轮如实标 ⚠️ 并保留，因为"哪次失败与 stderr 有关"需要先定义，属设计判断而非机械修改 |
-| **D-033 措辞** | ✅ | 已订正（见 DEVIATIONS） |
+| **D-033 措辞** | ✅ | 已订正（`docs/DEVIATIONS.md` 的 D-033 行） |
 
 ### 7.2 本轮的验证方式
 
@@ -236,7 +279,7 @@ V9-3/D-047 则把"组装结果"这一层也纳入了闸门——**不能假定�
   于是"实现明明已修"却始终为红。改用每条用例一个空缓存后立刻转绿；这条经验（被测世界与缓存必须同生命周期）写进了注释。
 - 本轮**没有**再出现"声称已修但代码里没有"：三条第六轮虚报逐条订正为真实状态，其中两条在本轮真正做完，一条如实标 ⚠️。
 
-## 〇-A、第六轮（`ipynb-mcp-code-review-v6.md`）
+## 〇-4、第六轮（`ipynb-mcp-code-review-v6.md`）
 
 > 本轮的核查对象是**仓库自己的测试与脚本**（把守卫当被测对象做变异），加上 **CI 首次真跑**的失败
 > （GitHub issue #1）。结论：v5 的修复是真的，但新加的写前闸门、缩进检查器与几处测试本身有缺陷，
