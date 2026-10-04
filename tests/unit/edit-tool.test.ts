@@ -485,18 +485,25 @@ describe('[V8-14] the refusal must recommend an operation that actually works', 
     expect(body['code']).toBe('selfcheck_failed');
     const detail = body['detail'] as Record<string, unknown>;
     expect(detail['problem']).toMatchObject({ rule: 'execution_count_negative' });
-    // V9-8: the hint must be TRUE, not merely mention an operation. v8 asserted
+    expect(detail['pre_existing']).toBe(true);
+    // The hint must be TRUE, not merely mention an operation. v8 asserted
     // `toContain('clear_outputs')` and the sentence it pinned claimed the operation
-    // "resets the cell execution count" — which SPEC §4.5 rule 5 forbids, which
-    // `edit.ts` deliberately does not do, and which step 2 below now measures.
+    // "resets the cell execution count" (SPEC §4.5 rule 5 forbids that, and `edit.ts`
+    // deliberately does not do it). v9 fixed that half and over-claimed the other: it
+    // ended "so the file becomes valid", which the AUTHORITY denies (review v10 V10-4).
+    // So the assertions below are about the two halves separately, and the ones that
+    // matter are the behavioural ones in steps 2/2b/3 — not the wording.
     const hint = String(detail['hint'] ?? '');
     expect(hint).toContain('execution_count_negative');
     expect(hint).toContain('clear_outputs');
     expect(hint).toContain('does not change the count');
     expect(hint).toContain('set_cell_type');
+    // V10-4: the old wording's promise must be gone, and the honest limit stated.
+    expect(hint).not.toContain('the file becomes valid');
+    expect(hint).toContain('nbformat.validate still rejects it');
   });
 
-  it('step 2: the recommended clear_outputs SUCCEEDS and leaves a file the gate accepts', async () => {
+  it('step 2: clear_outputs SUCCEEDS; the count stays and the authority still refuses the file', async () => {
     const nb = await negativeCountNotebook('v814-b.ipynb');
     const { isError, body } = await runEdit({
       path: nb,
@@ -508,9 +515,10 @@ describe('[V8-14] the refusal must recommend an operation that actually works', 
       outputs_cleared: true,
     });
 
-    // SPEC §4.5 rule 5: the count is NOT touched by this operation. That is exactly
-    // what the hint has to say, and the reason the file is nevertheless accepted:
-    // with the outputs gone, the count is no longer part of any rule the gate applies.
+    // SPEC §4.5 rule 5: the count is NOT touched by this operation. That is what the
+    // hint says, and it is also why the FILE remains invalid — the claim v9's wording
+    // got wrong. Our own gate no longer checks a cell with no outputs; `nbformat` does,
+    // and the hint now says so rather than promising validity.
     const written = JSON.parse(await readFile(nb, 'utf8')) as {
       cells: Array<Record<string, unknown>>;
     };
@@ -518,6 +526,12 @@ describe('[V8-14] the refusal must recommend an operation that actually works', 
     expect(written.cells[0]!['execution_count']).toBe(-1);
     expect(findStructuralProblem(parseNotebook(new TextEncoder().encode(await readFile(nb, 'utf8')), hasher).doc))
       .toBeNull();
+    // The external authority, which is the only thing entitled to say "valid": it is a
+    // Python check, so it is exercised in the integration suite
+    // (`tests/integration/v10-regressions.test.ts` asserts the same sentence's
+    // consequence end to end). What is asserted here is that OUR gate's acceptance is
+    // not confused with validity — the mistake that produced V10-4.
+    expect(written.cells[0]!['execution_count']).not.toBeNull();
   });
 
   it('step 2b: the hint is a promise — a SECOND edit of the cleared cell is not refused', async () => {

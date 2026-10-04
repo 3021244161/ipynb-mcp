@@ -59,6 +59,40 @@ function mimeText(value: unknown): string | null {
   return dataValueToString(value);
 }
 
+/**
+ * The mime keys this tool treats as images (SPEC §4.4). Shared by the read boundary and
+ * the image branch so "which keys are images" has one answer.
+ */
+function isImageMime(mime: string): boolean {
+  return mime === 'image/png' || mime === 'image/jpeg';
+}
+
+/**
+ * A base64-carrying mime value as a string, or null when it is not one.
+ *
+ * STRICTER than {@link dataValueToString}, and the difference is the whole point of the
+ * function existing (review v10, V9-1 residue). nbformat allows a mime value to be a
+ * string OR an array of strings, and both are legal for an image; but a mime value may
+ * also be any JSON value in practice, and `[1,2,3]` (or `{...}`) reaching a `String()`
+ * map produces `"123"` — which is valid base64 alphabet, decodes to two bytes, and was
+ * therefore served as a REAL IMAGE, artifact and all, with no warning. The read path and
+ * the run path also disagreed: the read path joined an array of lines and produced an
+ * image, while the run path — where the value arrives from the sidecar unjoined — called
+ * the same value "not a string" and degraded it.
+ *
+ * So the rule is one rule for both paths: join ONLY when every element is a string; in
+ * every other case return null and let the documented degradation happen.
+ */
+function imageValueText(value: unknown): string | null {
+  if (typeof value === 'string') {
+    return value;
+  }
+  if (Array.isArray(value) && value.every((entry) => typeof entry === 'string')) {
+    return value.join('');
+  }
+  return null;
+}
+
 function dataValueToString(value: unknown): string | null {
   if (typeof value === 'string') {
     return value;
@@ -115,6 +149,19 @@ export function rawOutputsOfCell(cell: NotebookCell): RawOutput[] {
         // model was handed a wrong answer for legal data (review v7 V7-1).
         if (isJsonMime(key)) {
           normalized[key] = value;
+          continue;
+        }
+        // An IMAGE mime keeps nbformat's two legal shapes distinguishable. Joining first
+        // and asking questions later lost the difference between "an array of lines"
+        // (legal, must work) and "an array of numbers" (not a string, must degrade):
+        // `[1,2,3]` joined to `"123"`, which is valid base64 alphabet, so it was served
+        // as a real 2-byte image with an artifact and no warning (review v10, V9-1
+        // residue). The array of STRINGS is still joined here, so both the read path and
+        // the run path hand `mapRawOutputs` the same thing.
+        if (isImageMime(key)) {
+          normalized[key] = Array.isArray(value) && value.every((line) => typeof line === 'string')
+            ? value.join('')
+            : value;
           continue;
         }
         const text = dataValueToString(value);
@@ -286,6 +333,17 @@ export interface DroppedMime {
 }
 
 /**
+ * How many dropped mime values a warning names before it summarises the rest.
+ *
+ * The mime NAMES come from the user's cells (`display({'application/x-bogus-<i>': 5})`),
+ * so an unbounded list lets a cell size the response: the reviewer measured a 9 897
+ * character warning from a 300-iteration loop, which then travels into `warnings[]` and
+ * into `exec_timeout`'s `detail.warnings` (review v10 V10-9). Eight is enough to name the
+ * shapes a real notebook has; the count stays exact, so nothing is hidden by the cap.
+ */
+export const DROPPED_MIME_DETAIL_LIMIT = 8;
+
+/**
  * The `output_truncated` warning for a call, or null when nothing was lost.
  *
  * Two different facts share this code because SPEC §7's table is closed
@@ -324,9 +382,12 @@ export function outputTruncatedWarning(
   }
   const parts: string[] = [];
   if (unique.length > 0) {
-    const rendered = unique.map((entry) => `cell ${String(entry.cellIndex)}: ${entry.mime}`);
+    const named = unique
+      .slice(0, DROPPED_MIME_DETAIL_LIMIT)
+      .map((entry) => `cell ${String(entry.cellIndex)}: ${entry.mime}`);
+    const rest = unique.length - named.length;
     parts.push(
-      `dropped ${String(unique.length)} mime value(s) nbformat cannot store (${rendered.join(', ')})`,
+      `dropped ${String(unique.length)} mime value(s) nbformat cannot store (${named.join(', ')}${rest > 0 ? `, … and ${String(rest)} more` : ''})`,
     );
   }
   if (truncatedCount > 0) {
@@ -335,6 +396,42 @@ export function outputTruncatedWarning(
     );
   }
   return { code: 'output_truncated', message: parts.join('; ') };
+}
+
+/**
+ * The per-call warnings for a finished (or abandoned) run, in one place.
+ *
+ * Pure, and exported so a unit test can drive the REAL rule with real inputs. The v9
+ * version of this logic lived inline in `run.ts` behind a private helper, and the
+ * reviewer's mutation — short-circuit the helper — left all 432 unit cases green; only
+ * the integration suite noticed (review v10 V10-5). A rule that only an integration test
+ * can falsify is a rule most runs never check.
+ *
+ * `executed` carries the outputs (truncation and inexact numbers), `dropped` the mime
+ * values nbformat could not store. Results are deduplicated by message and returned in a
+ * stable order so two exits of the same run cannot disagree.
+ */
+export function assembleCallWarnings(
+  executed: readonly { readonly outputs: readonly OutputItem[] }[],
+  dropped: readonly DroppedMime[],
+): OutputWarning[] {
+  const warnings: OutputWarning[] = [];
+  const seen = new Set<string>();
+  const push = (warning: OutputWarning): void => {
+    if (seen.has(warning.message)) {
+      return;
+    }
+    seen.add(warning.message);
+    warnings.push(warning);
+  };
+  const truncation = outputTruncatedWarning(dropped, countTruncatedCells(executed));
+  if (truncation !== null) {
+    push(truncation);
+  }
+  for (const lifted of collectOutputWarnings(executed)) {
+    push(lifted);
+  }
+  return warnings;
 }
 
 /** How many executed cells had at least one truncated output. */
@@ -475,25 +572,79 @@ const TRACEBACK_TAIL_LINES = 20;
  * value is now emittable as-is.
  *
  * The THIRD instance of the same family is a number that JavaScript cannot hold:
- * `parseJsonExact` keeps such an integer as a marker (review v9 V9-5), and this
- * function is where the model is told about it. The value is passed through as the
- * number the marker says, and the exact literal travels in the output's warning so
- * the model is not left believing it saw the file's value.
+ * `parseJsonExact` keeps such a literal as a marker (review v9 V9-5), and this function
+ * is where the model is told about it. The value is passed through as the number the
+ * marker says, and the exact literal travels in the output's warning so the model is
+ * not left believing it saw the file's value.
+ *
+ * RECURSIVE, because the marker can be anywhere (review v10 V10-1). The first version
+ * only asked about the TOP-level value, so a literal nested in an object or an array
+ * went out as the marker object itself: the model saw a structure the file does not
+ * contain, no warning said why, and the marker's name is not documented anywhere. The
+ * walk below replaces every marker with its number and collects one warning per
+ * DISTINCT literal — the same literal twice is one fact, not two.
  */
 function jsonValueOf(value: unknown): { value: JsonValue; warnings: OutputWarning[] } {
+  const literals = new Map<string, number>();
+  const projected = projectJsonValue(value, literals);
+  const warnings: OutputWarning[] = [];
+  for (const literal of literals.keys()) {
+    warnings.push({ code: 'output_truncated', message: inexactNumberMessage(literal) });
+  }
+  return { value: projected, warnings };
+}
+
+/**
+ * The one sentence that has to carry a number the JSON channel cannot.
+ *
+ * It states three things the model needs: the exact digits, that they are NOT what it
+ * is being handed, and what it will actually read. The literal is recognisable by the
+ * test suite's regex, which is why the wording is load-bearing rather than cosmetic.
+ */
+function inexactNumberMessage(literal: string): string {
+  return `json value ${literal} was not representable exactly; the exact digits are in this warning and in the file, but a JSON client reads it as ${String(Number(literal))}`;
+}
+
+/**
+ * Walk a parsed json value, replacing markers with the number they stand for.
+ *
+ * Ordinary objects are rebuilt rather than mutated: the tree comes from the document,
+ * and the projection must not be able to change what a later write-back serializes
+ * (that is the whole reason the marker exists). Keys are defined, not assigned, for the
+ * same reason the parser does it — a `__proto__` key in the file is data.
+ */
+function projectJsonValue(value: unknown, literals: Map<string, number>): JsonValue {
   if (isExactNumber(value)) {
     const literal = value.__ipynb_exact_number__;
-    return {
-      value: Number(literal) as JsonValue,
-      warnings: [
-        {
-          code: 'output_truncated',
-          message: `json value ${literal} is outside the range this tool can represent exactly; the exact digits are in this warning and in the file, but a JSON client will read it as ${String(Number(literal))}`,
-        },
-      ],
-    };
+    literals.set(literal, (literals.get(literal) ?? 0) + 1);
+    // `Number(literal)` of an out-of-range literal is Infinity, which is not a JSON
+    // value: it is projected as null, which is what `JSON.stringify` does with it and
+    // what the warning's wording ("reads it as …") describes. Both are lossy, and both
+    // are announced.
+    const asNumber = Number(literal);
+    return Number.isFinite(asNumber) ? asNumber : null;
   }
-  return { value: (value === undefined ? null : value) as JsonValue, warnings: [] };
+  if (value === undefined || value === null || typeof value !== 'object') {
+    return (value ?? null) as JsonValue;
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => projectJsonValue(entry, literals));
+  }
+  const result: Record<string, JsonValue> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    // A nested `undefined` has no JSON form; `JSON.stringify` drops the key, and so do
+    // we, rather than inventing a null the file does not have.
+    if (entry === undefined) {
+      continue;
+    }
+    Object.defineProperty(result, key, {
+      value: projectJsonValue(entry, literals),
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+  }
+  return result;
 }
 
 export function mapRawOutputs(rawOutputs: readonly RawOutput[], options: MapOutputsOptions): MapOutputsResult {
@@ -537,22 +688,22 @@ export function mapRawOutputs(rawOutputs: readonly RawOutput[], options: MapOutp
     const data = raw.data ?? {};
     // 3./4. images (png first, then jpeg).
     //
-    // The value must be NARROWED to a string before it is treated as base64. The
-    // kernel can send any JSON value for a mime key, and a raw `display({'image/png':
-    // 123})` used to reach `base64.replace`, throw a TypeError and abort the whole
-    // run with `internal` — a code SPEC §4.8 does not list for notebook_run, from a
-    // path a user's own cell can trigger. `?? ''` only caught null/undefined
-    // (review v6 CRASH-1). A non-string value takes the existing
-    // image_materialize_failed route, which is the documented exit for an image
-    // that cannot be materialized (SPEC §4.4).
-    const imageValue = (key: string): string | null => {
-      const value = data[key];
-      return typeof value === 'string' ? value : null;
-    };
+    // The value must be NARROWED before it is treated as base64. The kernel can send any
+    // JSON value for a mime key, and a raw `display({'image/png': 123})` used to reach
+    // `base64.replace`, throw a TypeError and abort the whole run with `internal` — a code
+    // SPEC §4.8 does not list for notebook_run, from a path a user's own cell can trigger.
+    // `?? ''` only caught null/undefined (review v6 CRASH-1). A value that is not a string
+    // (and not an array of strings — both are legal nbformat shapes for this field) takes
+    // the existing `image_materialize_failed` route, which is the documented exit for an
+    // image that cannot be materialized (SPEC §4.4).
+    //
+    // `imageValueText` rather than a local `typeof === 'string'` check: the local version
+    // made the read path and the run path disagree about the array form, and let `[1,2,3]`
+    // be joined into a valid-looking base64 image (review v10, V9-1 residue).
     const imageMediaType =
       data['image/png'] !== undefined ? 'image/png' : data['image/jpeg'] !== undefined ? 'image/jpeg' : null;
     if (imageMediaType !== null) {
-      const rawImage = imageValue(imageMediaType);
+      const rawImage = imageValueText(data[imageMediaType]);
       // A `data:` URL is what people paste and what some tools emit. Jupyter cannot
       // render one either (`base64.b64decode` fails on the prefix), so this is not
       // legal data being dropped — but the prefix is unambiguous and stripping it is

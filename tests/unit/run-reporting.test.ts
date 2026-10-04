@@ -13,6 +13,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { findStructuralProblem, parseNotebook, selfCheckNotebook } from '../../src/core/parse.js';
 import {
+  DROPPED_MIME_DETAIL_LIMIT,
+  assembleCallWarnings,
   countTruncatedCells,
   dropUnrepresentableOutputs,
   nbformatOutputsOfRaw,
@@ -59,9 +61,13 @@ describe('[P1-a] a negative CELL execution_count is refused by the gate', () => 
     });
   });
 
-  it('a cell with no outputs key at all is still checked', () => {
-    // The count lives on the cell, not on an output, so requiring `outputs` first
-    // would leave the most likely shape unchecked.
+  it('[V9-8] the count rule keys on whether there are outputs, not on the key being present', () => {
+    // v7 shape: "a cell with no outputs key at all is still checked", because the count
+    // lives on the cell and not on an output. v9 moved the boundary — a count with no
+    // outputs to belong to is not something this gate needs to refuse, and refusing it
+    // made the documented escape hatch impossible (V9-8) — so the assertion is inverted
+    // here on purpose. What must NOT change is the other direction: the same count on a
+    // cell that HAS outputs is still refused, which the next cases cover.
     const parsed = parseNotebook(
       new TextEncoder().encode(JSON.stringify({
         nbformat: 4,
@@ -71,7 +77,7 @@ describe('[P1-a] a negative CELL execution_count is refused by the gate', () => 
       })),
       hasher,
     );
-    expect(findStructuralProblem(parsed.doc)).toMatchObject({ rule: 'execution_count_negative' });
+    expect(findStructuralProblem(parsed.doc)).toBeNull();
   });
 
   it('0 and positive integers are fine, and null is fine', () => {
@@ -91,9 +97,22 @@ describe('[P1-a] a negative CELL execution_count is refused by the gate', () => 
       outputs: [{ output_type: 'stream', name: 'stdout', text: 'stale\n' }],
     });
     expect(findStructuralProblem(withOutputs.doc)).toMatchObject({ rule: 'execution_count_negative' });
-    // Empty outputs, and no outputs key at all: nothing for the count to belong to.
+    // Empty outputs, and no outputs key at all: nothing for the count to belong to. The
+    // second spelling is the one this file's own probe caught — requiring `[]` exactly
+    // left a cell without an `outputs` key permanently refused, the same lockout in a
+    // different spelling of the same state.
     expect(findStructuralProblem(docWithCell({ execution_count: -1, outputs: [] }).doc)).toBeNull();
     expect(findStructuralProblem(docWithCell({ execution_count: -1 }).doc)).toBeNull();
+    // …but a cell whose outputs are ALSO malformed is still reported on the count rule:
+    // "clear the outputs" fixes both, and its hint is the one that unsticks the caller.
+    expect(
+      findStructuralProblem(
+        docWithCell({
+          execution_count: -1,
+          outputs: [{ output_type: 'display_data', data: { 'text/plain': 5 }, metadata: {} }],
+        }).doc,
+      ),
+    ).toMatchObject({ rule: 'execution_count_negative' });
   });
 
   it('a rewritten cell that KEEPS its outputs and a negative count fails the write (D-037 rule 2)', () => {
@@ -228,6 +247,30 @@ describe('[V7-2][V8-10] output_truncated is emitted once, and carries both facts
     expect(warning!.message).toContain('cell 2: text/plain');
   });
 
+  it('[V10-9] the dropped-mime list is bounded, and the count stays exact', () => {
+    // A cell can name the mime keys, so an unbounded list lets it size the response —
+    // the reviewer measured 9 897 characters from a 300-iteration loop (review v10 V10-9).
+    const many = Array.from({ length: 300 }, (_, index) => ({
+      cellIndex: 0,
+      mime: `application/x-bogus-${String(index)}`,
+    }));
+    const warning = outputTruncatedWarning(many, 0);
+    expect(warning).not.toBeNull();
+    const message = warning!.message;
+    expect(message).toContain('dropped 300');
+    expect(message).toContain('application/x-bogus-0');
+    // The tail is summarised, not silently dropped: the model is told how many it is
+    // not seeing. 300 names would be ~6 600 characters; the cap keeps it under 400.
+    expect(message).toContain('… and 292 more');
+    expect(message).not.toContain('application/x-bogus-299');
+    expect(message.length).toBeLessThan(400);
+    // Under the cap, every name is still listed.
+    const few = many.slice(0, DROPPED_MIME_DETAIL_LIMIT);
+    const short = outputTruncatedWarning(few, 0)!.message;
+    expect(short).not.toContain('more');
+    expect(short).toContain(`application/x-bogus-${String(DROPPED_MIME_DETAIL_LIMIT - 1)}`);
+  });
+
   it('is silent when nothing was lost — the case a blanket push would break', () => {
     // Without this, `outputTruncatedWarning` could return a warning unconditionally
     // and every case above would still pass.
@@ -281,31 +324,70 @@ describe('[V7-8][V9-7] a timeout detail carries the warnings gathered so far', (
     });
   });
 
-  it('[V9-7] the run assembles those warnings in ONE place, used on every exit', async () => {
-    // V8-4's finding was that this file proved the PROJECTION and nothing about the
-    // run: deleting the call site in `run.ts` kept everything green. The v9 shape
-    // routed both exits through `callWarnings`, so what has to be pinned is that the
-    // helper exists, is what the timeout path calls, and that the assembly is not
-    // inlined back into the happy path.
+  it('[V10-5] the assembly rule is a core function a unit test can falsify', () => {
+    // V8-4's finding was that this file proved the PROJECTION and nothing about the run.
+    // v9's answer was better but still weak: the rule lived inline behind a private
+    // helper in `run.ts`, so the reviewer's mutation — short-circuit the helper — left
+    // all 432 unit cases green and only the integration suite noticed. The rule is now
+    // `assembleCallWarnings` in core, driven here with REAL inputs.
+    const truncated: OutputItem = {
+      kind: 'stream',
+      stream_name: 'stdout',
+      text: 'x'.repeat(10),
+      truncated: true,
+      truncated_at_chars: 10,
+    };
+    const inexact: OutputItem = {
+      kind: 'json',
+      value: 18446744073709552000,
+      warnings: [{ code: 'output_truncated', message: 'json value 18446744073709551616 was not representable exactly' }],
+    };
+    const plain: OutputItem = {
+      kind: 'stream',
+      stream_name: 'stdout',
+      text: 'ok',
+      truncated: false,
+      truncated_at_chars: null,
+    };
+
+    // All three facts, in one call: a dropped value, a truncation, an inexact number.
+    const all = assembleCallWarnings(
+      [{ outputs: [truncated, inexact] }],
+      [{ cellIndex: 0, mime: 'text/plain' }],
+    );
+    expect(all).toHaveLength(2);
+    expect(all[0]!.message).toContain('dropped 1');
+    expect(all[0]!.message).toContain('cell 0: text/plain');
+    expect(all[0]!.message).toContain('1 output(s) exceeded inline_text_chars');
+    expect(all[1]!.message).toContain('18446744073709551616');
+
+    // Nothing lost, nothing said — the case a blanket push would break.
+    expect(assembleCallWarnings([{ outputs: [plain] }], [])).toEqual([]);
+
+    // Deduplicated: the same inexact literal in two cells is one fact, and calling the
+    // assembly twice must not double it either.
+    const twice = assembleCallWarnings([{ outputs: [inexact] }, { outputs: [inexact] }], []);
+    expect(twice).toHaveLength(1);
+    expect(all.map((warning) => warning.code)).toEqual(['output_truncated', 'output_truncated']);
+  });
+
+  it('[V9-7][V10-7] every terminal exit routes its warnings through one assembly', async () => {
+    // The remaining source-level claim, kept because it is about WIRING rather than
+    // about the rule: the assembly is called before the timeout throw, and the aborted /
+    // kernel_died exits pass the collected warnings into `failedRunError` (v10 V10-7 — a
+    // run that had already written the file and dropped values reported nothing).
     const source = await readFile(new URL('../../src/run.ts', import.meta.url), 'utf8');
     expect(source).toContain('function pushCallWarnings(');
-    // Call sites: the timeout exit and the successful exit, and nothing else pushes
-    // `outputTruncatedWarning` directly.
-    const assemblyCalls = source.match(/pushCallWarnings\(/g) ?? [];
-    expect(assemblyCalls.length).toBeGreaterThanOrEqual(3); // 1 definition + 2 exits
-    // Exactly one CALL, which must be inside the helper: a second one would be the
-    // inlined happy-path shape coming back.
-    expect(source.match(/= outputTruncatedWarning\(/g) ?? []).toHaveLength(1);
-    const helperStart = source.indexOf('function pushCallWarnings(');
-    const helperEnd = source.indexOf('\n}', helperStart);
-    expect(source.indexOf('= outputTruncatedWarning(')).toBeGreaterThan(helperStart);
-    expect(source.indexOf('= outputTruncatedWarning(')).toBeLessThan(helperEnd);
-    // The truncation fact must be assembled BEFORE the timeout throw, or the timeout
-    // path ships an empty list again (the regression this test exists for).
     const timeoutThrow = source.indexOf("throw new IpynbError('exec_timeout'");
-    const timeoutAssembly = source.indexOf('pushCallWarnings(warnings, executed, droppedMimes);');
+    const timeoutAssembly = source.lastIndexOf('pushCallWarnings(warnings, executed, droppedMimes);', timeoutThrow);
     expect(timeoutAssembly).toBeGreaterThan(0);
     expect(timeoutAssembly).toBeLessThan(timeoutThrow);
+    // Every abort exit collects first and hands the result over.
+    const abortCalls = source.match(/throw await abortedRunError\(/g) ?? [];
+    expect(abortCalls.length).toBeGreaterThanOrEqual(3);
+    expect(source.match(/\{ warnings, droppedMimes \},/g)?.length ?? 0).toBeGreaterThanOrEqual(abortCalls.length);
+    // And nothing re-derives the rule locally any more.
+    expect(source).not.toContain('outputTruncatedWarning(');
   });
 });
 

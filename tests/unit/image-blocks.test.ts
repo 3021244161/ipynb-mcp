@@ -169,6 +169,18 @@ const CASES: readonly Case[] = [
   { name: 'non-string value', value: 123, expectBytes: null, fallback: 'not a string' },
   { name: 'null value', value: null, expectBytes: null, fallback: 'not a string' },
   { name: 'object value', value: { unexpected: true }, expectBytes: null, fallback: 'not a string' },
+  // V9-1 residue (review v10): an array whose elements are NOT strings used to be joined
+  // into `"123"`, which is valid base64 alphabet — so `[1,2,3]` was served as a real
+  // 2-byte image WITH an artifact, and no warning. nbformat allows a string or an array
+  // of strings; a mixed array is neither, and must degrade like any other bad value.
+  { name: 'array of numbers', value: [1, 2, 3], expectBytes: null, fallback: 'not a string' },
+  { name: 'array of mixed types', value: [PNG_B64, 7], expectBytes: null, fallback: 'not a string' },
+  { name: 'array of objects', value: [{ a: 1 }], expectBytes: null, fallback: 'not a string' },
+  // An empty array is `[]` for nbformat and joins to the empty string, so it takes the
+  // "empty" exit rather than the "not a string" one — the distinction v8 V8-3 added, and
+  // the reason the two messages exist separately.
+  { name: 'empty array', value: [], expectBytes: null, fallback: 'empty' },
+  { name: 'nested array', value: [[PNG_B64]], expectBytes: null, fallback: 'not a string' },
 ];
 
 describe('[V9-1][V9-2] every returned image block is valid where the client reads it', () => {

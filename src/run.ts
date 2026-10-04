@@ -12,12 +12,11 @@ import {
   type Warning,
 } from './core/errors.js';
 import {
+  assembleCallWarnings,
   collectOutputWarnings,
-  countTruncatedCells,
   dropUnrepresentableOutputs,
   mapRawOutputs,
   nbformatOutputsOfRaw,
-  outputTruncatedWarning,
   representableExecutionCount,
   type DroppedMime,
   type OutputItem,
@@ -35,27 +34,22 @@ export type RunMode = 'auto' | 'resume' | 'replay' | 'full';
 export type ModeUsed = 'resume' | 'replay' | 'full';
 
 /**
- * Append the per-call output warnings to `warnings`, once each.
+ * Append the call's output warnings to `warnings`, once each.
  *
- * ONE assembly point for every exit of a run: the successful one, the timeout one,
- * and (through the already-populated array) the cancelled/kernel_died ones, which
- * receive this array by reference. The facts it carries all share SPEC §7's
- * `output_truncated` code because the table is closed: outputs truncated at
- * `inline_text_chars`, mime values nbformat cannot store, and json numbers the JSON
- * channel cannot carry exactly.
+ * The RULE lives in core (`assembleCallWarnings`) so a unit test can drive it with real
+ * inputs; this is only the "append without repeating yourself" half. Every exit of a run
+ * goes through it — successful, timeout, cancelled and kernel_died (see `failedRunError`),
+ * because a run that has already rewritten the file and dropped values must not report
+ * having lost nothing, whatever ended it.
  */
 function pushCallWarnings(
   warnings: Warning[],
   executed: readonly ExecutedCell[],
   droppedMimes: readonly DroppedMime[],
 ): void {
-  const truncation = outputTruncatedWarning(droppedMimes, countTruncatedCells(executed));
-  if (truncation !== null && !warnings.some((warning) => warning.message === truncation.message)) {
-    warnings.push(createWarning(truncation.code, truncation.message));
-  }
-  for (const lifted of collectOutputWarnings(executed)) {
-    if (!warnings.some((warning) => warning.message === lifted.message)) {
-      warnings.push(createWarning(lifted.code, lifted.message));
+  for (const assembled of assembleCallWarnings(executed, droppedMimes)) {
+    if (!warnings.some((warning) => warning.message === assembled.message)) {
+      warnings.push(createWarning(assembled.code, assembled.message));
     }
   }
 }
@@ -431,6 +425,7 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
           platform,
           executedCellsSet,
           preRunDoc,
+          { warnings, droppedMimes },
         );
       }
       deps.onProgress?.({ phase: 'start', total: targets.length });
@@ -504,6 +499,7 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
               platform,
               executedCellsSet,
               preRunDoc,
+              { warnings, droppedMimes },
             );
           }
           throw cause;
@@ -641,7 +637,18 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
           // Completed cells stay written; the interrupted cell never lands
           // (SPEC §4.8). This is the ONE terminal path for both the mid-cell abort
           // and the cancel that lands while the write-back is running (v3 ROB-8).
-        throw await abortedRunError(executed, deps, abortState, notebook, effectiveReq, platform, executedCellsSet, preRunDoc);
+        pushCallWarnings(warnings, executed, droppedMimes);
+        throw await abortedRunError(
+          executed,
+          deps,
+          abortState,
+          notebook,
+          effectiveReq,
+          platform,
+          executedCellsSet,
+          preRunDoc,
+          { warnings, droppedMimes },
+        );
       }
 
       // SPEC §7 defines `output_truncated` as "ANY OutputItem has
@@ -735,7 +742,18 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
       // exists on paper, and the terminal state is now single-writer so getting
       // it wrong is visible).
       if (isAborted(effectiveReq.abort)) {
-        throw await abortedRunError(executed, deps, abortState, notebook, effectiveReq, platform, executedCellsSet, preRunDoc);
+        pushCallWarnings(warnings, executed, droppedMimes);
+        throw await abortedRunError(
+          executed,
+          deps,
+          abortState,
+          notebook,
+          effectiveReq,
+          platform,
+          executedCellsSet,
+          preRunDoc,
+          { warnings, droppedMimes },
+        );
       }
       deps.onProgress?.({ phase: 'write_back', completed: executed.length, total: targets.length });
       let writeBack: RunOutcome['write_back'] = { performed: false, backup_path: null };
@@ -778,7 +796,18 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
             // completed cells must still land and be reported. Throwing a bare
             // `cancelled` with no detail lost them silently and made one terminal
             // code answer with two different shapes (review v3 ROB-8).
-            throw await abortedRunError(executed, deps, abortState, notebook, effectiveReq, platform, executedCellsSet, preRunDoc);
+            pushCallWarnings(warnings, executed, droppedMimes);
+            throw await abortedRunError(
+              executed,
+              deps,
+              abortState,
+              notebook,
+              effectiveReq,
+              platform,
+              executedCellsSet,
+              preRunDoc,
+              { warnings, droppedMimes },
+            );
           }
           throw cause;
         }
@@ -842,6 +871,7 @@ async function abortedRunError(
   platform: NodeJS.Platform,
   executedCellsSet: ReadonlySet<number>,
   preRunDoc: NotebookDoc,
+  collected: { warnings: readonly Warning[]; droppedMimes: readonly DroppedMime[] },
 ): Promise<IpynbError> {
   const code = req.abort!.reason === 'kernel_died' ? 'kernel_died' : 'cancelled';
   return failedRunError(
@@ -855,6 +885,7 @@ async function abortedRunError(
     platform,
     executedCellsSet,
     preRunDoc,
+    collected,
   );
 }
 
@@ -926,6 +957,18 @@ async function failedRunError(
   platform: NodeJS.Platform,
   executedCellsSet: ReadonlySet<number>,
   preRunDoc: NotebookDoc,
+  /**
+   * Warnings this run had already gathered, and the mime values it dropped.
+   *
+   * Without them this exit reported `warnings: []` for a run whose FILE had already been
+   * rewritten and whose values had already been discarded — the model was told nothing
+   * was lost (review v10 V10-7). The timeout exit has taken this route since v9; the
+   * aborted/kernel-died exits were left behind, and their comment claimed otherwise.
+   */
+  collected: { warnings: readonly Warning[]; droppedMimes: readonly DroppedMime[] } = {
+    warnings: [],
+    droppedMimes: [],
+  },
 ): Promise<IpynbError> {
   // The failure-path write-back can discover carried-forward content, and the
   // caller here is an ERROR response: without this collector the warning had
@@ -936,6 +979,14 @@ async function failedRunError(
     ? { performed: false, backup_path: null }
     : await writeBackCompleted(notebook, req, deps, platform, executedCellsSet, warnings, preRunDoc);
   abortState.writtenBack = true;
+  // Same assembly as the successful and timeout exits, so the three terminal shapes
+  // cannot disagree about what the run lost.
+  const assembled = assembleCallWarnings(executed, collected.droppedMimes);
+  for (const warning of [...collected.warnings, ...assembled]) {
+    if (!warnings.some((existing) => existing.message === warning.message)) {
+      warnings.push(createWarning(warning.code, warning.message));
+    }
+  }
   return new IpynbError(code, message, {
     executed_cells: executed.length,
     executed: executed as unknown as JsonValue,

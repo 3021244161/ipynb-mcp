@@ -248,6 +248,15 @@ async function executeBackgroundRun(
       if (Array.isArray(executed)) {
         handle.executed = executed as typeof handle.executed;
       }
+      // …and the WARNINGS, for the same reason and by the same route (review v10
+      // V10-7). `runNotebook` now puts them in the detail for every terminal shape; a
+      // background run reaches the client only through `notebook_run_status`, so a
+      // detail nobody copies is a warning nobody receives — the run had already
+      // rewritten the file and dropped values, and the status said nothing.
+      const collected = detail['warnings'];
+      if (Array.isArray(collected)) {
+        handle.warnings = collected as typeof handle.warnings;
+      }
     }
     // The run-store marker is authoritative: restart/shutdown mark
     // kernel_died even though the cooperative abort raised 'cancelled'
