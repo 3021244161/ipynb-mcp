@@ -253,22 +253,169 @@ function analyse(name, text) {
 }
 
 // ---------------------------------------------------------------------------
-// Self-test: every snippet is mis-indented in exactly one construct, and the
-// clean sample must produce nothing.
+// Self-test. Two matrices, because detection and false-positive resistance fail in
+// opposite directions and no single sample can prove both:
+//
+//   DETECTION_CASES  one construct per sample, mis-indented. `expect` is a substring
+//                    that must appear in at least one finding. Naming the expected
+//                    message is the point: for a statement that shares its line with
+//                    other syntax, "reported the wrong thing" and "reported nothing"
+//                    are different failures and "something was found" cannot tell
+//                    them apart (review v9 V8-17 — forcing the `ownsLine` guard true
+//                    left the whole script green).
+//   CLEAN_CASES      must produce NOTHING. These are what make a guard's SKIP branches
+//                    falsifiable: each sample starts reporting the moment the guard
+//                    that skips it stops skipping.
+//
+// Each sample carries `proves` — the mutation that turns it red — because AGENTS §9
+// asks a guard to name it, and a sample nobody can attribute is a sample whose loss of
+// power nobody notices. This matrix exists at all because the file is plain .mjs
+// outside tsconfig, so `tsc` cannot see a wrong AST property name here: that is how the
+// `if` coverage stayed dead for two rounds (`IfStatement` has `thenStatement`, not
+// `statement`, review v6 INDENT-HOLE).
 
-const SELF_TEST_CASES = [
-  ['if body', 'function f(a: number) {\n  if (a) {\n  return 1;\n  }\n}\n'],
-  ['else body', 'function f(a: number) {\n  if (a) {\n    return 1;\n  } else {\n  return 2;\n  }\n}\n'],
-  ['for body', 'function f(a: number) {\n  for (let i = 0; i < a; i += 1) {\n  use(i);\n  }\n}\n'],
-  ['for-of body', 'function f(a: number[]) {\n  for (const x of a) {\n  use(x);\n  }\n}\n'],
-  ['while body', 'function f(a: number) {\n  while (a) {\n  a -= 1;\n  }\n}\n'],
-  ['switch case body', 'function f(a: number) {\n  switch (a) {\n    case 1:\n    return 1;\n  }\n}\n'],
-  ['switch case label', 'function f(a: number) {\n  switch (a) {\n  case 1:\n    return 1;\n  }\n}\n'],
-  ['try body', 'function f() {\n  try {\n  g();\n  } catch {\n    h();\n  }\n}\n'],
-  ['catch body', 'function f() {\n  try {\n    g();\n  } catch {\n  h();\n  }\n}\n'],
-  ['arrow body', 'const f = (a: number) => {\n  return a;\n  };\n'],
-  ['function expression body', 'const f = function (a: number) {\n  return a;\n  };\n'],
-  ['closing brace', 'function f(a: number) {\n  if (a) {\n    return 1;\n    }\n}\n'],
+const DETECTION_CASES = [
+  {
+    name: 'if-body',
+    proves: '`thenStatement` carries the if body; `statement` would cover nothing',
+    expect: 'if @2 [ReturnStatement]',
+    snippet: 'function f(a: number) {\n  if (a) {\n  return 1;\n  }\n}\n',
+  },
+  {
+    name: 'else-body',
+    proves: 'the `else` clause is checked separately from the `then` clause',
+    expect: 'else @4 [ReturnStatement]',
+    snippet: 'function f(a: number) {\n  if (a) {\n    return 1;\n  } else {\n  return 2;\n  }\n}\n',
+  },
+  {
+    name: 'for-body',
+    proves: '`ForStatement` is in the loop disjunction',
+    expect: 'ForStatement @2 [ExpressionStatement]',
+    snippet: 'function f(a: number) {\n  for (let i = 0; i < a; i += 1) {\n  use(i);\n  }\n}\n',
+  },
+  {
+    name: 'for-of-body',
+    proves: '`ForOfStatement` is in the loop disjunction',
+    expect: 'ForOfStatement @2 [ExpressionStatement]',
+    snippet: 'function f(a: number[]) {\n  for (const x of a) {\n  use(x);\n  }\n}\n',
+  },
+  {
+    name: 'for-in-body',
+    proves: '`ForInStatement` is in the loop disjunction',
+    expect: 'ForInStatement @2 [ExpressionStatement]',
+    snippet: 'function f(a: Record<string, number>) {\n  for (const k in a) {\n  use(k);\n  }\n}\n',
+  },
+  {
+    name: 'while-body',
+    proves: '`WhileStatement` is in the loop disjunction',
+    expect: 'WhileStatement @2 [ExpressionStatement]',
+    snippet: 'function f(a: number) {\n  while (a) {\n  a -= 1;\n  }\n}\n',
+  },
+  {
+    name: 'do-body',
+    proves: '`DoStatement` is in the loop disjunction',
+    expect: 'DoStatement @2 [ExpressionStatement]',
+    snippet: 'function f(a: number) {\n  do {\n  a -= 1;\n  } while (a > 0);\n}\n',
+  },
+  {
+    name: 'switch-case-label',
+    proves: 'a `case`/`default` label sits one level inside the case block',
+    expect: 'switch case: line 3 is indented 2, expected 4',
+    snippet: 'function f(a: number) {\n  switch (a) {\n  case 1:\n    return 1;\n  }\n}\n',
+  },
+  {
+    name: 'switch-case-body',
+    proves: 'a statement-list case body sits one level inside its label',
+    expect: 'switch case body [ReturnStatement]',
+    snippet: 'function f(a: number) {\n  switch (a) {\n    case 1:\n    return 1;\n  }\n}\n',
+  },
+  {
+    name: 'switch-case-block',
+    proves: 'a braced case body goes through `checkBlock` (its own rule), not the statement list',
+    expect: 'switch case @3 [closing brace]',
+    snippet: 'function f(a: number) {\n  switch (a) {\n    case 1: {\n      return 1;\n      }\n  }\n}\n',
+  },
+  {
+    name: 'try-body',
+    proves: '`tryBlock` is checked',
+    expect: 'try @2 [ExpressionStatement]',
+    snippet: 'function f() {\n  try {\n  g();\n  } catch {\n    h();\n  }\n}\n',
+  },
+  {
+    name: 'catch-body',
+    proves: '`catchClause.block` is checked',
+    expect: 'catch @4 [ExpressionStatement]',
+    snippet: 'function f() {\n  try {\n    g();\n  } catch {\n  h();\n  }\n}\n',
+  },
+  {
+    name: 'finally-body',
+    proves: '`finallyBlock` is checked',
+    expect: 'finally @4 [ExpressionStatement]',
+    snippet: 'function f() {\n  try {\n    g();\n  } finally {\n  h();\n  }\n}\n',
+  },
+  {
+    name: 'function-declaration-body',
+    proves:
+      '`FunctionDeclaration` bodies are checked — the mis-indented statement is a DIRECT child of the body, so no inner block can report it instead',
+    expect: 'function body @1 [IfStatement]',
+    snippet: 'function f(a: number) {\n    if (a) {\n      return 1;\n    }\n}\n',
+  },
+  {
+    name: 'arrow-body',
+    proves: '`ArrowFunction` is in the function-body disjunction',
+    expect: 'function body @1 [ReturnStatement]',
+    snippet: 'const f = (a: number) => {\n    return a;\n};\n',
+  },
+  {
+    name: 'arrow-closing-brace',
+    proves:
+      "the closing brace is measured against the line that opened the block, NOT against the owner's character column (this owner starts mid-line at column 10)",
+    expect: 'function body @1 [closing brace]',
+    snippet: 'const f = (a: number) => {\n  return a;\n  };\n',
+  },
+  {
+    name: 'function-expression-body',
+    proves: '`FunctionExpression` is in the function-body disjunction',
+    expect: 'function body @1 [ReturnStatement]',
+    snippet: 'const f = function (a: number) {\n    return a;\n};\n',
+  },
+  {
+    name: 'method-body',
+    proves: '`MethodDeclaration` is in the function-body disjunction',
+    expect: 'function body @2 [ReturnStatement]',
+    snippet: 'class C {\n  m(a: number) {\n  return a;\n  }\n}\n',
+  },
+  {
+    name: 'constructor-body',
+    proves: '`ConstructorDeclaration` is in the function-body disjunction',
+    expect: 'function body @2 [ExpressionStatement]',
+    snippet: 'class C {\n  constructor(a: number) {\n  use(a);\n  }\n}\n',
+  },
+  {
+    name: 'get-accessor-body',
+    proves: '`GetAccessorDeclaration` is in the function-body disjunction',
+    expect: 'function body @2 [ReturnStatement]',
+    snippet: 'class C {\n  get value(): number {\n  return 1;\n  }\n}\n',
+  },
+  {
+    name: 'set-accessor-body',
+    proves: '`SetAccessorDeclaration` is in the function-body disjunction',
+    expect: 'function body @2 [ExpressionStatement]',
+    snippet: 'class C {\n  set value(v: number) {\n  use(v);\n  }\n}\n',
+  },
+  {
+    name: 'closing-brace',
+    proves: 'a closing brace must line up with the line that opened the block',
+    expect: 'if @2 [closing brace]',
+    snippet: 'function f(a: number) {\n  if (a) {\n    return 1;\n    }\n}\n',
+  },
+  {
+    name: 'statement-not-on-own-line',
+    proves:
+      'a statement glued to its block header is reported AS SUCH — force `ownsLine` true and only the generic indent message survives, which describes a different defect',
+    expect: '[ExpressionStatement is not on its own line]',
+    snippet: 'function f(a: number) {\n  if (a) { use(a);\n  }\n}\n',
+  },
 ];
 
 const CLEAN_SAMPLE = [
@@ -319,18 +466,93 @@ const CLEAN_SAMPLE = [
   '',
 ].join('\n');
 
-const undetected = SELF_TEST_CASES.filter(([name, snippet]) => analyse(`selftest-${name}.ts`, snippet).length === 0).map(
-  ([name]) => name,
-);
-if (undetected.length > 0) {
-  problems.push(
-    `self-test: mis-indentation is NOT detected in: ${undetected.join(', ')} — ` +
-      'the AST property for that construct is probably wrong (review v6 INDENT-HOLE)',
-  );
+// The false-positive half. Each entry is an input a guard must NOT report on — most of
+// them because a guard exists to skip exactly that shape — so a sample that starts
+// reporting is the guard reporting instead of skipping.
+const CLEAN_CASES = [
+  {
+    name: 'mixed-style',
+    proves: 'the two brace styles this repository mixes, plus the legal `case 1: return 1;`',
+    snippet: CLEAN_SAMPLE,
+  },
+  {
+    name: 'switch-label-shares-line',
+    proves:
+      'the switch-label `ownsLine` guard in `walk`: force it true and this sample reports "switch case" on the `default:` that follows a statement',
+    snippet:
+      'function f(a: number) {\n' +
+      '  switch (a) {\n' +
+      '    case 1:\n' +
+      '      break; default:\n' +
+      '      break;\n' +
+      '  }\n' +
+      '}\n',
+  },
+  {
+    name: 'one-line-blocks',
+    proves:
+      'the one-line-block early return: turn it off and the statement collapsed onto the header line is reported',
+    snippet: 'function f(a: number) {\n  if (a) { use(a); }\n  try { g(); } catch { h(); }\n}\n',
+  },
+  {
+    name: 'braceless-bodies',
+    proves:
+      'the non-block body early return: turn it off and `checkBlock` reads `.statements` off a plain statement and throws. The bodies that span lines are the ones that reach it — a single-line one is stopped earlier by the one-line rule, and nothing about the guard would be exercised.',
+    snippet:
+      'const g = (x: number) => x + 1;\n' +
+      'function f(a: number) {\n' +
+      '  if (a) return 1;\n' +
+      '  else return g(a);\n' +
+      '  for (let i = 0; i < a; i += 1)\n' +
+      '    use(\n' +
+      '      i,\n' +
+      '    );\n' +
+      '  while (a > 0) a -= 1;\n' +
+      '  do a -= 1; while (a > 0);\n' +
+      '  return 0;\n' +
+      '}\n',
+  },
+  {
+    name: 'wrapped-header-closing-brace',
+    proves:
+      'the `ownerColumn` acceptance: when the opening brace lands on a continuation line, the closing brace may line up with the construct that owns it instead',
+    snippet: 'function f(\n  a: number\n  ) {\n    return a;\n}\n',
+  },
+];
+
+const SAMPLE_COUNT = DETECTION_CASES.length + CLEAN_CASES.length;
+
+/** Findings for one sample. A broken guard can make the checker throw where it used to
+ * skip (a brace-less body has no `.statements`), and a stack trace names no sample — so
+ * attribute the throw to the sample instead. */
+function findingsFor(name, snippet) {
+  try {
+    return analyse(`selftest-${name}.ts`, snippet);
+  } catch (error) {
+    return [`threw ${error instanceof Error ? error.message : String(error)}`];
+  }
 }
-const cleanFindings = analyse('selftest-clean.ts', CLEAN_SAMPLE);
-if (cleanFindings.length > 0) {
-  problems.push(`self-test: the checker reports a clean sample — ${cleanFindings[0]}`);
+
+if (SAMPLE_COUNT < 2 || DETECTION_CASES.length === 0 || CLEAN_CASES.length === 0) {
+  // Otherwise an emptied matrix would pass by having nothing left to contradict.
+  problems.push('self-test: the sample matrix is empty — the guard has nothing to prove itself with');
+}
+
+for (const { name, proves, expect, snippet } of DETECTION_CASES) {
+  const found = findingsFor(name, snippet);
+  if (!found.some((finding) => finding.includes(expect))) {
+    const got = found.length === 0 ? 'no finding at all' : `instead "${found[0]}"`;
+    problems.push(
+      `self-test [${name}]: expected a finding containing "${expect}", got ${got} — ${proves} (review v9 V8-17)`,
+    );
+  }
+}
+
+for (const { name, proves, snippet } of CLEAN_CASES) {
+  const found = findingsFor(name, snippet);
+  if (found.length > 0) {
+    problems.push(`self-test [${name}]: the checker reports a clean sample — ${found[0]} — ${proves}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -366,4 +588,4 @@ if (problems.length > 0) {
   process.stderr.write(`structural indent check failed (${problems.length}):\n${problems.join('\n')}\n`);
   process.exit(1);
 }
-process.stdout.write('structural indent check: ok\n');
+process.stdout.write(`structural indent check: ok (${SAMPLE_COUNT} self-test samples passed)\n`);
