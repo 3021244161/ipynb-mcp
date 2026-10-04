@@ -82,19 +82,129 @@ function declaredDigest(lines) {
  * neither existed — the ghost symbol `callWarnings` was still in `src/run.ts`, and the
  * tautological assertion was still in `tests/unit/json-exact.test.ts` (review v11 V11-4).
  * Discipline did not hold; a cheap mechanical check does.
+ *
+ * v12 caught this list missing the plainest word of all: `| ✅ | 已修 V11-99 的全部问题 |` walked
+ * straight through a vocabulary that had `已订正` but not `已修` (review v12 V12-4). The list is
+ * now the whole family, both languages.
  */
-const FIX_CLAIM_WORDS = ['已订正', '已删除', '已改名', '已移除', '已重命名', 'named', 'renamed', 'removed', 'deleted'];
+const FIX_CLAIM_WORDS = [
+  '已修',
+  '已订正',
+  '已删除',
+  '已移除',
+  '已改名',
+  '已重命名',
+  '已补齐',
+  '已同步',
+  'fixed',
+  'named',
+  'renamed',
+  'removed',
+  'deleted',
+];
 
 /**
- * A backticked token in a claimed row must EXIST somewhere in the tree.
+ * What it means for a symbol to "exist": it is DECLARED, not merely mentioned.
  *
- * Deliberately shallow: it does not check that the artefact proves the claim, only that the
- * thing named is real. That is enough for the failure it is aimed at — a row asserting that a
- * symbol was renamed, while the symbol it names appears nowhere in the repository.
+ * The first version of this gate searched `docs/` and was satisfied by the row's own text; the
+ * second searched code and was satisfied by a same-named LOCAL VARIABLE in an unrelated test —
+ * `tests/unit/json-exact.test.ts` has `const callWarnings = payload['warnings'] …`, which
+ * vouched for a row claiming that `callWarnings` had been renamed (review v12 V12-4). The class
+ * of failure is the same both times: the existence test was a substring test, so any text that
+ * happened to contain the name counted.
+ *
+ * A claim about a symbol is about a DECLARATION, so the test is for a declaration form: an
+ * exported or local `function`/`const`/`class`/`interface`/`type`/def, a method, or a call
+ * `name(`. A name that appears only inside a comment no longer counts — which is exactly the
+ * `src/run.ts` case this gate was written for.
+ */
+function isDeclared(name, dir) {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pattern = new RegExp(
+    `(?:\\b(?:function|const|let|var|class|interface|type|enum|def)\\s+${escaped}\\b)` +
+      `|(?:\\b${escaped}\\s*[=(])`,
+  );
+  return grepTree(dir, pattern, true);
+}
+
+/** Whether a token from a status row can be found in the repository (path or symbol). */
+function exists(token) {
+  const [pathPart] = token.split(':');
+  // A PATH may point anywhere, docs included — the artifact is then the document itself.
+  if (existsSync(path.join(REPO_ROOT, pathPart))) {
+    return true;
+  }
+  // A bare symbol must be DECLARED in shipped code (see `isDeclared` and `SHIPPED_DIRS`).
+  if (pathPart.length < 4) {
+    return true;
+  }
+  return SHIPPED_DIRS.some((dir) => isDeclared(pathPart, path.join(REPO_ROOT, dir)));
+}
+
+/** Is this token a path in the tree at all? Used to tell "names no artefact" from "names one". */
+function namesAnArtefact(token) {
+  const [pathPart] = token.split(':');
+  return existsSync(path.join(REPO_ROOT, pathPart)) || SHIPPED_DIRS.some((dir) =>
+    isDeclared(pathPart, path.join(REPO_ROOT, dir)));
+}
+
+/** Is `needle` present in any text file under `dir`? Depth-first, with the usual exclusions. */
+/**
+ * Is `needle` present in any text file under `dir`?
+ *
+ * `asPattern` switches from substring to regular-expression matching, which is what lets a
+ * symbol be looked for as a DECLARATION rather than as any occurrence of the name (review v12
+ * V12-4). The file kinds are code and scripts only: a claim about a symbol is a claim about the
+ * source, and searching markdown would let the status table vouch for itself again.
+ */
+function grepTree(dir, needle, asPattern = false) {
+  if (!existsSync(dir)) {
+    return false;
+  }
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name === 'node_modules' || entry.name === '.git') {
+      continue;
+    }
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (grepTree(full, needle, asPattern)) {
+        return true;
+      }
+      continue;
+    }
+    if (!/\.(ts|js|mjs|py|sh)$/.test(entry.name)) {
+      continue;
+    }
+    const text = readFileSync(full, 'utf8');
+    if (asPattern ? new RegExp(needle).test(text) : text.includes(needle)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Where a SHIPPED symbol is declared: the code that is released.
+ *
+ * A row claiming that a production symbol was renamed is not corroborated by a local variable
+ * of the same name in a test — which is how this gate's second version was satisfied by the very
+ * symbol it was written to catch: `tests/unit/json-exact.test.ts` has
+ * `const callWarnings = payload['warnings'] …`, so "`callWarnings` 已改名" passed while the ghost
+ * symbol was still in `src/run.ts` (review v12 V12-4). Claims about tests are corroborated by
+ * `tests/`, and a row that means a test symbol names the test file, which is checked as a path.
+ */
+const SHIPPED_DIRS = ['src', 'python'];
+
+/**
+ * Rows that CLAIM a change must name an artefact that is really there.
+ *
+ * Deliberately shallow: it does not check that the artefact proves the claim, only that what is
+ * named is a real declaration or a real path. That is enough for the failure it is aimed at —
+ * a row asserting that a symbol was renamed, while the symbol it names exists only inside a
+ * comment (which is exactly what v12 found in `src/run.ts`).
  */
 function claimProblems(file, text) {
   const problems = [];
-  const root = REPO_ROOT;
   for (const [index, line] of text.split('\n').entries()) {
     if (!line.startsWith('|') || !line.includes('✅')) {
       continue;
@@ -113,65 +223,15 @@ function claimProblems(file, text) {
       );
       continue;
     }
-    const missing = tokens.filter((token) => !exists(token));
-    if (missing.length === tokens.length) {
+    // ANY artefact being real is enough: a row that lists several may legitimately name a
+    // mixture of new and existing things.
+    if (!tokens.some((token) => namesAnArtefact(token))) {
       problems.push(
-        `${file}:${String(index + 1)}: a ✅ row claims a change, but none of its artefacts exist in the tree: ${missing.join(', ')}`,
+        `${file}:${String(index + 1)}: a ✅ row claims a change, but none of its artefacts exist as a declaration or a path: ${tokens.join(', ')}`,
       );
     }
   }
-  void root;
   return problems;
-}
-
-/**
- * Which tree a symbol named in a status row must live in.
- *
- * ONLY code, and deliberately not `docs`: the row that makes the claim is itself a document, so
- * `grepTree(docs, token)` found the token in the claim and every claim satisfied its own check.
- * That is the "期望自我循环" shape in its purest form — the guard proving the guard — and it was
- * caught by testing the gate against a symbol that exists nowhere (review v11 V11-4's gate).
- */
-const CODE_DIRS = ['src', 'tests', 'scripts', 'python'];
-
-/** Whether a token from a status row can be found in the repository (path or symbol). */
-function exists(token) {
-  const [pathPart] = token.split(':');
-  // A PATH may point anywhere, docs included — the artifact is then the document itself.
-  if (existsSync(path.join(REPO_ROOT, pathPart))) {
-    return true;
-  }
-  // A bare symbol is looked for in code only.
-  if (pathPart.length < 4) {
-    return true;
-  }
-  return CODE_DIRS.some((dir) => grepTree(path.join(REPO_ROOT, dir), pathPart));
-}
-
-/** Is `needle` present in any text file under `dir`? Depth-first, with the usual exclusions. */
-function grepTree(dir, needle) {
-  if (!existsSync(dir)) {
-    return false;
-  }
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    if (entry.name === 'node_modules' || entry.name === '.git') {
-      continue;
-    }
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      if (grepTree(full, needle)) {
-        return true;
-      }
-      continue;
-    }
-    if (!/\.(ts|js|mjs|py|md|json|sh)$/.test(entry.name)) {
-      continue;
-    }
-    if (readFileSync(full, 'utf8').includes(needle)) {
-      return true;
-    }
-  }
-  return false;
 }
 
 /**
@@ -246,7 +306,15 @@ export function inspectDocument(doc, text) {
   // fail by deleting the last row AND by appending one.
   const declaredTotal = declareCount(lines, doc);
   const highest = numbers.at(-1) ?? 0;
-  if (declaredTotal !== null && highest !== declaredTotal) {
+  if (declaredTotal === null) {
+    // A MISSING declaration is a problem, not a skipped rule (review v11 V11-11's last hole: the
+    // reviewer deleted the whole `entries:` line and the check exited 0). Turning a rule off by
+    // deleting its input is the cheapest way to make a guard useless, and it looks exactly like
+    // a guard that passes.
+    problems.push(
+      `${doc.file}: no \`> entries: NN\` line, so the table's length is not declared; run \`node scripts/check-docs.mjs --print-digest\` and add both header lines`,
+    );
+  } else if (highest !== declaredTotal) {
     problems.push(
       `${doc.file}: the table ends at ${doc.idPrefix}${String(highest).padStart(3, '0')} but its header declares ${String(declaredTotal)} entries — a row was lost from the end, or appended without updating the count`,
     );
@@ -417,6 +485,11 @@ function selftest() {
       expect: 'no `> digest:` line',
     },
     {
+      name: 'the entries line was removed (the v11 last hole: deleting the input disarms the rule)',
+      text: /^> entries:.*\n/m.test(original) ? original.replace(/^> entries:.*\n/m, '') : null,
+      expect: 'no `> entries: NN` line',
+    },
+    {
       name: 'a row was spliced onto the pasted copy (the v9 symptom, at row scale)',
       // Derived: turn the last cell separator into a bare pipe, so the row loses a cell
       // however its final column happens to be worded.
@@ -443,6 +516,53 @@ function selftest() {
     const found = inspectDocument(doc, testCase.text);
     if (!found.some((problem) => problem.includes(testCase.expect))) {
       problems.push(`self-test [${testCase.name}]: expected a problem containing ${JSON.stringify(testCase.expect)}, got ${JSON.stringify(found)}`);
+    }
+  }
+
+  // The honesty gate, mutated. Both bypasses v12 found are here as permanent cases, because a
+  // gate that cannot fail is worse than none: the first version was satisfied by the row's own
+  // text and the second by a same-named local variable in a test file (review v11 V11-4, v12
+  // V12-4). The control below then proves the gate does NOT fire on real artefacts.
+  const status = read('docs/REVIEW-FIX-STATUS.md');
+  const statusAnchor = /^\| \*\*V10-9④\*\*.*$/m.exec(status)?.[0] ?? null;
+  const claimCandidates = [
+    {
+      name: 'a ✅ row claims a fix with the word "已修" and names no artefact',
+      row: '| **V12-ST** 🟡 x | ✅ | 已修 V11-99 的全部问题 |',
+      expect: 'names no symbol or file',
+    },
+    {
+      name: 'a ✅ row claims a rename, vouched for only by a test-local variable',
+      row: '| **V12-ST** 🟡 x | ✅ | `callWarnings` 已改名 |',
+      expect: 'none of its artefacts exist as a declaration or a path',
+    },
+    {
+      name: 'a ✅ row claims a fix naming a symbol that exists nowhere',
+      row: '| **V12-ST** 🟡 x | ✅ | `someSymbolThatExistsNowhere` 已修 |',
+      expect: 'none of its artefacts exist as a declaration or a path',
+    },
+  ];
+  for (const testCase of claimCandidates) {
+    if (statusAnchor === null) {
+      skipped.push(testCase.name);
+      continue;
+    }
+    applied += 1;
+    const found = claimProblems('docs/REVIEW-FIX-STATUS.md', status.replace(statusAnchor, `${testCase.row}\n${statusAnchor}`));
+    if (!found.some((problem) => problem.includes(testCase.expect))) {
+      problems.push(`self-test [${testCase.name}]: expected a problem containing ${JSON.stringify(testCase.expect)}, got ${JSON.stringify(found)}`);
+    }
+  }
+  // …and the gate must stay quiet for a row that names a real shipped declaration, or it has no
+  // discriminating power in the direction that matters (every real row would go red).
+  if (statusAnchor !== null) {
+    applied += 1;
+    const clean = claimProblems(
+      'docs/REVIEW-FIX-STATUS.md',
+      status.replace(statusAnchor, '| **V12-ST** 🟡 x | ✅ | `pushCallWarnings` 已改名 |\n' + statusAnchor),
+    );
+    if (clean.length > 0) {
+      problems.push(`self-test [the honesty gate must accept a real declaration]: got ${JSON.stringify(clean)}`);
     }
   }
 
