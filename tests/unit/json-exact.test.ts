@@ -17,7 +17,7 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import type { JsonValue } from '../../src/core/errors.js';
-import { exactNumber, losesPrecision, parseJsonExact, stringifyJsonExact } from '../../src/core/json-exact.js';
+import { exactNumber, isExactNumber, losesPrecision, parseJsonExact, stringifyJsonExact } from '../../src/core/json-exact.js';
 import { parseNotebook, serializeNotebook } from '../../src/core/parse.js';
 import { hasher } from '../../src/hash.js';
 import { renderReadResult } from '../../src/mcp/render/read.js';
@@ -89,53 +89,103 @@ describe('[V9-5] the parser keeps numbers JavaScript would round', () => {
       // The marker, not a number: `Number(literal)` is already the wrong value.
       expect(parsed.v).toEqual(exactNumber(literal));
       expect(stringifyJsonExact(parsed)).toBe(`{"v":${literal}}`);
-      // The rounded value is what the bug produced — assert the two differ, so this
-      // test cannot pass by accident on a runtime that happens to keep the digits.
-      expect(Number(literal)).not.toBe(BigInt(literal) >= 0n ? Number.NaN : Number.NaN);
+      // The rounded value is what the bug produced, and it is a DIFFERENT number — the
+      // only thing that entitles this module to keep the literal. (This assertion used to
+      // be the tautology `Number(literal) !== NaN`, which held for every input; review
+      // v11 V11-4 caught that it had survived a round of "已删除" claims.)
       expect(String(Number(literal))).not.toBe(literal);
+      expect(losesPrecision(literal), literal).toBe(true);
     }
   });
 
-  it('[V10-3] every literal a JS number would rewrite is preserved, not just integers', () => {
-    // The v9 version of this assertion listed only integers, which is exactly how the
-    // DECIMAL half of the same family survived a round (review v10 V10-3). The rule is
-    // now "does `String(Number(literal))` give the literal back?", so the cases are
-    // grouped by WHY they fail that round trip.
-    const roundTrips = ['0', '-1', '42', '9007199254740991', '-9007199254740991', '1.5', '0.1', '2.5e-10', '1e-7'];
-    for (const literal of roundTrips) {
+  it('[V10-3][V11-1] the criterion is the VALUE, with an explicit table of both sides', () => {
+    // The v9 version listed only integers (which is how the DECIMAL half survived a round,
+    // v10 V10-3); the v10 version asked the BYTES question and so called every ordinary
+    // Python float spelling a precision loss (v11 V11-1).
+    //
+    // The table below is INDEPENDENT of the implementation: each entry is a claim about a
+    // literal, written out rather than derived from `losesPrecision`. That is the point —
+    // the v10 matrix computed its expectations by calling the function it was testing, so
+    // it could not have caught a wrong criterion (review v11 V11-1, "期望自我循环").
+    const valueSurvives = [
+      // Exactly representable integers, including the boundary in both directions.
+      '0', '-1', '42', '9007199254740991', '9007199254740992', '-9007199254740991',
+      // Decimals: the double's shortest round-trip form is the same NUMBER as the literal.
+      '0.1', '0.2', '0.3', '0.25', '1.5', '0.30000000000000004', '2.5e-10', '1e-7', '1e-300',
+      // …and the spellings Python's own json.dumps emits, which the v11 review measured.
+      '100.0', '2.0', '1e2', '1.5e3', '0.10', '1.5e-07', '2.5e-05', '1e+100', '1e308',
+      // A large integer a double holds exactly: `String(Number(x))` is `5e+21`, a different
+      // spelling of the same number.
+      '5000000000000000000000',
+      // `1E+2` is the v10 case whose expectation this round deliberately relaxes: the value
+      // survives, so the spelling change is not a value loss. See D-051's v11 correction.
+      '1E+2', '1e21',
+    ];
+    for (const literal of valueSurvives) {
       expect(losesPrecision(literal), literal).toBe(false);
-      expect(typeof (parseJsonExact(literal) as unknown), literal).toBe('number');
     }
-    const rewritten = [
-      // Precision: the value itself changes.
+
+    const valueChanges = [
+      // Precision: the double denotes a DIFFERENT number than the literal.
       '9007199254740993',
       '-9007199254740993',
       BIG,
       BIG_NEGATIVE,
+      '123456789012345678901234567890',
       '0.1234567890123456789',
       '0.1234567890123456789012345',
       '1.0000000000000001',
       '3.141592653589793238462643383279',
-      // Out of range for a double.
+      '0.10000000000000001',
+      // Out of range for a double (the response delivers null; the digits are in the file).
       '1e400',
       '-1e400',
-      // Value is preserved but the BYTES would not be: the file keeps its spelling.
-      '1E+2',
-      '1e21',
-      '0.10',
-      '1.50',
+      '1e309',
+      // The value is exactly zero, but the sign is a fact the JSON channel cannot carry.
       '-0',
-      '0.0',
+      // 55 digits that happen to BE `Number('0.1')`. Reported, not silently shortened: the
+      // digits are the caller's, and the v11 review's own criterion — normalize the
+      // formatting, then compare with the double's shortest form — says the same. What the
+      // message must NOT do is call the VALUE imprecise: `0.1` is exactly what a client
+      // reads, and the digits are in the file (see the wording case in
+      // `json-number-forms.test.ts`).
+      '0.1000000000000000055511151231257827021181583404541015625',
     ];
-    for (const literal of rewritten) {
+    for (const literal of valueChanges) {
       expect(losesPrecision(literal), literal).toBe(true);
     }
-    // `2**53` is NOT in the list above on purpose: it is exactly representable
-    // (`String(2 ** 53) === '9007199254740992'`), so it survives as a plain number and
-    // marking it would put a marker in the response for no reason. `2**53 + 1` is the
-    // first integer that does not — the boundary, asserted on both sides.
-    expect(losesPrecision('9007199254740992')).toBe(false);
-    expect(losesPrecision('9007199254740993')).toBe(true);
+
+    // The parse side follows the same table: a surviving value is a plain number, and the
+    // ones that do not survive are markers.
+    for (const literal of valueSurvives) {
+      expect(typeof (parseJsonExact(literal) as unknown), literal).toBe('number');
+    }
+    for (const literal of valueChanges) {
+      expect(isExactNumber(parseJsonExact(literal)), literal).toBe(true);
+    }
+  });
+
+  it('[V11-2] a clone invalidates the marker — a KNOWN LIMIT, measured here', () => {
+    // The v10 comment claimed the opposite ("extensibility IS preserved by structuredClone,
+    // so the marker survives the clone"), and a comment that blesses an unsafe refactor is
+    // worse than no comment: the next person reads it and concludes a snapshot-then-write
+    // path is fine. This case exists so the limitation cannot be re-forgotten, and so the
+    // day someone makes the marker clone-safe, this test is what tells them.
+    const marker = exactNumber(BIG);
+    expect(isExactNumber(marker), 'the original is a marker').toBe(true);
+    expect(Object.isExtensible(marker)).toBe(false);
+
+    const cloned = structuredClone(marker);
+    expect(isExactNumber(cloned), 'a clone is NOT a marker').toBe(false);
+    expect(Object.isExtensible(cloned), 'structuredClone drops the frozen state').toBe(true);
+    // The consequence, in bytes: the marker OBJECT would reach the user's file.
+    expect(stringifyJsonExact({ v: cloned })).toBe(`{"v":${JSON.stringify(marker)}}`);
+    expect(stringifyJsonExact({ v: marker })).toBe(`{"v":${BIG}}`);
+
+    // Which is why the invariant the serializer depends on is about the ORIGINAL tree: the
+    // document that gets written is the one `parseNotebook` produced, and that tree keeps
+    // its markers. Asserted end to end in the same file (`[V9-5]` cases below) and in
+    // `v10-regressions.test.ts` for the edit path, which is the one that clones.
   });
 
   it('[V9-5] the serializer matches JSON.stringify for everything it does not mark', () => {

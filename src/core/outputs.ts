@@ -5,7 +5,7 @@
 
 import type { JsonValue } from './errors.js';
 import { decodeBase64ToBytes, encodeBase64, isBase64Shaped } from './base64.js';
-import { isExactNumber } from './json-exact.js';
+import { isExactNumber, isNegativeZero } from './json-exact.js';
 // Value types are imported, not redefined: the execution path and the write gate
 // must answer "is this representable?" identically (review v6 GATE-5).
 import { isJsonMime, isRepresentableMimeValue, type Hasher, type NotebookCell } from './parse.js';
@@ -335,13 +335,38 @@ export interface DroppedMime {
 /**
  * How many dropped mime values a warning names before it summarises the rest.
  *
- * The mime NAMES come from the user's cells (`display({'application/x-bogus-<i>': 5})`),
- * so an unbounded list lets a cell size the response: the reviewer measured a 9 897
- * character warning from a 300-iteration loop, which then travels into `warnings[]` and
- * into `exec_timeout`'s `detail.warnings` (review v10 V10-9). Eight is enough to name the
- * shapes a real notebook has; the count stays exact, so nothing is hidden by the cap.
+ * The mime NAMES come from the user's cells (`display({'application/x-bogus-<i>': 5})`), so an
+ * unbounded list lets a cell size the response: the reviewer measured a 9 897 character
+ * warning from a 300-iteration loop, which then travels into `warnings[]` and into
+ * `exec_timeout`'s `detail.warnings` (review v10 V10-9). Eight is enough to name the shapes a
+ * real notebook has; the count stays exact, so nothing is hidden by the cap.
  */
 export const DROPPED_MIME_DETAIL_LIMIT = 8;
+
+/**
+ * How long a single mime name may be in a warning.
+ *
+ * Capping the number of ENTRIES is not a cap on the message — that was the first version, and
+ * one name defeats it: a 20 000 character mime name produced a 20 176 character warning, and
+ * the reviewer measured the relationship as linear (message ≈ name + 70). The invariant has to
+ * be about the message, so each name is bounded too (review v11 V11-7). 64 characters is well
+ * past every real mime type (`application/vnd.plotly.v1+json` is 32) and short enough that
+ * eight of them plus the framing stay in the low hundreds.
+ */
+export const DROPPED_MIME_NAME_LIMIT = 64;
+
+/**
+ * A mime name short enough for a warning, with a marker when it was cut.
+ *
+ * The name is user data, so it cannot be trusted to be short — and a warning that a cell can
+ * grow without limit is a response-size lever (review v11 V11-7). The ellipsis is there so a
+ * truncated name is not mistaken for the real one.
+ */
+function ellipsizeMime(mime: string): string {
+  return mime.length <= DROPPED_MIME_NAME_LIMIT
+    ? mime
+    : `${mime.slice(0, DROPPED_MIME_NAME_LIMIT)}…`;
+}
 
 /**
  * The `output_truncated` warning for a call, or null when nothing was lost.
@@ -384,7 +409,7 @@ export function outputTruncatedWarning(
   if (unique.length > 0) {
     const named = unique
       .slice(0, DROPPED_MIME_DETAIL_LIMIT)
-      .map((entry) => `cell ${String(entry.cellIndex)}: ${entry.mime}`);
+      .map((entry) => `cell ${String(entry.cellIndex)}: ${ellipsizeMime(entry.mime)}`);
     const rest = unique.length - named.length;
     parts.push(
       `dropped ${String(unique.length)} mime value(s) nbformat cannot store (${named.join(', ')}${rest > 0 ? `, … and ${String(rest)} more` : ''})`,
@@ -512,6 +537,8 @@ export interface OutputWarning {
 export interface ExtractedImage {
   /** Index of this image's OutputItem inside the mapped items array. */
   readonly outputIndex: number;
+  /** The cell these outputs came from, so a warning can be attributed (review v11 V11-10). */
+  readonly cellIndex: number | null;
   readonly mediaType: 'image/png' | 'image/jpeg';
   readonly bytes: Uint8Array;
   readonly width: number | null;
@@ -540,6 +567,17 @@ export interface MapOutputsResult {
 
 export interface MapOutputsOptions {
   readonly inlineTextChars: number;
+  /**
+   * Which cell these outputs belong to, when the caller knows.
+   *
+   * Not needed to map anything — it exists so an `image_materialize_failed` warning can name
+   * the cell. The warning used to name only the OUTPUT index, and since every cell's outputs
+   * start at 0 the message was identical for every broken image in the notebook: the read path
+   * printed it three times with no way to tell the cells apart, and the run path deduplicated
+   * the three into one, which loses exactly the information the caller needs (review v11
+   * V11-10, measured with three cells each holding a broken image).
+   */
+  readonly cellIndex?: number;
   readonly maxImageBytes: number;
   readonly hasher: Hasher;
 }
@@ -597,12 +635,28 @@ function jsonValueOf(value: unknown): { value: JsonValue; warnings: OutputWarnin
 /**
  * The one sentence that has to carry a number the JSON channel cannot.
  *
- * It states three things the model needs: the exact digits, that they are NOT what it
- * is being handed, and what it will actually read. The literal is recognisable by the
- * test suite's regex, which is why the wording is load-bearing rather than cosmetic.
+ * It states three things the model needs: the exact digits, that they are NOT what it is
+ * being handed, and WHAT IT WILL ACTUALLY READ — which differs by case, so the sentence
+ * has to be built per case rather than templated from `String(Number(literal))`:
+ *   - a value out of double range is delivered as `null` (JSON cannot carry Infinity);
+ *     the v11 review caught the first version promising `Infinity` instead (V11-12①),
+ *     which is a claim about a payload that never leaves the server;
+ *   - `-0` is exactly zero and is delivered as `0`: the warning is about the SIGN, not
+ *     about precision, and saying "was not representable exactly" about zero is false
+ *     (V11-1).
+ *
+ * The literal and the phrase "not representable exactly" are matched by the test suite
+ * and by the round-trip cases, so both are load-bearing wording.
  */
 function inexactNumberMessage(literal: string): string {
-  return `json value ${literal} was not representable exactly; the exact digits are in this warning and in the file, but a JSON client reads it as ${String(Number(literal))}`;
+  const asNumber = Number(literal);
+  if (isNegativeZero(literal)) {
+    return `json value ${literal} is negative zero; the value is exact but its sign is not carried by a JSON response, so a client reads it as 0 (the file keeps ${literal})`;
+  }
+  if (!Number.isFinite(asNumber)) {
+    return `json value ${literal} is outside the range this tool can represent exactly; it is delivered as null and the exact digits are in this warning and in the file`;
+  }
+  return `json value ${literal} was not representable exactly; the exact digits are in this warning and in the file, but a JSON client reads it as ${String(asNumber)}`;
 }
 
 /**
@@ -612,15 +666,22 @@ function inexactNumberMessage(literal: string): string {
  * and the projection must not be able to change what a later write-back serializes
  * (that is the whole reason the marker exists). Keys are defined, not assigned, for the
  * same reason the parser does it — a `__proto__` key in the file is data.
+ *
+ * Two facts get a warning here, and they are different facts:
+ *   - the value would change (`9007199254740993` → `…992`, `1e400` → out of range): the
+ *     exact digits are in the message because nothing else can carry them;
+ *   - the value is exact and only its SIGN is lost (`-0` → `0`): calling that "not
+ *     representable exactly" would be false, so it says what it is (review v11 V11-1).
+ * A value that survives untouched — including a `-0` that the response cannot spell —
+ * is delivered as its number and says nothing else.
  */
 function projectJsonValue(value: unknown, literals: Map<string, number>): JsonValue {
   if (isExactNumber(value)) {
     const literal = value.__ipynb_exact_number__;
     literals.set(literal, (literals.get(literal) ?? 0) + 1);
     // `Number(literal)` of an out-of-range literal is Infinity, which is not a JSON
-    // value: it is projected as null, which is what `JSON.stringify` does with it and
-    // what the warning's wording ("reads it as …") describes. Both are lossy, and both
-    // are announced.
+    // value: it is projected as null, and {@link inexactNumberMessage} says exactly that
+    // rather than promising a payload the channel cannot carry.
     const asNumber = Number(literal);
     return Number.isFinite(asNumber) ? asNumber : null;
   }
@@ -736,6 +797,7 @@ export function mapRawOutputs(rawOutputs: readonly RawOutput[], options: MapOutp
         });
         extractedImages.push({
           outputIndex: items.length - 1,
+          cellIndex: options.cellIndex ?? null,
           mediaType: imageMediaType,
           bytes: new Uint8Array(0),
           width: null,
@@ -789,6 +851,7 @@ export function mapRawOutputs(rawOutputs: readonly RawOutput[], options: MapOutp
         });
         extractedImages.push({
           outputIndex: items.length - 1,
+          cellIndex: options.cellIndex ?? null,
           mediaType: imageMediaType,
           bytes: new Uint8Array(0),
           width: null,
@@ -812,6 +875,7 @@ export function mapRawOutputs(rawOutputs: readonly RawOutput[], options: MapOutp
       });
       extractedImages.push({
         outputIndex: items.length - 1,
+        cellIndex: options.cellIndex ?? null,
         mediaType: imageMediaType,
         bytes: decoded,
         width: size?.width ?? null,

@@ -20,33 +20,52 @@ import path from 'node:path';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { isExactNumber, losesPrecision, parseJsonExact, stringifyJsonExact } from '../../src/core/json-exact.js';
+import { isExactNumber, normalizedSpelling, parseJsonExact, stringifyJsonExact } from '../../src/core/json-exact.js';
 import { mapRawOutputs, rawOutputsOfCell } from '../../src/core/outputs.js';
 import { parseNotebook, serializeNotebook } from '../../src/core/parse.js';
 import { hasher } from '../../src/hash.js';
 
-/** Literals whose FORM is the point, and whether a JS number can carry them. */
+/**
+ * Every literal whose FORM is the point, with an EXPLICIT expectation.
+ *
+ * `warned` is written here rather than computed from `losesPrecision`, and that is the
+ * v11 correction (V11-1): the first version of this table derived its expectations by
+ * calling the function under test, so a wrong criterion made the test agree with itself —
+ * it reported 24 green cases while telling every notebook with a float that its value
+ * "was not representable exactly".
+ *
+ * `warned: true` ⇒ the literal must reach the file byte-for-byte and the model must be
+ * told, with the digits in the message. `warned: false` ⇒ the double carries the value
+ * and the spelling is one of the forms a JSON writer normalizes away, so the file may
+ * hold the number's own spelling and the response must be silent.
+ */
 const FORMS = [
-  { literal: '0', exact: true, why: 'zero' },
-  { literal: '-1', exact: true, why: 'small negative integer' },
-  { literal: '9007199254740991', exact: true, why: '2^53 - 1, the last safe integer' },
-  { literal: '9007199254740992', exact: true, why: '2^53, exactly representable' },
-  { literal: '9007199254740993', exact: false, why: '2^53 + 1, the first unrepresentable integer' },
-  { literal: '18446744073709551616', exact: false, why: '2^64' },
-  { literal: '-9223372036854775808', exact: false, why: '-2^63' },
-  { literal: '123456789012345678901234567890', exact: false, why: 'a long integer' },
-  { literal: '0.1', exact: true, why: 'a decimal that round-trips' },
-  { literal: '1.5', exact: true, why: 'a plain fraction' },
-  { literal: '0.1234567890123456789012345', exact: false, why: 'more digits than a double holds' },
-  { literal: '1.0000000000000001', exact: false, why: 'rounds down to 1' },
-  { literal: '3.141592653589793238462643383279', exact: false, why: 'pi to 30 places' },
-  { literal: '0.30000000000000004', exact: true, why: "the double's own shortest form" },
-  { literal: '1e21', exact: false, why: 'JS spells it 1e+21' },
-  { literal: '1E+2', exact: false, why: 'JS spells it 100' },
-  { literal: '2.5e-10', exact: true, why: 'a small exponent that round-trips' },
-  { literal: '1e400', exact: false, why: 'overflows a double entirely' },
-  { literal: '-0', exact: false, why: 'negative zero, where String() drops the sign' },
-  { literal: '0.0', exact: false, why: 'trailing zero, which String() removes' },
+  { literal: '0', warned: false, why: 'zero' },
+  { literal: '-1', warned: false, why: 'small negative integer' },
+  { literal: '9007199254740991', warned: false, why: '2^53 - 1, the last safe integer' },
+  { literal: '9007199254740992', warned: false, why: '2^53, exactly representable' },
+  { literal: '9007199254740993', warned: true, why: '2^53 + 1, the first unrepresentable integer' },
+  { literal: '18446744073709551616', warned: true, why: '2^64 is a double, but not those digits' },
+  { literal: '-9223372036854775808', warned: true, why: '-2^63' },
+  { literal: '123456789012345678901234567890', warned: true, why: 'a long integer' },
+  { literal: '0.1', warned: false, why: 'a decimal that round-trips' },
+  { literal: '1.5', warned: false, why: 'a plain fraction' },
+  { literal: '100.0', warned: false, why: "Python's json.dumps spells 100 this way" },
+  { literal: '1e2', warned: false, why: 'exponent notation for 100' },
+  { literal: '1.5e3', warned: false, why: 'exponent notation for 1500' },
+  { literal: '0.10', warned: false, why: 'a trailing zero' },
+  { literal: '1e-07', warned: false, why: "Python's json.dumps spells 1e-7 this way" },
+  { literal: '2.5e-05', warned: false, why: "Python's json.dumps spells 2.5e-5 this way" },
+  { literal: '0.1234567890123456789012345', warned: true, why: 'more digits than a double holds' },
+  { literal: '1.0000000000000001', warned: true, why: 'rounds down to 1' },
+  { literal: '3.141592653589793238462643383279', warned: true, why: 'pi to 30 places' },
+  { literal: '0.30000000000000004', warned: false, why: "the double's own shortest form" },
+  { literal: '1e21', warned: false, why: 'JS spells it 1e+21, which is the same digits' },
+  { literal: '1E+2', warned: false, why: 'JS spells it 100, which is the same digits' },
+  { literal: '2.5e-10', warned: false, why: 'a small exponent that round-trips' },
+  { literal: '1e400', warned: true, why: 'overflows a double entirely' },
+  { literal: '-0', warned: true, why: 'negative zero: the sign is a fact the response cannot carry' },
+  { literal: '0.0', warned: false, why: 'trailing zero on a zero' },
 ] as const;
 
 /** Where the number sits inside the json value. */
@@ -178,23 +197,55 @@ function storedJsonValueText(text: string): string {
   throw new Error('unterminated application/json value');
 }
 
-/** The distinct inexact literals inside a JSON text, in order of first appearance. */
-function inexactLiteralsIn(jsonText: string): string[] {
-  const found: string[] = [];
-  for (const match of jsonText.matchAll(/-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g)) {
-    const literal = match[0];
-    if (losesPrecision(literal) && !found.includes(literal)) {
-      found.push(literal);
-    }
+/**
+ * The literals that MUST be named in the warnings for a json text, in order.
+ *
+ * A written-down answer rather than a call to `losesPrecision`: the previous version
+ * scanned the text with the function it was testing, so the expectation could not
+ * disagree with the implementation (v11 V11-1, "期望自我循环"). The match is anchored on
+ * the literal forms this file uses, and `18446744073709551616` appears in one POSITION.
+ */
+function expectedWarnedLiterals(jsonText: string): string[] {
+  const expected = FORMS.filter((form) => form.warned && containsNumber(jsonText, form.literal)).map(
+    (form) => form.literal,
+  );
+  // One POSITION embeds a second number, and it is deliberately the same literal the
+  // "beside another inexact number" case is built around.
+  const embedded = '18446744073709551616';
+  if (containsNumber(jsonText, embedded) && !expected.includes(embedded)) {
+    expected.push(embedded);
   }
-  return found;
+  // First appearance order, which is the order the projection walks the value in.
+  return expected.sort((left, right) => jsonText.indexOf(left) - jsonText.indexOf(right));
 }
 
-/** The literals a set of warning messages names, in order. */
+/**
+ * Is `literal` a NUMBER TOKEN in `jsonText`, rather than a substring of a longer one?
+ *
+ * The naive `includes` is what made the first version of this table wrong: `1e-07`
+ * contains `-0`, so the expectation demanded a warning for a literal that is not in the
+ * text at all. The boundary check is what a reader of JSON would do.
+ */
+function containsNumber(jsonText: string, literal: string): boolean {
+  const escaped = literal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?:^|[^\\d.eE+-])${escaped}(?![\\d.])`).test(jsonText);
+}
+
+/**
+ * The literals a set of warning messages names, in order.
+ *
+ * Three message shapes reach here and each is matched explicitly, because the assertion's
+ * job is to notice a MISSING warning — an over-specific regex that quietly matches nothing
+ * would report "no warnings" on a response full of them (the v11 round caught the
+ * neighbouring version of this mistake in the sentence it pinned, V11-12①).
+ */
 function warnedLiterals(messages: readonly string[]): string[] {
   const found: string[] = [];
   for (const message of messages) {
-    const match = /json value (-?\S+) was not representable exactly/.exec(message);
+    const match =
+      /json value (\S+) was not representable exactly/.exec(message) ??
+      /json value (\S+) is outside the range/.exec(message) ??
+      /json value (\S+) is negative zero/.exec(message);
     if (match !== null) {
       found.push(match[1]!);
     }
@@ -267,15 +318,24 @@ describe('[V10-3] every number literal the file holds survives the write-back', 
         // write may not change anything — that is what "the file does not move under
         // an unrelated edit" means in practice.
         expect(writeOnce(written), `${form.literal} (${form.why}) — ${position.name}`).toBe(written);
-        // And the literal itself is in the bytes, exactly as spelled.
-        expect(written, `${form.literal}`).toContain(form.literal);
+        // ① A literal the double cannot carry is in the bytes exactly as spelled.
+        // ② A literal the double carries loses only its formatting, so the file holds the
+        // number's own spelling — and the VALUE is what must not move. The expectation
+        // comes from the table, never from `losesPrecision` (v11 V11-1).
+        if (form.warned) {
+          expect(written, `${form.literal}`).toContain(form.literal);
+        }
         // …and the VALUE that came back is the value that went in, compared with
         // `Object.is` semantics on every number. That single assertion subsumes "not
         // rounded": a rounding would show up as a different number, and it works for
         // `1.0000000000000001` (where "does the text contain `1`" cannot).
+        //
+        // The reference is the FIRST WRITE's tree, not the hand-built fixture: `jsonValueOf`
+        // projects a protected literal to the plain number a client reads, so comparing
+        // against the fixture's text would compare a marker against a number.
         expectSameValue(
           parseJsonExact(storedJsonValueText(written)),
-          parseJsonExact(position.build(form.literal)),
+          parseJsonExact(storedJsonValueText(text)),
           `${form.literal} (${form.why}) — ${position.name}`,
         );
       }
@@ -298,7 +358,19 @@ describe('[V10-3] every number literal the file holds survives the write-back', 
       (notebook.cells[1] as { source: unknown }).source = ['y = 2'];
       const written = serializeNotebook(notebook);
 
-      expect(written, `${form.literal} (${form.why})`).toContain(`"application/json": ${form.literal}\n`);
+      // The cell the edit did not name is untouched in the way this form allows: its
+      // literal survives verbatim where the value needed protecting, and its VALUE is
+      // preserved either way. Both halves are asserted, so "we normalized it away" can
+      // never hide a rewritten number.
+      if (form.warned) {
+        expect(written, `${form.literal} (${form.why})`).toContain(`"application/json": ${form.literal}\n`);
+      } else {
+        expectSameValue(
+          parseJsonExact(storedJsonValueText(written)),
+          parseJsonExact(form.literal),
+          `${form.literal} (${form.why})`,
+        );
+      }
       expect(written, `${form.literal} (${form.why})`).toContain('"y = 2"');
       await writeFile(target, written, 'utf8');
     }
@@ -314,21 +386,81 @@ describe('[V10-3] every number literal the file holds survives the write-back', 
         result: { rawOutputs: Array<{ data: { 'application/json': unknown } }> };
       };
       const value = parsed.result.rawOutputs[0]!.data['application/json'];
-      expect(stringifyJsonExact({ v: value }), `${form.literal} (${form.why})`).toBe(`{"v":${form.literal}}`);
+      if (form.warned) {
+        expect(stringifyJsonExact({ v: value }), `${form.literal} (${form.why})`).toBe(`{"v":${form.literal}}`);
+      } else {
+        // The protocol parser agrees with the document parser: a value the double carries
+        // comes back as a number, not as an object shaped like our marker.
+        expect(isExactNumber(value), `${form.literal} (${form.why})`).toBe(false);
+        expectSameValue(value, Number(form.literal), `${form.literal} (${form.why})`);
+      }
     }
   });
 
-  it('[V10-3] a value that survives as a double stays a plain number', () => {
+  it('[V10-3][V11-1] a value that survives as a double stays a plain number', () => {
     // The over-correction to avoid: marking everything would put a marker (and a
-    // warning) on `0.1`, and a warning that appears for correct values is noise the
-    // model learns to ignore.
-    for (const form of FORMS.filter((entry) => entry.exact)) {
+    // warning) on `0.1`, and a warning that appears for correct values is noise the model
+    // learns to ignore. The v11 round found the over-correction had already shipped — the
+    // expectation is the table's, and the VALUE check below is deliberately weaker than
+    // `String(parsed) === literal`, because `100.0` and `1E+2` are allowed to become
+    // `100`: same digits, same number.
+    for (const form of FORMS.filter((entry) => !entry.warned)) {
       const parsed = parseJsonExact(form.literal);
       expect(typeof parsed, `${form.literal} (${form.why})`).toBe('number');
       expect(isExactNumber(parsed)).toBe(false);
-      expect(String(parsed)).toBe(form.literal);
+      expect(String(parsed)).toBe(String(Number(form.literal)));
     }
   });
+});
+
+describe('[V11-1] the normalizer itself, against a written table', () => {
+  // The value rule is `normalizedSpelling(literal) === String(Number(literal))`, and the
+  // normalizer is the part with the arithmetic in it: the first three versions each got a
+  // different term wrong (`100.0` → `0.1` when the trailing-zero shift was missing, every
+  // value → `0` when the trailing regex was `0*$`). So its OUTPUT is pinned against a table
+  // written by hand, independently of the double and of the code under it.
+  const NORMALIZED: Array<[string, string]> = [
+    ['0', '0'],
+    ['0.0', '0'],
+    ['-0', '0'],
+    ['42', '42'],
+    ['-1', '-1'],
+    ['9007199254740992', '9007199254740992'],
+    ['18446744073709551616', '18446744073709551616'],
+    ['123456789012345678901234567890', '1.2345678901234567890123456789e+29'],
+    ['0.1', '0.1'],
+    ['0.2', '0.2'],
+    ['0.25', '0.25'],
+    ['1.5', '1.5'],
+    ['0.10', '0.1'],
+    ['100.0', '100'],
+    ['2.0', '2'],
+    ['10.0', '10'],
+    ['1234.5', '1234.5'],
+    ['0.001', '0.001'],
+    ['1e2', '100'],
+    ['1E+2', '100'],
+    ['1.5e3', '1500'],
+    ['1e6', '1000000'],
+    ['1e20', '100000000000000000000'],
+    ['1e21', '1e+21'],
+    ['5e21', '5e+21'],
+    ['5000000000000000000000', '5e+21'],
+    ['1e-5', '0.00001'],
+    ['1e-6', '0.000001'],
+    ['1e-7', '1e-7'],
+    ['1.5e-07', '1.5e-7'],
+    ['2.5e-05', '0.000025'],
+    ['1e+100', '1e+100'],
+    ['1e308', '1e+308'],
+    ['1e-300', '1e-300'],
+    ['0.30000000000000004', '0.30000000000000004'],
+  ];
+  for (const [literal, normalized] of NORMALIZED) {
+    it(`[V11-1] ${literal} normalizes to ${normalized}`, () => {
+      expect(normalizedSpelling(literal), literal).toBe(normalized);
+    });
+  }
 });
 
 describe('[V10-1] a number reaches the model as a number, with the digits in a warning', () => {
@@ -344,10 +476,10 @@ describe('[V10-1] a number reaches the model as a number, with the digits in a w
         // warning says so — see the case below.)
         expect(isExactNumber(item.value), `${form.literal} ${position.name}`).toBe(false);
         expect(['number', 'object'], `${form.literal} ${position.name}`).toContain(typeof item.value);
-        // ③ Every distinct inexact literal is named, exactly once each — derived from
-        // the text under test rather than from the form's own flag, so a position that
-        // embeds a second number (there is one) cannot make the expectation wrong.
-        const expected = inexactLiteralsIn(position.build(form.literal));
+        // ③ The literals named in the warnings are exactly this form's literal (when the
+        // table says it must be reported) plus the second literal one POSITION embeds.
+        // EXPECTED_WARNINGS is a written-down table, not a call to the code under test.
+        const expected = expectedWarnedLiterals(position.build(form.literal));
         expect(warnedLiterals(item.warnings.map((warning) => warning.message)), `${form.literal} ${position.name}`)
           .toEqual(expected);
         // ④ Warning codes stay inside SPEC §7's closed table.
