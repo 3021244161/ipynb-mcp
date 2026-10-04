@@ -33,6 +33,11 @@ sidecar 里的同族隐患更严重：`send()` 用 `ensure_ascii=False`，用户
 
 `tests/integration/kernel.test.ts` 的 I9 用例依赖前一个 interrupt 用例**留下**的 kernel，而这只在 interrupt 生效的平台成立（Windows 报 `timeout` → 注册表按 §4.7 规则 6 关闭内核）。现在 interrupt 用例自带 kernel 并**显式断言**"超时后句柄必须消失"，I9 用例自己启动内核。
 
+### Documented, not changed — 实测发现的两处已知行为
+
+- **`mode='auto'` 会重跑目标之前的 cell**（实测 `mode_used=replay`、`replayed=14`）。SPEC §4.7 规则 1 要求这个阶段静默，而 §7 的 warning 码表是封闭的，没有哪个既有码能表达"刚刚重跑了 14 个 cell"——复用会让模型读到假语义。因此**登记为已知行为**并写进 README：想只跑一格就先 `notebook_kernel(action='start')` 再 `mode='resume'`（实测 `replayed=0`）。代价在响应里可见（`mode_used` 与 `replayed_cell_indexes` 都是既有字段）。见 D-062。
+- **`notebook_kernel(action='list')` 不存在**，合法值是 `status|start|shutdown|restart`（实测报 `invalid_arguments`）。评审脚本原本用了 `list`；这是工具按 SPEC 拒绝未知参数，不是缺陷。
+
 ### Tests
 
 - `tests/unit/json-exact.test.ts` 新增 `[V13-1]`：2 MiB 载荷的**分配探针**（阈值 8 倍）。**变异验证**：把逐字符版本写回去，只有这一条红并打印 `retained 61.4 MiB`，其余 9 条全绿。
