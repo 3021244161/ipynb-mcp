@@ -1,6 +1,6 @@
 # 代码审查整改状态（review fix status）
 
-> **来源**：`docs/review/ipynb-mcp-code-review.md`（第一轮）、`…-v2.md`、`…-v3.md`、`…-v4.md`、`…-v5.md`、`…-v6.md`（第六轮 / 本轮）
+> **来源**：`docs/review/ipynb-mcp-code-review.md`（第一轮）、`…-v2.md`、`…-v3.md`、`…-v4.md`、`…-v5.md`、`…-v6.md`、`…-v7.md`、`…-v8.md`、`…-v9.md`（第九轮 / 本轮）
 > **权威**：`SPEC.md` + `AGENTS.md`。整改只做「实现与被 SPEC 判定不符」的部分；
 > SPEC 自身的缺陷按 AGENTS §0 记入 `DEVIATIONS.md` 后按 SPEC 继续。
 >
@@ -20,9 +20,77 @@
 > `pip install ipykernel jupyter_client nbformat`，日志里 `[FID-1]`/`[FID-3]`/`[FID-1 fixtures]` **三条均为 ✓ 而非 skip** ——
 > 这正是 P0-a 要的结果：在唯一会自动运行的环境里，产物合法性**确实被外部权威检查过**（此前 `nbformat` 不在依赖闭包里，三条断言被 `if` 静默跳过而套件仍全绿）。
 > 集成用到的解释器与三平台默认根见 `COMPATIBILITY.md`。
+>
+> **上面这段门禁数字是第六轮当时的快照**（不随轮次改动）。**当前数字见第九轮段的开篇**（本轮亲跑：单测 432 / 28 文件、集成 50 / 7 文件、smoke 26/26、`check:package` 140 文件、`linux-check --selftest` 26 例）。
 ---
 
-## 〇、第八轮（`ipynb-mcp-code-review-v8.md`，本轮）
+## 〇、第九轮（`ipynb-mcp-code-review-v9.md`，本轮）
+
+> 本轮的两条 🔴 是**同一个错误的第四次与第五次形态**。v8 为修"data-URL 图片看得见读不出"只改了**解码/物化**那一层，
+> 断言停在内部 `OutputItem`（`bytes > 0`、`__decodeFailed === false`），而**内容块**那一层仍把文档里的 `data:` 原值交给 SDK
+> → 含该形状的 notebook 连 `notebook_read` 都以协议错误 `-32602` 失败（`notebook_run` 同），**门禁、CI、smoke 同时放行**；
+> 另一条是刚写进 `AGENTS.md` §9 的"全部合法类型矩阵"漏了 **number 域**：超出 IEEE-754 的整数 JSON 被静默四舍五入，
+> run 路径还把舍入后的值写回用户文件（用户数据在磁盘上永久丢失）。所以本轮除修代码外，把两条规则写进 `AGENTS.md` §9：
+> **断言要断言到消费者真正拿到的那一层**、**单个字段的缺陷不得升级为工具级失败**。
+>
+> **门禁实测（第九轮整改后，本轮亲跑）**：`pnpm typecheck` exit 0 ｜ `npx oxlint src tests` **0 警 0 错（71 文件 / 99 规则）**
+> ＋ `scripts/check-format.mjs` ＋ `scripts/check-indent.mjs`（**28 个自测样本全部通过**）＋ `scripts/check-docs.mjs`
+> （**7 个自测变异全被抓到、真文档对照通过**）｜ 单测 **432 passed / 28 文件**（`npx vitest run --reporter=dot`）｜
+> 集成 **50 passed / 7 文件**（`pnpm test:integration`，238.8 s，含新增的 `v9-regressions.test.ts`）｜
+> `pnpm smoke` **26/26** ｜ `npm pack --dry-run` **140 文件**、`pnpm check:package` **ok（140 文件，20 个变异全被抓到）** ｜
+> `python scripts/check-connection-sweep.py` **PASS**（本机 Windows，`liveness probe available: True`）｜
+> `bash scripts/linux-check.sh --selftest`（本机 WSL）**cases=26 failed=0**，`IPYNB_SELFTEST_MUTATE=prefix-only` → **4 条转红**、
+> `no-readlink-flag` → **2 条转红**。
+
+### 9.1 本轮条目（完整清单）
+
+| 条目 | 状态 | 处置与证据 |
+|---|---|---|
+| **V9-1** 🔴 内容块用文档原值 → 整次调用 `-32602` | ✅ | 块载荷改为**已解码的字节**：`src/core/outputs.ts` 的 `ExtractedImage.base64` 由刚解出的字节重新编码（`encodeBase64`，顺带补 `atob` 要求的 padding），`src/mcp/render/read.ts` 与 `src/run.ts` 的块构建只读它、不再回读文档；`src/mcp/tools/result.ts` 组装前再做一次 `isBase64Shaped` 过滤。**空值**归入同一出口：`imageBlockBase64` 拒绝空载荷，`imageDecodeProblem` 给出 `image value is empty`（V8-3 想区分的"空 vs 坏"此前在"空"这格失效）。**断言落在块层并用外部判据**：`tests/unit/image-blocks.test.ts`（14 种值形状 × SDK `CallToolResultSchema`，并断言块解码回文件字节）、集成 `tests/integration/v9-regressions.test.ts`（真 kernel：run 返回的块、盘上仍是原 data-URL、失败 run 写过的文件可再读）、`scripts/e2e-smoke.mjs`（真 stdio＋真客户端 **7 条图片断言**：run 的块与 artifact、read 的块与 artifact、`-32602` 不再发生、每个块都过 `atob`）。**D-047** |
+| **V9-2** 🟠 断言只到内部投影 | ✅ | `scripts/e2e-smoke.mjs` 的 `call()` 现在收集 `type==='image'` 的块（此前只收 text，图片块对它完全不可见），并用 `atob` 当判据；`tests/unit/image-blocks.test.ts` 用 SDK 自己的 schema 判每一次结果，其中 `[V9-1] the OLD block source (the document value) is the thing the SDK rejects` 把**旧写法**交给 schema 并断言其**失败**，`[V9-3] withholds the block, keeps the text answer, and warns in the payload` 断言降级路径。实跑：`pnpm smoke` **26/26**（含 `an image output does not fail the whole tools/call`、`every returned image block carries SDK-valid base64`） |
+| **V9-3** 🟡 缺"块合法性"闸门 | ✅ | `toCallToolResult` 逐块校验（非空 + `isBase64Shaped`），不合法的块**丢弃**并把 `image_materialize_failed` 追加进已序列化 payload 的 `warnings[]`；文本答案与其它块保留，解析失败则原样返回文本（**绝不**为了加警告而丢答案）。用例 `tests/unit/image-blocks.test.ts` 的 `[V9-3]` 三条：旧写法被拒、降级时文本仍在且带警告、全部合法时文本**逐字节不变**。**D-047** |
+| **V9-5** 🔴 大整数 JSON 被静默四舍五入（run 还写回盘） | ✅ | 新增 `src/core/json-exact.ts`：`parseJsonExact`（递归下降，只把"看起来是整数且非安全整数"的字面量存成 marker）/`stringifyJsonExact`（marker 原文写回）；`src/core/parse.ts` 的读入与序列化、`src/kernel/protocol.ts` 的 sidecar 响应解析都改用它；`src/core/outputs.ts` 的 `jsonValueOf` 把 marker 投影成最近的 double，并生成**带精确数字**的 per-output 警告，`collectOutputWarnings` 把它升格进调用级 `warnings[]`（复用 §7 闭集内的 `output_truncated`，**零新增错误码**）。证据：`tests/unit/json-exact.test.ts`、`tests/unit/outputs.test.ts` 的 `[V9-5]`、集成 `tests/integration/v9-regressions.test.ts`（真 kernel `2**64` / `2**53+1` / `-2**63`：**盘上逐字节**与响应警告）。**D-048** |
+| **V9-6** 🟠 `docs/DEVIATIONS.md` 被拼接成两份 | ✅ | 文件恢复成单份（表头 1 个、每个编号 1 行、编号从 D-001 连续到 D-049）；新增 `scripts/check-docs.mjs` 并接进 `pnpm lint`：断言表头与表头行唯一、每个 `D-0NN` 恰好一次、编号无缺口、行内列数与表头一致，且 `docs/OPEN_QUESTIONS.md` 仍是 SPEC §12 的**逐字**副本。可证伪：`--selftest` 用 **7 个变异**（整份重复、重复一行、缺号、列数断裂、重复表头、改写 Q 行、删除 Q 行）要求逐一被抓到，并以"真文档必须通过"为对照。实跑：`node scripts/check-docs.mjs --selftest` → `ok (7 mutations detected, control clean)`；`node scripts/check-docs.mjs` → `ok (1 authority document(s), SPEC §12 verbatim)` |
+| **V9-7** 🟠 超时路径丢掉已收集的 warnings（v7 已修项回归） | ✅ | `src/run.ts` 的 `pushCallWarnings()` 是**唯一装配点**：成功出口与超时出口都调用它，且超时那次在 `throw … exec_timeout` **之前**（json 不等值在 cell 执行完就当场上报，被丢弃的 mime 在其写回前登记，两条都在 `pushCallWarnings` 里汇总）；丢弃警告现在带 cell 身份——`outputTruncatedWarning` 产出 `cell 3: text/plain`，同一 cell 同一 mime 去重、不同 cell 不去重。证据：`tests/unit/run-reporting.test.ts` 的 `[V7-2][V8-10]` 六条（驱动真函数）＋ `[V9-7] the run assembles those warnings in ONE place, used on every exit`；集成 `tests/integration/v9-regressions.test.ts` 的 `[V9-7]` 用**真 kernel 超时**断言 `exec_timeout` 的 detail 带 warnings。**D-042 的状态列已订正** |
+| **V9-8** 🟠 hint 与行为不符、另一条规则推荐无效操作 | ✅ | `src/core/parse.ts` 的 `escapeHatchFor` 改为**按规则生成**：`execution_count_negative` 说的是真话（`clear_outputs` 不动计数，但输出清空后该计数不再被检查），`non_code_cell_has_execution_count` / `non_code_cell_has_outputs` 只推荐 `set_cell_type` 并点明 `clear_outputs` 在非 code cell 上不可用；同时 `execution_count >= 0` 的判据从"**本次请求**清空了该 cell 的输出"改为"**该 cell 此刻**没有输出"（`outputs: []`），所以照 hint 做完之后**下一次**编辑不再被同一条规则拒绝。证据：`tests/unit/edit-tool.test.ts` 的 `[V8-14][V9-8]` 四步会话 + 后续编辑、`tests/unit/run-reporting.test.ts` 的 `[V9-8] the rule is about a count that has outputs to belong to`。**D-049** |
+| **V8-3 残留**（v9 §三·其余 🟡：`imageDecodeProblem` 的空值分支不可达） | ✅ | 空串/纯空白此前被判"解码成功"→ 返回 0 字节图片块 + 0 字节 artifact + **无警告**。现在 `imageBlockBase64` 明确拒绝空载荷，走解码失败出口，`text_fallback` 为 `image value is empty`。用例：`tests/unit/image-blocks.test.ts` 的 `empty string` / `whitespace only` / `empty data: URL payload` 三格（均要求无块 + `image_materialize_failed`） |
+| **V8-4** 🟠 守卫不能失败 | ⚠️ **部分** | 本轮把**装配点**钉住：`tests/unit/run-reporting.test.ts` 断言全仓只有一处 `= outputTruncatedWarning(`（且必须落在 `pushCallWarnings` 体内），并断言超时出口的装配调用**早于** `throw new IpynbError('exec_timeout'`；`[V7-8]` 那条也从"断言源码文本"改成驱动真 `IpynbError` + `toCallToolResult`。**未收口**：这条 pin 仍是**读源码**的断言，而 V8-4 的原始判据是"守卫必须能被变异打红"；行为层证据在集成 `[V9-7]`（真超时）。见 9.3 |
+| **V8-5** ⚠️→✅ 死导出与第六份 venv 复制 | ✅ | `tests/unit/analyze-op.test.ts` 删掉第六份 venv 逻辑（原占据该文件 `:19-214`），改为从 `tests/integration/test-venv.ts` 导入 `prepareVenv` / `BASE_PYTHON` / `TEST_VENV_PY` / `resolvedTestInterpreter`；死导出 `usableInterpreter` 删除（全仓只剩一处注释提到它）。证据：`npx vitest run --reporter=dot` **432 passed / 28 文件**（实跑） |
+| **V8-6** 🟠 清扫判活：后缀误当 pid、Windows 退化 | ✅ | `python/ipynb_sidecar.py` 的 `_owner_pid` 改为**按位置**读：名字必须是 `ipynb-mcp-<kernelId>-<pid>-<random>.json`，最后一段是 mkstemp 的随机后缀（字符集校验），**倒数第二段**才是 pid（ASCII 数字、2–10 位、`< 2^31`），否则返回 `None`（不可归属 ⇒ 走 7 天保守年龄）；Windows 不再用 `os.kill(pid, 0)`（CPython 在 Windows 上把它实现为 `TerminateProcess`），改为 `OpenProcess` + `WaitForSingleObject`：`WAIT_OBJECT_0` ⇒ False（确证已死）、`WAIT_TIMEOUT` ⇒ True、打不开/`WAIT_FAILED` ⇒ `None`（**绝不把"判不了"说成"可以删"**）。年龄阶梯：活着不动 → 确证已死 = `ORPHAN_CONNECTION_AGE_SECONDS`（1 h）→ 探针可用但被拒 = 24 h → 平台无探针 = 7 天。证据：`python scripts/check-connection-sweep.py` 本机实跑 **PASS**（15 条归属规则 + 11 条清扫行为 + 2 条探针，含"全数字随机后缀不得被当 pid"与"活属主 + 上古文件必须留"）；本轮另把该检查器接进 **CI 的 integration job**（`.github/workflows/ci.yml`，见 9.3） |
+| **V8-8 / V9-4** 🟡 `linux-check.sh` 的 `WORK` 守卫可被 `..` 绕过（v9 报告正文按 V8-8 编号，§四 维度段写作 V9-4） | ✅ | `guard()` 按顺序：空值 → 非绝对 → **原始值含 `..` 段**（`has_segment`，归一化之前）→ `readlink -m` 归一化（`-m` 不可用才退 `readlink -f`，两者都不可用或解不出来就**拒绝并说明**）→ 归一化后再查 `..` → 等于某个允许根 → 是 `/` 或 `$HOME` → 必须落在 `/tmp`、`/var/tmp`、`$HOME/tmp` 之下；新增 `--selftest` 与 `--guard <path>`。证据（本机 WSL 实跑）：`cases=26 failed=0`、`SELFTEST PASSED`；判别力：`IPYNB_SELFTEST_MUTATE=prefix-only` → **4 条转红**（`/tmp/../etc`、`/var/tmp/../etc`、`/tmp/..////etc`、`/tmp/a/../b`），`no-readlink-flag` → **2 条转红**（`/tmp/ok/sub`、`$HOME/tmp/x`）并打印 `readlink -f (fallback)`。第八轮那行的"实测"已按订正说明撤回 |
+| **V8-9** 🟠 两点残留（`lib/*` 不可失败、两守卫互斥） | ✅ | `scripts/check-package.mjs` 重写为**纯检查 + 常驻变异矩阵**：`lib` 的模块清单**派生**自构建输出（`files` 漂移即红，不再手写不可失败的 `REQUIRED` 行），入口按 `package.json#bin` 断言、shebang 从**构建产物**读；`scripts/check-connection-sweep.py` 开头设 `sys.dont_write_bytecode = True`。证据（本机实跑）：`node scripts/check-package.mjs` → `ok (140 files, 20 mutations detected)`；`npm pack --dry-run` → `total files: 140`；跑完 sweep 后 `python/__pycache__` **不存在**且 `check:package` 仍绿（两个守卫不再互斥） |
+| **V8-11** 🟡 权威问错解释器 | ✅ | `tests/integration/run.test.ts` 的 nbformat 权威改为 `nbformatSkipReason(authorityInterpreter())`，而 `authorityInterpreter()` 返回 `test-venv.ts` 记录下来的 `resolvedTestInterpreter()`（即**这次实际选中**的解释器，默认 base）；`fixtures-valid.test.ts` 用的也是搜索选中的那个。证据：全仓 `nbformatSkipReason(` 的调用点只有 `run.test.ts`（两处，均经 `authorityInterpreter()`）与 `fixtures-valid.test.ts`（选中解释器） |
+| **V8-12** 🟡 单测删掉集成正在用的 venv | ✅ | `vitest.config.ts` 加 `fileParallelism: false`（与集成配置一致，理由写在注释里）；新增 `tests/unit/test-venv-ownership.test.ts`，用**真实 helper** 在隔离目录上钉住所有权规则：带 marker 的自己人 venv 不可用才删、**外来 venv（无 marker）绝不删**并回退 base、`requireVenv` 失败时也不删。证据：`npx vitest run --reporter=dot` 全绿（432 passed / 28 文件，含该文件 3 条） |
+| **V8-17** 🟡 `check-indent` 守卫不可证伪 | ✅ | `scripts/check-indent.mjs` 的自测矩阵重构为**带标签的 28 个样本**（上一版 16 条分支变异基线只抓到 3 条），`SAMPLE_COUNT` 参与断言，矩阵为空即失败。证据（实跑）：`node scripts/check-indent.mjs` → `structural indent check: ok (28 self-test samples passed)`；`pnpm lint` 里同时跑它 |
+| **卫生**（`mutate-pkg.mjs` 被跟踪、`.gitignore` 家族不全） | ✅ | 删除仓库根的 `mutate-pkg.mjs` 与 `patch-v88.mjs`（两者都已不在盘上）；`.gitignore` 补上 `/mutate-*.mjs`、`/mutate-*.cjs`、`/mutate-*.js`（第六次同类事故）。证据：`git ls-files` 的输出里含 `mutate`/`patch-`/`probe-` 的条目为空 |
+
+> **第八轮表（§8.1）的订正**：v9 复核证伪或降级了其中 10 行，本轮已就地标注（**V8-3**、**V8-4**、**V8-5**、**V8-6**、**V8-10**、**V8-11**、**V8-12**、**V8-13**、**V8-15**、**V8-17**：
+> 分别为"空值分支不可达"、"删掉调用点仍全绿"、"死导出与第六份复制仍在"、"后缀误当 pid + Windows 退化"、"超时路径丢掉 warnings 且 message 丢 cell 身份"、
+> "**根本没改**（`run.test.ts` 仍问 `VENV_PY`）"、"**注释与代码相反**且删除仍会发生"、"`.gitignore` 家族没补全（第六次同类）"、"`analyze-op` 的注释修反"、"标 ✅ 却引用 §8.3 的'未做'"）。
+> 其中 V8-11、V8-12 原文与代码不符，按本文件的撤回约定改为删除线 + 指向本节；V8-8 的订正说明见 §8.1 之后那段。
+
+### 9.2 新增硬规则（`AGENTS.md` §9）
+
+> **断言要断言到消费者真正拿到的那一层。** 数据形状有**四层**：① 内部投影 → ② 模型读到的内容块（`OutputItem` / `content[]`）→
+> ③ 文件字节 → ④ 协议帧。形状类修复**至少**要断言到 ②，涉及写回/存储的再带上 ③，能走真链路的一律走 ③④。
+> **单个字段的缺陷不得升级为工具级失败。** 默认出口是 warning + 降级项；只有"协议帧完整性"与"文件字节完整性"才允许升级为工具级失败。
+
+两条都是本轮用真金白银换来的：V9-1 的根因不是能力问题，而是**测试层次选错**（断言停在 ①，用户拿到的是 ②，SDK 在 ② 上抛 `-32602`）；
+V9-3/D-047 则把"组装结果"这一层也纳入了闸门——**不能假定生产者永远正确**，协议错误与产品错误的边界要由我们守。
+
+### 9.3 未做，与原因 / 残留
+
+- **V8-4 未收口**：`tests/unit/run-reporting.test.ts` 的"单一装配点"断言仍读 `src/run.ts` 的**源码文本**。它比 v8 那版强（删掉任一调用点、或把装配挪到 throw 之后都会红），但按 V8-4 的判据仍不是行为断言；
+  行为层的对应证据在集成 `[V9-7]`（真 kernel 超时 → detail 带 warnings）。要彻底收口需要把 `run.ts` 的出口做成可注入的纯函数，属重构。
+- **`scripts/check-connection-sweep.py` 不放在 `pnpm lint` 里**：它需要 `python`，而 `pnpm lint` 必须在**没有 Python 的机器上**通过（AGENTS §3）。本轮把它做成可独立运行且不写字节码（`sys.dont_write_bytecode = True`），并接进 **CI 的 integration job**（`.github/workflows/ci.yml`，紧跟 `pnpm build` 之后，那里本来就有 Python 与 `ipykernel`）—— 这同时回答了 v9 报告"检查器未接入任何门禁"那一条。
+- **`docs/DEVIATIONS.md` 的 D-046 影响面措辞待订正**（该文件由下一批改动负责）：它还写着"`os.kill(pid, 0)` 判活；平台判不了时退化为……"，
+  而现状是 Windows 用 `OpenProcess`/`WaitForSingleObject` 真探针、确证已死只等 1 h。**代码是权威**，措辞按本节 V8-6 行。
+- **`scripts/check-package.mjs` 的"草稿脚本"规则**：`FORBIDDEN` 里写的是 `^(probe|patch)-`，`mutate-*` 由"根目录不得有 `.mjs/.js/.cjs/.ts`"那条兜住 —— 能红，但失败信息会归到另一条规则名下。属可读性问题，未改。
+- **v9 报告 §五.4 的建议 ② 与仓库现状不符**（记录在案，免得下一轮照着它做）：`pnpm smoke` 早在第八轮整改时就已进入 CI 的 integration job
+  （`git show HEAD:.github/workflows/ci.yml` → 第 90 行 `- run: pnpm smoke`，第 86 行 `- run: pnpm check:package`），所以"19/19 目前只是本机"这条不成立。
+  本轮 smoke 的唯一缺口是**本轮尚未在 CI 上跑过**（本机 26/26，CI 结果看下一次运行）。
+
+## 〇-0、第八轮（`ipynb-mcp-code-review-v8.md`）
 
 > 第八轮的两条 TOP 都指向同一件事：**v7 的修复只覆盖了等价类的一半，而 v7 的复验也只跑了上一轮点名的那一格**。
 > 因此本轮把"修数据形状缺陷 = 补该字段全部合法类型的矩阵 + 逐项先红后绿"写进 `AGENTS.md` §9（见"新增硬规则"一节），
@@ -34,22 +102,28 @@
 |---|---|---|
 | **V8-2** 🔴 `application/json` 的**字符串值**被静默改写 | ✅ | `jsonValueOf` 不再做任何转换：`"123"` 保持字符串、`"hello"` 不再被降级成 `text/plain`、mime 不再被改写。**真实 kernel cell 复现并验证**（4 次 `display(..., raw=True)`，盘上与响应逐字节一致）。矩阵 19 类型 × 5 个 json mime = 95 条，**改代码前 79 条红** |
 | **V8-1** 🟠 `+json` 一族读不回 | ✅ | 键查找改用 `isJsonMime`（与写方向同一条规则）；`unsupported` 的 message 现在说明"值原样保留在文件里"，因为"unsupported output type"读起来像"这个输出是空的" |
-| **V8-4** 🟠 本轮新增的守卫**不能失败** | ✅ | 三个假守卫全部换掉：不再"自己演一遍产品的 if"，不再断言**源码字符串**（把行挪进注释也能过），不再用与标题无关的用例充数。规则下沉到 `core/outputs.ts`（`outputTruncatedWarning` / `countTruncatedCells`）以便直接驱动；sidecar env 用例改为构造真实 `SidecarTransport` 并读它实际传给子进程的 env。**复跑评审的 M1/M1b/M4/M6/M7/M8 六个变异，全部变红**（M1/M4 此前是绿的） |
-| **V8-14** 🟠 拒绝时推荐的出路本身被拒 | ✅ | `clear_outputs` 曾被同一条 `execution_count_negative` 拒绝。**没有改 `clear_outputs`**：SPEC §4.5 规则 5 明写它不动 `execution_count`，所以改的是**我们的**闸门 —— `SelfCheckScope` 增 `clearedOutputCellIndexes`，被本次操作清空输出的 cell 不再受 cell 级计数规则约束（规则与它所属的 outputs 一起消失）。hint 改为按规则生成（`escapeHatchFor`）。四步会话 + 两条"没有放水"用例；三个变异（关掉 skip、把 skip 放宽到整个请求、恢复通用 hint）全部变红 |
+| **V8-4** 🟠 本轮新增的守卫**不能失败** | ⚠️ **部分**（v9 复核：删掉 `run.ts` 的调用点仍全绿；第九轮已把装配点钉住，见第九轮段） | 三个假守卫全部换掉：不再"自己演一遍产品的 if"，不再断言**源码字符串**（把行挪进注释也能过），不再用与标题无关的用例充数。规则下沉到 `core/outputs.ts`（`outputTruncatedWarning` / `countTruncatedCells`）以便直接驱动；sidecar env 用例改为构造真实 `SidecarTransport` 并读它实际传给子进程的 env。**复跑评审的 M1/M1b/M4/M6/M7/M8 六个变异，全部变红**（M1/M4 此前是绿的） |
+| **V8-14** 🟠 拒绝时推荐的出路本身被拒 | ~~✅~~ ⚠️ **部分**（v9 复核：`clear_outputs` 确实能成功了，但 hint 文案不实、非 code cell 那条规则推荐了会被 `invalid_ops` 拒掉的操作；第九轮已修，见第九轮段 V9-8） | `clear_outputs` 曾被同一条 `execution_count_negative` 拒绝。**没有改 `clear_outputs`**：SPEC §4.5 规则 5 明写它不动 `execution_count`，所以改的是**我们的**闸门 —— `SelfCheckScope` 增 `clearedOutputCellIndexes`，被本次操作清空输出的 cell 不再受 cell 级计数规则约束（规则与它所属的 outputs 一起消失）。hint 改为按规则生成（`escapeHatchFor`）。四步会话 + 两条"没有放水"用例；三个变异（关掉 skip、把 skip 放宽到整个请求、恢复通用 hint）全部变红 |
 | **V8-9** 🟠 发布产物带 `.pyc` | ✅ | `files` 从 `"python"` 改为 `python/*.py`（133→132 文件）；新增 `scripts/check-package.mjs` 断言**产物形状**（不含编译产物/源码/测试/内部文档/草稿脚本，且入口、server、sidecar 都在），接入 `pnpm check:package` 与 CI。**我前两版断言写错了**（把 source map 与 bin 的可执行位当缺陷），已删掉而不是留成永久噪音 |
-| **V8-6** 🟠 清扫只按年龄 | ✅ | 改为按**文件名里的 pid** 判活（`mkstemp` 的 prefix 就带着它）；判不了 pid 的平台退化为"无 pid 且超过一周"。另一个 bug 一并修：一个判不了的文件会中断整轮扫描却仍报部分计数 |
+| **V8-6** 🟠 清扫只按年龄 | ~~✅~~ ⚠️ **部分**（v9 复核：归属规则把 mkstemp 的全数字随机后缀当成 pid → 实测删掉活属主的文件；Windows 上全部退化为 7 天；第九轮已按位置判 pid 并加 Windows 真探针，见第九轮段） | 改为按**文件名里的 pid** 判活（`mkstemp` 的 prefix 就带着它）；判不了 pid 的平台退化为"无 pid 且超过一周"。另一个 bug 一并修：一个判不了的文件会中断整轮扫描却仍报部分计数 |
 | **V8-7** 🟠 sidecar 越界未登记 | ✅ | 登记 **D-046**（含"为什么不放到 Node 层"：Node 看不见连接文件路径） |
-| **V8-5** ⚠️→✅ 新 helper 零调用 | ✅ | `prepareVenv()` 真正承担"建/校验/回退/不留下不可用 venv/尊重 `IPYNB_TEST_REQUIRE_VENV`"，五个集成文件全部改为调用，各自不再建 venv |
-| **V8-11** 🟡 权威问错解释器 | ✅ | `nbformatSkipReason` 改为问**搜索实际选中的那个**解释器 |
-| **V8-3** 🟡 data-URL 图片与含糊诊断 | ✅ | 接受 `data:<mime>;base64,` 前缀；解不出来时 fallback 文本说明原因（"空"与"坏"必须能区分） |
-| **V8-10** 🟡 一条 message 两个计数 | ✅ | 丢弃与截断共用一条 `output_truncated`，message 同时给出两个计数 |
-| **V8-8** 🟡 `..` 绕过 WORK 守卫 | ✅ | 先拒绝任何含 `..` 的值，再 `readlink -m` 归一化后判前缀。WSL 实测：`/tmp/../etc`、`/`、`/tmp`、`/var/tmp`、`$HOME`、`/home/x/notebooks` 全拒，`/tmp/ok-check` 放行 |
-| **V8-12** 🟡 共享 venv 生命周期文档不实 | ✅ | `test-venv.ts` 头部改为描述**实际**行为（健康的 venv 作为缓存保留，只有不可用的才删），并说明为什么 |
-| **V8-13** 🟡 跟踪的草稿脚本 | ✅ | 删掉三个被跟踪的 probe/patch 脚本；`.gitignore` 补上整个家族（第五次同类事故） |
-| **V8-15** 🟡 注释/文档不实 | ✅ | README 的集成 venv 路径改为事实（临时目录 + `IPYNB_TEST_VENV` 覆盖）；`analyze-op` 的 `afterAll` 注释改为描述真实行为 |
+| **V8-5** ⚠️→✅ 新 helper 零调用 | ~~✅~~ ⚠️ **部分**（v9 复核：`usableInterpreter` 仍零调用、`analyze-op.test.ts` 里的第六份复制仍在；第九轮已删干净，见第九轮段） | `prepareVenv()` 真正承担"建/校验/回退/不留下不可用 venv/尊重 `IPYNB_TEST_REQUIRE_VENV`"，五个集成文件全部改为调用，各自不再建 venv |
+| **V8-11** 🟡 权威问错解释器 | ~~✅~~ **撤回：v8 这行与代码不符**（v9 复核：`run.test.ts:910` 当时仍问 `VENV_PY`，而 run 用的是可能回退到 base 的 `sidecarInterpreter`）。**第九轮已真修，见第九轮段** | ~~`nbformatSkipReason` 改为问**搜索实际选中的那个**解释器~~ |
+| **V8-3** 🟡 data-URL 图片与含糊诊断 | ⚠️ **部分**（v9 复核：空值会被判"解码成功"→ 产出 0 字节图片块 + 无警告，"空 vs 坏"在"空"这格失效；第九轮已修，见第九轮段） | 接受 `data:<mime>;base64,` 前缀；解不出来时 fallback 文本说明原因（"空"与"坏"必须能区分） |
+| **V8-10** 🟡 一条 message 两个计数 | ⚠️ **部分**（v9 复核：合并计数做到了，但超时路径重新丢掉"值被丢弃"的提示、message 丢掉 cell 身份；第九轮已修，见第九轮段 V9-7） | 丢弃与截断共用一条 `output_truncated`，message 同时给出两个计数 |
+| **V8-8** 🟡 `..` 绕过 WORK 守卫 | ~~✅~~ **撤回：第八轮没做，这行是虚报；第九轮（V9-4）已真修** | **旧说法（不实，原文保留在此）**：~~"先拒绝任何含 `..` 的值，再 `readlink -m` 归一化后判前缀。WSL 实测：`/tmp/../etc`、`/`、`/tmp`、`/var/tmp`、`$HOME`、`/home/x/notebooks` 全拒，`/tmp/ok-check` 放行"~~。**核实**：`git diff HEAD -- scripts/linux-check.sh` 与 `git diff c78e36f~1 c78e36f -- scripts/linux-check.sh` **均为空**，第八轮该文件一行未动，所以那串"实测"没有对应的代码，属于无证据的 ✅。**现行为**：`guard()` 按顺序做下列检查，每道失败都打印**点名的那一项**——`empty-check`（空值）/ `absolute-check`（非绝对路径）/ `dotdot-check`（原始值含 `..` 段，**归一化之前**）/ `normalize-check`（`readlink -m` 归一化，仅当 `-m` 不可用时才退回 `readlink -f`，两者都不可用或解不出来则**拒绝并说明**，不静默放行）/ `root-check`（归一化后等于某个允许根本身）/ `toplevel-check`（归一化后是 `/` 或 `$HOME`）/ `temp-root-check`（归一化后不在 `/tmp`、`/var/tmp`、`$HOME/tmp` 之下）。新增 `--selftest` 与 `--guard <path>`。**自测实测（WSL，本机执行）**：`bash scripts/linux-check.sh --selftest` → **cases=26 failed=0，`SELFTEST PASSED`，退出码 0**（含 `/tmp/../etc`、`/var/tmp/../etc`、`/tmp/..`、`/tmp/.`、`/tmp/../etc` 的变体 `/tmp/..////etc`、`/tmp/a/../b`、`/`、`/tmp`、`/var/tmp`、空值、`.`、`foo/bar`、`$HOME`、`$HOME/tmp`、`$HOME/notebooks` 全拒；`/tmp/ipynb-linux-check`（脚本默认值）、`/tmp/ok-check`、`/tmp/ok/sub`、`/var/tmp/ipynb-linux-check`、`$HOME/tmp/x` 放行）。判别力实测：`IPYNB_SELFTEST_MUTATE=prefix-only`（拿掉 `..` 预检、只留归一化前缀判据）→ **4 条转红**；`IPYNB_SELFTEST_MUTATE=no-readlink-flag`（强制 `readlink -f` 退路）→ 2 条转红并打印 `normalizer : readlink -f (fallback)`。越界实测：`WORK=/tmp/../tmp/ipynb-guard-sentinel` 在 `rm -rf` **之前**退出码 2，哨兵目录仍在 |
+| **V8-12** 🟡 共享 venv 生命周期文档不实 | ~~✅~~ **撤回：v8 写的注释与代码相反**（v9 复核：实测把带 marker 的健康 venv 交给单文件运行仍会被删；`vitest.config.ts` 当时也没有 `fileParallelism`）。**第九轮已真修，见第九轮段** | ~~`test-venv.ts` 头部改为描述**实际**行为（健康的 venv 作为缓存保留，只有不可用的才删），并说明为什么~~ |
+| **V8-13** 🟡 跟踪的草稿脚本 | ⚠️ **部分**（v9 复核：三个脚本确实清了，但"整个家族"没补全 —— `mutate-pkg.mjs` 这一轮又被跟踪；第九轮补上 `/mutate-*`，见第九轮段） | 删掉三个被跟踪的 probe/patch 脚本；`.gitignore` 补上整个家族（第五次同类事故） |
+| **V8-15** 🟡 注释/文档不实 | ⚠️ **部分**（v9 复核：README 那半是真修；`analyze-op` 的新注释与代码**相反** —— 第九轮已随第六份复制一起删掉，见第九轮段） | README 的集成 venv 路径改为事实（临时目录 + `IPYNB_TEST_VENV` 覆盖）；`analyze-op` 的 `afterAll` 注释改为描述真实行为 |
 | **V8-16** 🟡 v5 表遗留 ✅ 与 v6/v7 段冲突 | ✅ | 两行改为删除线 + 指向撤回处 |
-| **V8-17** 🟡 `disableConsoleIntercept`/守卫标注 | ✅ | 见 §8.3（记录为"未做，原因"） |
+| **V8-17** 🟡 `disableConsoleIntercept`/守卫标注 | ~~✅~~ ⚠️ **未做**（v9 复核：行内标 ✅ 却指向 §8.3 的"未做"，`check-indent.mjs:195` 改成 `if (true)` 仍 exit 0。**第九轮已真修**：28 个带标签样本，见第九轮段） | 见 §8.3（记录为"未做，原因"） |
 | **D-044 措辞超前** | ✅ | 范围改为"v7 写下时只有字面量 key 的非字符串值成立" |
+
+> **V8-8 的订正说明（第九轮补记，2026-10-04）。** 第八轮的 ✅ 为什么是虚报：那一轮的改动清单里**没有** `scripts/linux-check.sh`（`git diff` 为空），
+> 而这一行的措辞是照着"修复建议"写的、不是照着代码写的 —— 这正是本文件头部警告的同一类事故（"标 ✅ 但代码里不存在"），也是 V8-8 与 V8-16/V8-17 处理方式不同的原因：
+> V8-8 不是"改了但没验证"，而是**根本没改**。本次真修按 v8 修复建议的两步做（先拒 `..` 原始值，再归一化后判前缀），并补上**可失败的**自测矩阵，
+> 因为"守卫自己不能失败"等于没有守卫（`AGENTS.md` §9）。`/tmp/a/../b` 这类"归一化后回到临时根内部"的值**选择拒绝**（归一化后本就是 `/tmp/b`，安全，但 `..` 预检一律不放行）：
+> 这是一条单一规则，成本只是一条错误消息，且不依赖"这个 `..` 恰好无害"的判断。自测在本机 WSL 实跑，证据见上表该行。
 
 ### 8.2 新增硬规则（`AGENTS.md` §9）
 
@@ -69,8 +143,12 @@
 - **V8-12 的另一半**（"共享 venv 的生命周期"）：`test-venv.ts` 已经承担建/校验/回退，vi 的 `globalSetup` 级别复用
   需要先决定"哪个进程拥有这个 venv"，属设计判断；本轮的注释已经如实描述现状，不再声称不存在的安排。
 
+> **第九轮补记**：本节两条都已在第九轮落地，但走的是与本节设想不同的路 —— **V8-17** 改用"28 个带标签样本 + 矩阵为空即失败"把
+> `check-indent.mjs` 的守卫变成可失败的；**V8-12 的另一半**没有做 `globalSetup` 级复用，而是 `vitest.config.ts` 的
+> `fileParallelism: false` 加 `tests/unit/test-venv-ownership.test.ts` 的所有权用例（理由与证据见第九轮段对应两行）。
 
-## 〇-0、第七轮（`ipynb-mcp-code-review-v7.md`）
+
+## 〇-1、第七轮（`ipynb-mcp-code-review-v7.md`）
 
 > 第七轮的核查对象是**读方向**、**守卫之间的一致性**，以及**文档与代码是否相符**。
 > 它给出的三条 TOP：V7-1（读方向把合法的 `application/json` 静默改写/丢弃）、P0-a（唯一的外部权威在唯一的自动化环境里恒缺席）、

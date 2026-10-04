@@ -2,6 +2,49 @@
 
 本项目的接口变更遵循 D22 兼容承诺（工具名与参数名在 1.x 内不删不改；新增参数一律可选带默认值；返回字段只增不删）。
 
+## [Unreleased] 0.1.0 — 第九轮代码复核整改（未发布）
+
+> 来源：`docs/review/ipynb-mcp-code-review-v9.md`。
+> **无工具名/参数名变更**；**一处返回字段内部结构变化**（`OutputItem` 的 `json` 变体新增 `warnings: []`，
+> 仅新增，不删不改；详见下方"返回字段"）。
+
+### Fixed — 图片内容块（本轮两个 🔴 之一）
+
+- **含 data-URL 图片的 notebook 读写都失败**（🔴）：修 V8-3 时只改了**解码/物化**那一层，**内容块**那一层仍从文档取原值交给 SDK，而 SDK 用 `atob` 校验 `ImageContent.data`——一次非法值不是降级，而是整个 `tools/call` 以 `-32602` 失败（模型失去整份 notebook）；更糟的是**那次失败的 run 仍把 data-URL 写回了文件**，此后该文件永久读不回。现在块载荷由**已解码的字节**重新编码产生（`ExtractedImage.base64` 随物化决策一起返回），与"能否解码"共用同一判据；`result.ts` 另加一道块合法性闸门，任何未来的畸形值降级为 `image_materialize_failed` 警告而不是协议错误。见 D-047。
+- **空载荷图片曾以 0 字节图片 + 0 字节 artifact + 无警告**的形式通过：`atob('')` 成功、`bytes: 0` 与"坏图"看起来一样。空值与空白值现在走 `image_materialize_failed`，`text_fallback` 说明原因。
+- **非字符串图片值不再丢失 mime 名**：`{image/png: 123}` 此前连 key 一起被丢掉，读回来是 `unsupported (unknown)`；现在保留键并报"image value is not a string"，模型因此知道那是一个图片输出。
+
+### Fixed — JSON 数值精度（本轮另一个 🔴）
+
+- **超出 IEEE-754 的大整数被静默四舍五入，且 run 会把舍入后的值写回盘**（🔴）：`application/json` 的 `18446744073709551616` 读出来是 `18446744073709552000`，`warnings: []`，而写回路径把**舍入值**永久写进用户文件——这是"不会静默改坏"要消灭的故障本身。现在 `parse`/序列化走一对**精确保真**的 JSON 实现（`src/core/json-exact.ts`）：JS 无法精确表示的整数字面量以原文保存、原文写回；sidecar 协议解析同样换用精确解析（否则舍入发生在协议层，文件里就是错的）。响应里该值额外带一条 per-output 警告，**精确数字写在警告里**（JSON 通道本身无法承载它）。见 D-048。
+
+### Fixed — 报告与提示
+
+- **超时路径重新丢掉已收集的警告**（🟠，V8-10 的回归）：`exec_timeout` 的 `detail.warnings` 又变成空数组。警告装配现在只有一个入口，**成功出口与超时出口共用**，并在超时抛出**之前**完成。
+- **丢弃值的提示重新带上 cell 身份**（🟠）：扁平化成 `string[]` 之后 message 丢了 cell 下标，而 D-042 登记的影响面写着"指名 cell 与 mime"。现在按 `(cell_index, mime)` 去重并逐个写出。
+- **`clear_outputs` 的 hint 与行为不符**（🟠）：hint 曾声称"clear_outputs resets the cell execution count"，而 SPEC §4.5 规则 5 明写它不动计数，实现也照做；对 markdown cell 还推荐了一个必被拒的操作（`invalid_ops`）。hint 现在按规则生成且**每句为真**，非 code cell 只推荐 `set_cell_type`。
+- **计数规则的作用域从"请求"改为"状态"**（🟠）：v8 的豁免只在清空输出的那一次调用内有效，于是"照 hint 做完之后的**下一次**编辑"又会被同一条规则拒绝。现在一条没有 outputs 的 cell 没有"属于它的计数"，规则不再适用；仍带 outputs 的负数计数照旧被拒（`clear_outputs` 与 `set_cell_type` 推荐的行为都已在用例里走通）。见 D-049。
+
+### Fixed — 文档与守卫
+
+- **`docs/DEVIATIONS.md` 被拼接损坏**（🟠）：D-044 那一行中间嵌进了整份文档的第二份（表头 + 全表），每条偏离出现两次、`D-001` 命中两次，而门禁全绿——`oxlint` 不读 markdown。文件已恢复为单份，D-044 的缺失片段按两份残片的**互补**重建；新增 `scripts/check-docs.mjs`（表头/编号唯一、编号连续、行 arity，外加 SPEC §12 与 `docs/OPEN_QUESTIONS.md` 的逐字一致），接入 `pnpm lint`，并带 7 个变异自测。
+- **`linux-check.sh` 的 `WORK` 守卫可被 `..` 绕过**（🟡，v8 遗留）：先拒绝含 `..` 段的值，再用 `readlink -m` 归一化后判前缀；新增 `--selftest`（26 个 case）与两种变异（`prefix-only` / `no-readlink-flag`）实测转红。上一轮 CHANGELOG 与状态表里"已修"的说法**不实**（那个脚本当轮没有被改动），CHANGELOG 相应条目已订正。
+- **守卫可证伪化**：`check-indent.mjs` 的自测矩阵重构为 28 个带标签样本（16 条分支变异基线只抓到 3 条，现在 28/28 全红）；`check-package.mjs` 重写为"纯函数检查 + 常驻变异矩阵"，`lib/*` 从"不可失败"改为**派生**（`files` 漂移即红，实测去掉 `lib` 后 32 个模块消失）；`check-connection-sweep.py` 设 `sys.dont_write_bytecode = True`，两个守卫不再互斥。
+- **解释器与 venv 的单一决策点**（v8 遗留）：`usableInterpreter` 零调用且 `tests/unit/analyze-op.test.ts` 仍有**第六份复制**——现改为调用共享的 `prepareVenv()`，死导出删除；nbformat 权威改问**实际使用的解释器**（`resolvedTestInterpreter()`），测试 venv 的**所有权**（marker 文件）有了独立用例（`tests/unit/test-venv-ownership.test.ts`），`vitest.config.ts` 补 `fileParallelism: false`。
+- **卫生**：删除根目录草稿脚本 `mutate-pkg.mjs`（曾入库）与 `patch-v88.mjs`，`.gitignore` 补 `/mutate-*` 家族；`atomic.ts` 的重复 doc 注释、`notebook-file.ts` 的尾部空行清理。
+
+### Tests
+
+- **断言到消费者真正拿到的那一层**（`AGENTS.md` §9 新硬规则）：本轮两个 🔴 都是"改了一层、断言停在那一层"。新规则把数据形状分成四层（内部投影 / 模型读到的内容块 / 文件字节 / 协议帧），要求**至少断言到模型读到的那一层**，凡触及磁盘的再带上文件字节。
+- 新增 `tests/unit/image-blocks.test.ts`（**用 SDK 自己的 `CallToolResultSchema` 校验** `content[]`）：14 种图片值的矩阵（合法 base64、无填充、data-URL、标签不符、空 media type、换行、字符串数组、空串、纯空白、空载荷、非 base64、非字符串、null、对象）× 2 个判据，外加"旧写法确实会被 SDK 拒绝"的证伪锚。
+- 新增 `tests/unit/json-exact.test.ts`：精确解析/序列化与 `JSON.stringify` 逐字节一致、只标记不精确的整数、大整数经过**编辑后写回**仍是原文，以及读路径的警告内容。
+- 新增 `tests/integration/v9-regressions.test.ts`（真 kernel）：data-URL 图片跑完后**文件可读且块可解码**、`2**64` / `2**53+1` / `-2**63` **在盘上逐字节保留**并各带一条警告、超时运行的 `detail.warnings` 里带 `cell 0`。
+- `scripts/e2e-smoke.mjs` 新增 7 条：run 与 read 的图片块用 `atob` + PNG 魔数校验、artifact 与块字节一致、`an image output does not fail the whole tools/call`；并新增第 6 个 cell 真实产生 data-URL 图片，`call()` 现在也收集图片块（此前只收 `type==='text'`，图片问题对它**完全不可见**）。26/26。
+
+### 返回字段（唯一的结构性变化）
+
+- `OutputItem` 的 `json` 变体新增 `warnings: []`（`{code, message}[]`，码仍在 SPEC §7 闭集内，取 `output_truncated`）。旧消费者读 `kind`/`value` 不受影响；D-048 登记了这次语义借用。
+
 ## [Unreleased] 0.1.0 — 第八轮代码复核整改（未发布）
 
 > 来源：`docs/review/ipynb-mcp-code-review-v8.md`。
@@ -25,7 +68,7 @@
 - **发布产物带 `.pyc`**（🟠）：`files` 从 `"python"` 改为 `python/*.py`；新增 `pnpm check:package` 断言产物形状，并接入 CI。`pnpm smoke` 也进了 CI。
 - **测试 venv 只有一个决策点**：`prepareVenv()` 承担建/校验/回退，五个集成文件全部改为调用（此前是常量集中、逻辑五份，新 helper 零调用）。
 - **连接文件清扫按 pid 判活**（🟠）：此前只看年龄 —— 跑超过一小时的 kernel 的文件会被误删，而在上次 sidecar 启动之后被遗弃的文件永远扫不到。判不了 pid 的平台退化为"无 pid 且超过一周"（Windows 上"一小时"不算证据）。登记 D-046。
-- **`linux-check.sh` 的 `WORK` 守卫可被 `..` 绕过**（🟡）：先拒绝含 `..` 的值，再归一化后判前缀。
+- **`linux-check.sh` 的 `WORK` 守卫可被 `..` 绕过**（🟡）——**订正（第九轮复核）**：本条声称本轮已修，**不实**：该脚本当轮**一个字节都没有改动**（`git diff c78e36f~1 c78e36f -- scripts/linux-check.sh` 为空），`/tmp/../etc` 在 WSL 上仍被接受。真正的修复在第九轮完成（见上一节），本条保留原文以示记录。
 - README / 注释 / 状态表与实现对齐；三个被跟踪的草稿脚本删除；`.gitignore` 补全家族。
 
 ### Tests
