@@ -24,14 +24,14 @@
 
 | 平台 | Node | Python | unit | integration |
 |---|---|---|---|---|
-| Windows 11 x64 | 22.22.2 | 3.10.14（base anaconda：ipykernel 6.25.2 / jupyter_client 8.3.1 / pyzmq 25.1.1） | **432（全绿）**，28 文件 | **50/50**，7 文件全绿（第九轮本机实跑，238.8 s；新增 `tests/integration/v9-regressions.test.ts`。`kernel.test.ts` / `run.test.ts` 自动回退到 base 解释器，见下） |
+| Windows 11 x64 | 22.22.2 | 3.10.14（base anaconda：ipykernel 6.25.2 / jupyter_client 8.3.1 / pyzmq 25.1.1） | **552（全绿）**，30 文件 | **58/58**，8 文件全绿（第十轮本机实跑，约 536 s；新增 `tests/integration/v10-regressions.test.ts`。`kernel.test.ts` / `run.test.ts` 自动回退到 base 解释器，见下） |
 | Windows 11 x64 | 22.22.2 | 3.11.11（测试 venv，base conda env 内含 **pyzmq 26.2.0**） | 同上 | **该解释器无法启动 kernel**：sidecar 以 `0xC0000409`（`STATUS_STACK_BUFFER_OVERRUN`）退出，stderr 为 `Bad file descriptor (epoll.cpp:73)` |
-| **WSL Ubuntu 22.04（本机实跑）** | **v22.22.0** | 3.x（无 ipykernel → U20 显式 skip） | **381（全绿）**，25 文件 —— 第八轮实测；**第九轮未在 WSL 复跑单测**，只在 WSL 复跑了 `scripts/linux-check.sh --selftest`（**cases=26 failed=0**，两个变异分别 4 条 / 2 条转红） | 未在本机跑（需真实 kernel，见下） |
+| **WSL Ubuntu 22.04（本机实跑）** | **v22.22.0** | 3.x（无 ipykernel → U20 显式 skip） | **381（全绿）**，25 文件 —— 第八轮实测（**第十轮未在 WSL 复跑单测**，新增的 120 条用例只在 Windows 跑过）；**第十轮同样未在 WSL 复跑单测**，只在 WSL 复跑了 `scripts/linux-check.sh --selftest`（**cases=26 failed=0**，`prefix-only` 变异 4 条转红） | 未在本机跑（需真实 kernel，见下） |
 | ubuntu-latest | 22 / 24 | 3.10 / 3.12 | CI | CI（`pip install ipykernel jupyter_client nbformat` + `IPYNB_REQUIRE_NBFORMAT=1`） |
 | windows-latest | 22 / 24 | 3.x | CI | CI |
 | macos-latest | **22 only** | — | CI | **不跑 integration**（见下） |
 
-**其他实测项（第九轮本机实跑）**：`pnpm typecheck` exit 0；`pnpm lint` 0 警（oxlint **71 文件 / 99 规则** + `scripts/check-format.mjs` + `scripts/check-indent.mjs`（**28 个自测样本**）+ `scripts/check-docs.mjs`（**7 个自测变异**，真文档对照通过））；
+**其他实测项（第十轮本机实跑）**：`pnpm typecheck` exit 0；`pnpm lint` 0 警（oxlint **71 文件 / 99 规则** + `scripts/check-format.mjs` + `scripts/check-indent.mjs`（**28 个自测样本**）+ `scripts/check-docs.mjs`（**10 个自测变异**，真文档对照通过；变异源由当前文本推导，合法修订不会误报））；
 `pnpm smoke` **26/26**（真 stdio server + 真 SDK 客户端，含 `data:` URL 图片的读写与 `nbformat.validate`）；
 `pnpm check:package` **ok（140 文件，22 个变异全被抓到）**；`npm pack --dry-run` **140 项**，含 `lib/bin.js`（shebang ✓）与 `python/ipynb_sidecar.py`；
 `git ls-files --eol` 全树 LF（110 个 tracked 文件，0 CRLF / 0 mixed）。
@@ -44,7 +44,7 @@
 - **该 venv 继承的 pyzmq 26.2.0 无法启动 kernel。** 现象：sidecar 一收到 `start_kernel` 就以 `0xC0000409` 退出，Python 侧打印 `Bad file descriptor (zmq …/epoll.cpp:73)`；同一台机器上 pyzmq 25.1.1 的 base anaconda 解释器一切正常。这是**解释器环境**问题，不是 ipynb-mcp 的代码问题（`ping`、`analyze` 正常，`run/server/stale/locked-file` 四个集成文件全绿）。
   **处理方式**：把 `IPYNB_TEST_PYTHON` 指向 base anaconda 解释器即可让集成套件全绿；`tests/integration/kernel.test.ts` 与 `run.test.ts` 里直接用 transport 的用例，现在会在 `beforeAll` 里**真正起一次 kernel**做候选探测——venv 能起就用 venv，起不来就回退到 base 解释器（`kernel.test.ts` 会在 stderr 记录一行说明；走 `runNotebook` 的用例本就用 SPEC §5.2 候选链，不受影响）。因此集成套件在两种环境下都全绿，"环境坏了"不会被误读成"代码坏了"。真正的修复（给测试 venv 一个能用的 pyzmq）属环境操作，未执行。
 - **`analyze-op.test.ts` 的 U20 用例在无 kernel 能力的环境下显式 skip**（记录原因：无解释器 / 缺 `SIDECAR_REQUIRED_MODULES` 中的模块 / pyzmq 起不了 socket），因此单测在无 Python / 无 ipykernel 的机器上仍然全绿（AGENTS §3 要求）；而"解释器自称能起 kernel 却起不来"（`start_kernel` 回归）会**失败**而不是 skip（TST-5，已用变异验证）。
-  **该文件现在只有一个解释器决策**：`beforeAll` 里的 `prepareVenv()`（`tests/integration/test-venv.ts`，第九轮删掉了本文件里第六份复制）先看既有 venv 能否服务 sidecar —— 能就直接用；不能时**只删自己创建的那个**（marker 文件 `.ipynb-mcp-test-venv`），外来 venv（用 `IPYNB_TEST_VENV` 指过来的那份）原样留下并回退到基础解释器；只在基础解释器能服务时才新建 venv 并再次验证；否则直接用基础解释器。该文件的 `afterAll` 还断言"运行前就存在的 venv，运行后仍在"，专门钉住"解析解释器 ≠ 拥有它"（v9 V8-12）。此前"探针问的是 `interpreter()`、用例却自己建 venv"导致同一个 commit 在 CI 上先过后败（run `37134640458`）—— 留下的 venv 让第二次运行的探针看到了另一个解释器。
+  **该文件现在只有一个解释器决策**：`beforeAll` 里的 `prepareVenv()`（`tests/integration/test-venv.ts`，第九轮删掉了本文件里第六份复制；第十轮把 `afterAll` 的断言收窄为"运行前存在**且可用**的 venv，运行后仍在"）先看既有 venv 能否服务 sidecar —— 能就直接用；不能时**只删自己创建的那个**（marker 文件 `.ipynb-mcp-test-venv`），外来 venv（用 `IPYNB_TEST_VENV` 指过来的那份）原样留下并回退到基础解释器；只在基础解释器能服务时才新建 venv 并再次验证；否则直接用基础解释器。该文件的 `afterAll` 还断言"运行前存在且可用的 venv，运行后仍在"，专门钉住"解析解释器 ≠ 拥有它"（v9 V8-12；v10 修正了判据，见 V10-9②）。此前"探针问的是 `interpreter()`、用例却自己建 venv"导致同一个 commit 在 CI 上先过后败（run `37134640458`）—— 留下的 venv 让第二次运行的探针看到了另一个解释器。
 - **macOS 仅通过 unit 层验证**（SPEC §9 CI 矩阵的既定决策：macOS 不跑 integration；其 kernel 生命周期语义与 Linux 一致，unit 层覆盖其平台特有分支——路径规范化、缓存目录、`.venv/bin/python`）。
 - 集成测试在 vitest 下**按文件串行**（`fileParallelism: false`）：真实 kernel 的时序敏感用例（I16）在并行文件下不稳定，串行是准确性优先的取舍。
 - **CI 全绿且外部权威真的跑了**（2026-10-04，run `37143775026`，9 个 job）：integration job 装 `nbformat` 并设 `IPYNB_REQUIRE_NBFORMAT=1`，日志里三条 nbformat 断言均为 ✓ 而非 skip。首次运行（`37130350485`）10 个 job 里 8 个失败，全部在非 Windows 上；

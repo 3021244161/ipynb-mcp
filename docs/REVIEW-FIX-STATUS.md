@@ -1,6 +1,6 @@
 # 代码审查整改状态（review fix status）
 
-> **来源**：`docs/review/ipynb-mcp-code-review.md`（第一轮）、`…-v2.md`、`…-v3.md`、`…-v4.md`、`…-v5.md`、`…-v6.md`、`…-v7.md`、`…-v8.md`、`…-v9.md`（第九轮 / 本轮）
+> **来源**：`docs/review/ipynb-mcp-code-review.md`（第一轮）、`…-v2.md`、`…-v3.md`、`…-v4.md`、`…-v5.md`、`…-v6.md`、`…-v7.md`、`…-v8.md`、`…-v9.md`、`…-v10.md`（第十轮 / 本轮）
 > **权威**：`SPEC.md` + `AGENTS.md`。整改只做「实现与被 SPEC 判定不符」的部分；
 > SPEC 自身的缺陷按 AGENTS §0 记入 `DEVIATIONS.md` 后按 SPEC 继续。
 >
@@ -21,10 +21,52 @@
 > 这正是 P0-a 要的结果：在唯一会自动运行的环境里，产物合法性**确实被外部权威检查过**（此前 `nbformat` 不在依赖闭包里，三条断言被 `if` 静默跳过而套件仍全绿）。
 > 集成用到的解释器与三平台默认根见 `COMPATIBILITY.md`。
 >
-> **上面这段门禁数字是第六轮当时的快照**（不随轮次改动）。**当前数字见第九轮段的开篇**（本轮亲跑：单测 432 / 28 文件、集成 50 / 7 文件、smoke 26/26、`check:package` 140 文件、`linux-check --selftest` 26 例）。
+> **上面这段门禁数字是第六轮当时的快照**（不随轮次改动）。**当前数字见第十轮段的开篇**。
 ---
 
-## 〇、第九轮（`ipynb-mcp-code-review-v9.md`，本轮）
+## 〇、第十轮（`ipynb-mcp-code-review-v10.md`，本轮）
+
+> 本轮的两条 🔴 有一条是**新引入的回归**，而且它比被修的那条更重：为 V9-5 换上自研 JSON parser 之后，
+> 对象键用 `result[key] = value` 承接，`__proto__` 命中的是 `Object.prototype` 的 **setter** —— 该键既不进对象也不进响应，
+> **下一次写入就从用户文件里消失**（`x2 → x0`），编辑的还是**无关 cell**，而文件仍合法所以没有任何一处报警。
+> `JSON.parse` 在这一格本来是**正确**的：**替换一个成熟实现时，先写出被替换者的行为矩阵，再替换。**
+>
+> **门禁实测（第十轮整改后，亲跑）**：`pnpm typecheck` exit 0 ｜ `pnpm lint` 0 警 0 错 +
+> `format check: ok` + `structural indent check: ok (28 self-test samples)` +
+> `documentation self-test: ok (10 mutation(s) detected, 0 skipped, control clean)` +
+> `documentation check: ok` ｜ 单测 **552 passed / 30 文件** ｜ 集成 **58 passed / 8 文件**（`pnpm test:integration`，约 536 s）｜
+> `pnpm smoke` **26/26** ｜ `pnpm check:package` **ok（140 文件，22 变异）** ｜
+> `python scripts/check-connection-sweep.py` **PASS** ｜ `bash scripts/linux-check.sh --selftest`（WSL）**cases=26 failed=0**，
+> 变异 `prefix-only` → 4 条红。
+
+### 10.1 本轮条目（完整清单）
+
+| 条目 | 状态 | 处置与证据 |
+|---|---|---|
+| **V10-6** 🔴 `__proto__` 键被静默删除 + marker 可伪造 | ✅ | `src/core/json-exact.ts`：`readObject` 改用 `Object.defineProperty` 定义自有属性（不再走 setter 路径）；marker 判据改为"形状 + **不可扩展**"（`exactNumber()` 用 `Object.freeze`，来自文件的解析结果必然可扩展）；补齐 JSON 数字文法与 `-0` 符号。**没有**用 `class`+`instanceof` 或 Symbol 键——`structuredClone` 会把类实例压平并丢弃 Symbol 键，那样 marker 会在克隆后失效并被当作对象写进用户文件（实测过）。登记 **D-050**。证据：`tests/unit/json-parser-semantics.test.ts`（28 语义样本 × 解析/写回/往返三断言 + 22 拒绝样本，逐条与 `JSON.parse` 对照）、集成 `v10-regressions.test.ts`（metadata / cell metadata / json 输出三处 `__proto__` + 真 `nbformat.validate`；marker 伪造返回对象且 `warnings: []`） |
+| **V10-3** 🔴 编辑无关 cell 改写盘上的高精度小数 | ✅ | `losesPrecision` 判据从"看起来是整数"改为 `String(Number(literal)) !== literal`（即"能不能原样写回"），覆盖小数、超范围值、`1E+2`/`1e21`/`0.10`/`-0` 这类值与写法不同的形态；能往返的 `0.1`/`1.5` 仍是普通 number。登记 **D-051**。证据：`tests/unit/json-number-forms.test.ts`（**20 形态 × 8 位置** × 三条断言：盘上字节、模型可见值与警告、可往返值不产生 marker）、集成"编辑无关 cell 后盘上不变"与"run 写回同样保真" |
+| **V10-1** 🟠 嵌套精确数把标记对象漏给模型且无警告 | ✅ | `jsonValueOf` 改为**递归**（`projectJsonValue`）：任何深度的 marker 换成数字，**每个不同字面量一条警告**，精确数字仍写在警告文本里；`D-048` 的不变式②现在对嵌套成立。登记 **D-052**。证据：`tests/unit/json-number-forms.test.ts` 的 `[V10-1]`（断言序列化结果里**不出现** `__ipynb_exact_number__`、每个不精确字面量恰好一条警告、两个不同字面量两条） |
+| **V10-7** 🟠 中止类出口与后台 status 丢掉全部 warnings | ✅ | `failedRunError` 新增 `collected` 形参，`abortedRunError` 传入已收集的 warnings 与 droppedMimes；`executeBackgroundRun` 的 catch 把 `detail.warnings` 写回 `handle.warnings`；装配规则下沉到 core 的 `assembleCallWarnings`，四个终态出口共用。登记 **D-052**。证据：集成 `[V10-7]`（真 kernel：cell 0 丢值 → cell 1 在途取消 → 终态 `cancelled` 且 detail 里含 `cell 0: text/plain`；由 run 自己的 progress 事件驱动取消，不靠猜时长） |
+| **V10-4** 🟠 hint 声称"文件会变合法"而权威判它不合法 | ✅ | 文案改为分别陈述"本工具不再检查"与"计数仍在文件里、`nbformat.validate` 仍会拒绝"；`selfCheckNotebook` 的**首次拒绝路径也一律带 hint**（此前未传 `originalDoc` 时没有）。证据：集成 `[V10-4]` 两例——`clear_outputs` 之后**真 nbformat 仍 INVALID**（并断言消息含 `-1`）、`set_cell_type`→markdown 之后 **VALID**；单测断言旧措辞已消失 |
+| **V9-1 残留** 🟠 图片数组形式两条路径判据不同 + `[1,2,3]` 伪造图片 | ✅ | 共用 `imageValueText`：仅当元素全为字符串时 join；读入边界对图片 mime 保留数组形状、只在全字符串时 join，因此读路径与 run 路径交给 `mapRawOutputs` 的是同一种东西。登记 **D-054**。证据：`tests/unit/image-blocks.test.ts` 43 例（新增数字数组 / 混合数组 / 对象数组 / 空数组 / 嵌套数组 5 种非法形状，均断言零块 + `image_materialize_failed`） |
+| **V10-5** 🟡 警告装配无行为级判据 + 幽灵符号 + 恒真断言 + check-docs 两个盲点 | ✅ | 规则下沉到 core `assembleCallWarnings` 并用**真输入**直接单测；`callWarnings` 幽灵符号的注释已订正为 `pushCallWarnings`；恒真断言（`Number(literal) !== NaN`）随 v9 的用例重写而删除；`check-docs` 新增"**末尾条目被删**"与"**追加条目未改计数**"两条可失败规则——计数写在文档头部 `entries: NN`。证据：`tests/unit/run-reporting.test.ts` 的 `[V10-5]`（三事实一次装配、空事实静默、去重）；`check-docs --selftest` 10 个变异全红（含这两格） |
+| **V10-8** 🟡 检查器会因**合法修订**变红 | ✅ | 自测的变异源改为**从当前文本推导**（最后一个编号 / 中间编号 / 下一个编号 / §12 的任一行），施加不了就**跳过并显著提示**，并设"可施加数量下限 5"防止容错退化成什么都不查；`editLine` 的 `throw` 改为返回 null 由调用方跳过。证据：把 SPEC §12 与 `OPEN_QUESTIONS.md` **同步**改一个词（verbatim 仍成立）→ `check` exit 0、`--selftest` exit 0（改前会 exit 1）；只改一边 → 两者都红 |
+| **V10-9①** 🟡 警告 message 无上界 | ✅ | 最多列 8 个 `(cell, mime)` 对，其余 `… and N more`，**计数保持精确**；上限常量在 core 导出，用例引用而非写死。登记 **D-053**。证据：`[V10-9]` 用例（300 项 → message < 400 字符、含 `dropped 300` 与 `… and 292 more`；正好 8 项时不出现 `more`） |
+| **V10-9②** 🟡 `analyze-op` 的 afterAll 判据与 helper 行为矛盾 | ✅ | 断言从"之前存在"收窄为"之前存在**且可用**"——不可用的共享 venv 被 helper 删除是登记过的设计，随后重建失败时路径合法地不存在，旧文案却指责测试删了不是自己创建的环境。 |
+| **V10-9③** 🟢 `linux-check.sh` 的 `rm -rf` 用的是第二次归一化的字符串 | ✅ | 归一化之后再走一次 `guard`，使守卫注释里"每个删除目标都经过全部检查"成为事实。证据：WSL `--selftest` 26/26 通过、`prefix-only` 变异 4 条红 |
+| **V10-9④** 🟢 README 的 venv 措辞 | ✅ | 改为"单测与集成共用一个临时 venv"，并补一条**安全声明**（sidecar/kernel 继承完整 `process.env`，执行不沙箱） |
+| **给下一轮的硬规则** | ✅ | `AGENTS.md` §9 新增第 4、5 条：**判据必须与外部权威一致**（并反向要求"守卫不得因无关原因失败"）、**自己写 parser/序列化器时语言语义边界与数值形态都要有矩阵**（附必测格清单与"替换成熟实现前先写行为矩阵"的判据） |
+
+### 10.2 未做与残留
+
+- **E1–E9 真实第三方客户端**（Claude Desktop / Cursor / Cline 各跑一次并记录进 `COMPATIBILITY.md`）：仍 **0/9**。CI 已覆盖 ubuntu 的 unit + integration，但"服务端自认为正常、客户端收到协议错误"这类故障只有真客户端路径能可靠暴露（v9 的 `-32602` 就是例子）。**这是发布前最后一道非代码门。**
+- **macOS / arm64**：集成不在 macOS 上跑（SPEC §9 的分层），本轮未在 macOS 复跑任何东西。
+- **sidecar 探针的未实测分支**：Windows `PROCESS_QUERY_LIMITED_INFORMATION` 失败回退 `PROCESS_QUERY_INFORMATION`、`ERROR_ACCESS_DENIED → None`、以及"平台根本没有探针"那一级年龄阶梯，本机没有可造的真实场景（v8-6 轮报告已如实说明，本轮未变）。
+- **`output_truncated` 的三义拆分**：D-042/D-048/D-052 都记了"若 SPEC v3.1 愿意新增专用码（如 `output_value_dropped` / `output_value_inexact`），改一两处即可"。SPEC 未改，符合 AGENTS §0。
+- **两处仍值得将来处理的形状**（本轮未做，非阻塞）：① `--images=never` 与超限时，若某 cell 的块被 `result.ts` 丢弃，其 `artifact_path` 可能已指向刚写的文件——"先物化后组装"的固有序；② `run.test.ts` 的权威解释器用例依赖 `resolvedTestInterpreter()`，在没有 venv 的裸机上仍会走 base 解释器（这是设计，但值得在 CI 里断言它确实用了 venv）。
+
+
+## 〇-0、第九轮（`ipynb-mcp-code-review-v9.md`）
 
 > 本轮的两条 🔴 是**同一个错误的第四次与第五次形态**。v8 为修"data-URL 图片看得见读不出"只改了**解码/物化**那一层，
 > 断言停在内部 `OutputItem`（`bytes > 0`、`__decodeFailed === false`），而**内容块**那一层仍把文档里的 `data:` 原值交给 SDK
@@ -90,7 +132,7 @@ V9-3/D-047 则把"组装结果"这一层也纳入了闸门——**不能假定�
   （`git show HEAD:.github/workflows/ci.yml` → 第 90 行 `- run: pnpm smoke`，第 86 行 `- run: pnpm check:package`），所以"19/19 目前只是本机"这条不成立。
   本轮 smoke 的唯一缺口是**本轮尚未在 CI 上跑过**（本机 26/26，CI 结果看下一次运行）。
 
-## 〇-0、第八轮（`ipynb-mcp-code-review-v8.md`）
+## 〇-1、第八轮（`ipynb-mcp-code-review-v8.md`）
 
 > 第八轮的两条 TOP 都指向同一件事：**v7 的修复只覆盖了等价类的一半，而 v7 的复验也只跑了上一轮点名的那一格**。
 > 因此本轮把"修数据形状缺陷 = 补该字段全部合法类型的矩阵 + 逐项先红后绿"写进 `AGENTS.md` §9（见"新增硬规则"一节），
@@ -148,7 +190,7 @@ V9-3/D-047 则把"组装结果"这一层也纳入了闸门——**不能假定�
 > `fileParallelism: false` 加 `tests/unit/test-venv-ownership.test.ts` 的所有权用例（理由与证据见第九轮段对应两行）。
 
 
-## 〇-1、第七轮（`ipynb-mcp-code-review-v7.md`）
+## 〇-2、第七轮（`ipynb-mcp-code-review-v7.md`）
 
 > 第七轮的核查对象是**读方向**、**守卫之间的一致性**，以及**文档与代码是否相符**。
 > 它给出的三条 TOP：V7-1（读方向把合法的 `application/json` 静默改写/丢弃）、P0-a（唯一的外部权威在唯一的自动化环境里恒缺席）、

@@ -2,6 +2,43 @@
 
 本项目的接口变更遵循 D22 兼容承诺（工具名与参数名在 1.x 内不删不改；新增参数一律可选带默认值；返回字段只增不删）。
 
+## [Unreleased] 0.1.0 — 第十轮代码复核整改（未发布）
+
+> 来源：`docs/review/ipynb-mcp-code-review-v10.md`。
+> **无工具名/参数名变更**；**无新增返回字段**（`OutputItem.json.warnings` 是 v9 已发布形态，本轮只是把它的**内容**补全）。
+
+### Fixed — 本轮新引入的回归（🔴）
+
+- **`__proto__` 键被静默删除，且对象能被写成裸数字**（🔴，**本轮新引入**）：为 V9-5 换上自研 parser 时，对象键用 `result[key] = value` 承接，而 `__proto__` 命中的是 `Object.prototype` 的 **setter**——该键既不进对象也不进响应，**写入时从用户文件里消失**（实测 `x2 → x0`），编辑的还是**无关 cell**；文件仍合法，所以自检、nbformat 与门禁都不报警。上一版的 `JSON.parse` 在这一格**是正确的**。修法：`Object.defineProperty` 定义自有属性；marker 改为"形状 + 不可扩展"双重判据（`exactNumber()` 冻结产出，来自文件的解析结果必然可扩展，因此伪造不了），不用 `class`/`instanceof` 或 Symbol 键——`structuredClone`（编辑路径会对文档调用）会把类实例压平并**丢弃** Symbol 键，那样 marker 会在克隆后失效并被当作对象写进文件。见 **D-050**。顺带补齐 JSON 数字文法（`01`/`1.`/`.1`/`+1` 与 `JSON.parse` 一样拒绝）与 `-0` 的符号保留。
+
+### Fixed — 数值形态的原文保真（🔴）
+
+- **编辑一个无关 cell 会在盘上静默改写别处的高精度小数**（🔴）：判据只覆盖"看起来是整数的字面量"，而任何写入都会重序列化**整份文档**，于是 `0.1234567890123456789012345` → `0.12345678901234568`、π 的 30 位 → 16 位、`1.0000000000000001` → `1`，`warnings: []`——改的是**没被要求改的 cell**。判据改为"**能不能原样写回**"（`String(Number(literal)) !== literal` 即保护），因此小数、超范围值与"值等价但写法不同"的 `1E+2`、`1e21`、`0.10` 一并覆盖；能往返的 `0.1`/`1.5` 仍是普通 number（不制造无谓的 marker 与警告）。见 **D-051**。
+
+### Fixed — 同一族的另外三格
+
+- **嵌套的精确数字把内部标记对象漏给模型**（🟠）：`jsonValueOf` 只判顶层，容器里的字面量以 `{"__ipynb_exact_number__": "…"}` 原样发出且**零警告**——模型看到文件里不存在的结构，而那个名字在任何文档里都没定义。现在递归投射：任何深度的标记都换成数字，**每个不同字面量一条警告**，精确数字仍写在警告文本里。见 **D-052**。
+- **中止类出口丢掉全部已收集 warnings**（🟠）：`cancelled` / `kernel_died` 从未把已收集的 warnings 传进 detail，后台路径更彻底——即使 detail 里有也不写回句柄，于是 `notebook_run_status` **永远**看不到丢弃提示，而**文件已经被改写、值已经被丢弃**。四个终态出口与后台 status 现在共用 core 的 `assembleCallWarnings`（可用真输入直接单测，v9 那版藏在 `run.ts` 私有函数里、短路后 432 条单测全绿）。见 **D-052**。
+- **hint 声称"文件会变合法"，而 nbformat 判它不合法**（🟠）：`clear_outputs` 之后计数仍是 `-1`、`nbformat.validate` 仍拒绝——把"我们不再检查"说成了"文件合法"。文案改为分别陈述两件事，用例改为**由外部权威判定**（集成里断言"clear_outputs 之后仍 INVALID、`set_cell_type` 之后才 VALID"），首次拒绝路径也一律带 hint。见 AGENTS §9 新增的第 4 条规则。
+- **图片值的数组形式在两条路径上判据不同**（🟠，V9-1 残留）：读路径把数组 join 后当图片，run 路径要求 `typeof === 'string'`，同一份数据两条路径结论相反；更糟的是 `[1,2,3]` 被 join 成 `"123"`——合法 base64 字母表、解码出 2 字节，于是被**当成一张真图片**返回并写 artifact。两条路径现在共用 `imageValueText`：仅当元素**全部是字符串**时 join。见 **D-054**。
+
+### Fixed — 守卫与文档
+
+- **`check-docs.mjs` 会因合法的文档修订而变红**（🟡）：自测的变异源硬编码了文档里的字面量，同步修订两个文档（verbatim 仍成立）会让 `pnpm lint` 失败，而文档恰恰是改对了。变异改为**从当前文本推导**，施加不了就跳过并显著提示，另设"可施加数量下限"防止容错退化成什么都不查；同时补上 v9 遗留的两个盲点（**删掉最后一行**不报、**追加一条**不报）——计数现在写在文档头部（`entries: NN`）并由检查器校对。见 **D-053** 所在轮次的说明与 AGENTS §9 第 4 条。
+- **警告 message 无上界**（🟡）：mime 名由用户 cell 决定，300 个 `application/x-bogus-N` 实测产出 9 897 字符的调用级 message 并进入响应与 `exec_timeout` 的 detail。现在最多列 8 个 `(cell, mime)` 对，其余概括为 `… and N more`，**计数保持精确**。见 **D-053**。
+- **测试 venv 的所有权断言会因无关原因失败**（🟡）：共享 venv 存在但不可用时 helper **会**删它（V8-12 的设计），若随后的重建失败（Debian 缺 `python3-venv`），路径合法地不存在，而报错信息却指责测试删了"不是自己创建的环境"。断言改为"**之前存在且可用**的 venv 之后必须仍在"。
+- `linux-check.sh` 的 `rm -rf` 目标改为**归一化之后再走一次守卫**（此前守卫注释承诺"每个删除目标都经过全部检查"，而实际删的是第二次归一化的字符串）；README 补 venv 措辞（单测也用同一个 venv）与**安全声明**（sidecar/kernel 继承完整 `process.env`，执行不沙箱）。
+
+### Tests
+
+- **新增 `AGENTS.md` §9 第五条硬规则**：自己写 parser / 序列化器时，**语言语义边界与数值形态都要有矩阵**；替换一个成熟实现时，先写出被替换者的行为矩阵再替换。
+- 新增 `tests/unit/json-parser-semantics.test.ts`：**28 个语义样本 × 3 条断言**（解析结果与 `JSON.parse` 逐键一致、写回与 `JSON.stringify` 逐字节一致、round-trip 稳定）+ **22 个拒绝样本**（逐条先确认 `JSON.parse` 也拒绝）+ 深嵌套。`__proto__` 覆盖 metadata / cell metadata / json 输出 / 数组元素 / 深层嵌套 / 转义写法 / 重复键。
+- 新增 `tests/unit/json-number-forms.test.ts`：**20 种数值形态 × 8 个位置**（顶层 / 深度 1 / 深度 2 / 数组 / 数组套对象 / 三层嵌套 / 与另一不精确值相邻 / 同值两处）× 3 条断言（盘上字节、模型可见的 `value` 与警告、能往返的值不产生 marker），另有"编辑无关 cell 后盘上不变"与"run 写回同样保真"。
+- 新增集成 `tests/integration/v10-regressions.test.ts`（8 例，真 stdio + 真 kernel + `nbformat.validate`）：三处 `__proto__` 的读/编辑/权威校验、marker 伪造、无关 cell 的高精度小数、`clear_outputs` 之后仍 INVALID 而 `set_cell_type` 之后 VALID、取消的后台 run 仍报告丢弃、小数的 run 写回。
+- 新增 `tests/unit/test-venv-ownership.test.ts`（3 例，独立沙箱目录）：外来 venv 不删、自己创建的不可用 venv 会删、`IPYNB_TEST_REQUIRE_VENV=1` 的失败也不以删除实现。
+- `tests/unit/image-blocks.test.ts` 43 例（新增 5 种非法数组形状）。
+- 单测 **432 → 552**（30 文件）；集成 **50 → 58**（8 文件）。
+
 ## [Unreleased] 0.1.0 — 第九轮代码复核整改（未发布）
 
 > 来源：`docs/review/ipynb-mcp-code-review-v9.md`。
