@@ -4,7 +4,7 @@
 // the image policy allows blocks to be returned.
 
 import { createWarning, type Warning } from '../../core/errors.js';
-import { mapRawOutputs, rawOutputsOfCell, type OutputItem } from '../../core/outputs.js';
+import { mapRawOutputs, rawOutputsOfCell, collectOutputWarnings, type OutputItem } from '../../core/outputs.js';
 import { cellSource, hasStableCellIds, readNotebookMetadata, type NotebookFile } from '../../core/parse.js';
 import { applyImagePolicy, shouldReturnImages, type ImagesPolicy } from '../../fs/artifact.js';
 
@@ -117,28 +117,36 @@ export async function renderReadResult(input: RenderReadInput): Promise<RenderRe
       imageCursor += policyResult.materialized.length;
       if (returnImages) {
         for (const materialized of policyResult.materialized) {
-          const rawOutput = typedRawOutputs[materialized.outputIndex];
           const image = mapped.items[materialized.outputIndex];
           if (image !== undefined && image.kind === 'image') {
-            // Narrowed, not asserted: `RawOutput.data` is `unknown` per mime because
-            // a json mime legitimately holds any JSON value (review v7 V7-1). An
-            // image block may only be built from an actual base64 string.
-            const base64 = rawOutput?.data?.[image.media_type];
-            if (typeof base64 === 'string') {
-              imageBlocks.push({ data: base64, media_type: image.media_type });
-            }
+            // The payload comes from the materialization decision, NOT from the
+            // document: it is the base64 of the bytes that were just written, so it
+            // is valid by construction. Reading the raw value back here is how a
+            // `data:` URL reached the SDK and turned the whole call into `-32602`
+            // (review v9 V9-1).
+            imageBlocks.push({ data: materialized.base64, media_type: image.media_type });
           }
         }
       }
 
       cellPayload['outputs_summary'] = input.includeOutputs === 'summary' ? summarizeOutputs(mapped.items) : null;
       cellPayload['outputs'] = input.includeOutputs === 'full' ? mapped.items : null;
-      if (input.includeOutputs === 'full' && mapped.items.some((item) => item.kind === 'stream' && item.truncated)) {
-        if (!warnings.some((warning) => warning.code === 'output_truncated')) {
-          warnings.push(createWarning(
-            'output_truncated',
-            'at least one output exceeded inline_text_chars and was truncated',
-          ));
+      if (input.includeOutputs === 'full') {
+        // Per-output problems ride on the item; `warnings[]` is what a client
+        // reads, so they are lifted here as well (review v9 V9-5). Neither is a
+        // failure: nothing was dropped and the file still holds the value.
+        for (const lifted of collectOutputWarnings([{ outputs: mapped.items }])) {
+          if (!warnings.some((warning) => warning.message === lifted.message)) {
+            warnings.push(createWarning(lifted.code, lifted.message));
+          }
+        }
+        if (mapped.items.some((item) => item.kind === 'stream' && item.truncated)) {
+          if (!warnings.some((warning) => warning.code === 'output_truncated')) {
+            warnings.push(createWarning(
+              'output_truncated',
+              'at least one output exceeded inline_text_chars and was truncated',
+            ));
+          }
         }
       }
     }

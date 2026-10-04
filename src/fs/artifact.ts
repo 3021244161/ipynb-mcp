@@ -38,8 +38,16 @@ export interface MaterializeContext {
 
 export interface ApplyPolicyResult {
   readonly items: OutputItem[];
-  /** Materialized images in return order (index within the returned image blocks). */
-  readonly materialized: ReadonlyArray<{ outputIndex: number; artifactPath: string }>;
+  /**
+   * Materialized images in return order (index within the returned image blocks).
+   *
+   * `base64` is the payload the corresponding image block must carry — the exact
+   * bytes that were just written, encoded once. It travels with the decision so a
+   * caller never has to look the value up in the document again: doing that is
+   * what made a `data:` URL decodable for the artifact and fatal for the block
+   * (review v9 V9-1).
+   */
+  readonly materialized: ReadonlyArray<{ outputIndex: number; artifactPath: string; base64: string }>;
   readonly warnings: Warning[];
 }
 
@@ -56,7 +64,7 @@ export async function applyImagePolicy(
   context: MaterializeContext,
 ): Promise<ApplyPolicyResult> {
   const warnings: Warning[] = [];
-  const materialized: Array<{ outputIndex: number; artifactPath: string }> = [];
+  const materialized: Array<{ outputIndex: number; artifactPath: string; base64: string }> = [];
 
   if (!decision.returnImages || decision.maxImages <= 0) {
     if (decision.returnImages && decision.maxImages <= 0 && extractedImages.length > 0) {
@@ -80,6 +88,18 @@ export async function applyImagePolicy(
       warnings.push(createWarning(
         'image_materialize_failed',
         `failed to decode image at output ${image.outputIndex}; artifact_path and image_index stay null`,
+      ));
+      continue;
+    }
+    // A decodable image always has a canonical payload (see `ExtractedImage.base64`).
+    // Serving a block without one is the one outcome that must not happen, so it is
+    // reported as the documented materialize failure rather than as a raw value the
+    // SDK would reject with a protocol error (review v9 V9-1/V9-3).
+    const base64 = image.base64;
+    if (base64 === null) {
+      warnings.push(createWarning(
+        'image_materialize_failed',
+        `image at output ${image.outputIndex} has no returnable base64 payload; artifact_path and image_index stay null`,
       ));
       continue;
     }
@@ -134,7 +154,7 @@ export async function applyImagePolicy(
       item.artifact_path = artifactPath;
       item.image_index = imageIndex;
     }
-    materialized.push({ outputIndex: image.outputIndex, artifactPath });
+    materialized.push({ outputIndex: image.outputIndex, artifactPath, base64 });
     imageIndex += 1;
   }
 

@@ -4,6 +4,8 @@
 // image headers are parsed by hand (no image libraries, SPEC §4.4).
 
 import type { JsonValue } from './errors.js';
+import { decodeBase64ToBytes, encodeBase64, isBase64Shaped } from './base64.js';
+import { isExactNumber } from './json-exact.js';
 // Value types are imported, not redefined: the execution path and the write gate
 // must answer "is this representable?" identically (review v6 GATE-5).
 import { isJsonMime, isRepresentableMimeValue, type Hasher, type NotebookCell } from './parse.js';
@@ -116,9 +118,13 @@ export function rawOutputsOfCell(cell: NotebookCell): RawOutput[] {
           continue;
         }
         const text = dataValueToString(value);
-        if (text !== null) {
-          normalized[key] = text;
-        }
+        // A value that cannot be a string is KEPT as `null` rather than dropped:
+        // dropping the key claimed the mime was never there, so an image whose
+        // value was a number came back as "unsupported output type (unknown)"
+        // instead of naming `image/png` — the model's only clue about what it was
+        // looking at (review v9 V9-1's matrix). The write gate still refuses to
+        // store a null under a non-json mime, so nothing about the file changes.
+        normalized[key] = text;
       }
       raw.data = normalized;
     }
@@ -267,6 +273,19 @@ export function representableExecutionCount(value: unknown): number | null {
 }
 
 /**
+ * A mime value that had to be dropped, and the cell it belonged to.
+ *
+ * The cell is part of the fact, not decoration: the warning names which cell lost
+ * a value so the model can look there, and the v8 message lost that when the pairs
+ * were flattened into a `string[]` — while D-042 recorded the impact as "names the
+ * cell and the mime" (review v9 V9-7).
+ */
+export interface DroppedMime {
+  readonly cellIndex: number;
+  readonly mime: string;
+}
+
+/**
  * The `output_truncated` warning for a call, or null when nothing was lost.
  *
  * Two different facts share this code because SPEC §7's table is closed
@@ -276,24 +295,38 @@ export function representableExecutionCount(value: unknown): number | null {
  * truncation and never learn that a value had been discarded, or the reverse
  * (review v8 V8-10).
  *
- * One message therefore carries both counts. The text is built here, in core, so the
- * rule is testable without a kernel and cannot drift from the callers: the v7
- * attempt at this lived inline in `run.ts`, and the test for it re-implemented the
- * same `if` on its own array, so deleting the real guard kept the suite green
- * (review v8 V8-4).
+ * One message therefore carries both counts, and a third fact rides along: a
+ * `+json`/`application/json` value JavaScript cannot hold exactly is reported (and
+ * its exact digits preserved) by {@link collectOutputWarnings} (review v9 V9-5).
+ * The text is built here, in core, so the rule is testable without a kernel and
+ * cannot drift from the callers: the v7 attempt at this lived inline in `run.ts`,
+ * and the test for it re-implemented the same `if` on its own array, so deleting
+ * the real guard kept the suite green (review v8 V8-4).
  */
 export function outputTruncatedWarning(
-  droppedMimes: readonly string[],
+  dropped: readonly DroppedMime[],
   truncatedCount: number,
 ): { code: 'output_truncated'; message: string } | null {
-  const unique = [...new Set(droppedMimes)];
+  // Same cell dropping the same mime twice is one fact; the same mime dropped by
+  // two cells is two, and saying so is the point of carrying the cell index.
+  const seen = new Set<string>();
+  const unique: DroppedMime[] = [];
+  for (const entry of dropped) {
+    const key = `${String(entry.cellIndex)}\u0000${entry.mime}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    unique.push(entry);
+  }
   if (unique.length === 0 && truncatedCount === 0) {
     return null;
   }
   const parts: string[] = [];
   if (unique.length > 0) {
+    const rendered = unique.map((entry) => `cell ${String(entry.cellIndex)}: ${entry.mime}`);
     parts.push(
-      `dropped ${String(unique.length)} mime value(s) nbformat cannot store (${unique.join(', ')})`,
+      `dropped ${String(unique.length)} mime value(s) nbformat cannot store (${rendered.join(', ')})`,
     );
   }
   if (truncatedCount > 0) {
@@ -311,6 +344,36 @@ export function countTruncatedCells(
   return cells.filter((cell) => cell.outputs.some(isTruncatedItem)).length;
 }
 
+/**
+ * Lift per-output warnings to the call level, where SPEC §7's closed table lives.
+ *
+ * The output-level detail stays on the item (a model needs to know WHICH output);
+ * this is what makes the same problem visible to a client that only reads
+ * `warnings[]`. Deduped by message, so a call cannot report the identical fact
+ * twice, and returned in first-seen order for stable output.
+ */
+export function collectOutputWarnings(
+  cells: readonly { readonly outputs: readonly OutputItem[] }[],
+): OutputWarning[] {
+  const seen = new Set<string>();
+  const lifted: OutputWarning[] = [];
+  for (const cell of cells) {
+    for (const item of cell.outputs) {
+      if (item.kind !== 'json') {
+        continue;
+      }
+      for (const warning of item.warnings) {
+        if (seen.has(warning.message)) {
+          continue;
+        }
+        seen.add(warning.message);
+        lifted.push(warning);
+      }
+    }
+  }
+  return lifted;
+}
+
 function isTruncatedItem(item: OutputItem): boolean {
   return item.kind === 'stream' && item.truncated;
 }
@@ -320,7 +383,7 @@ export type OutputItem =
   | { kind: 'text'; media_type: 'text/plain'; text: string }
   | { kind: 'markdown'; text: string }
   | { kind: 'html'; html: string; text_fallback: string }
-  | { kind: 'json'; value: JsonValue }
+  | { kind: 'json'; value: JsonValue; warnings: OutputWarning[] }
   | {
       kind: 'image';
       media_type: 'image/png' | 'image/jpeg';
@@ -334,6 +397,20 @@ export type OutputItem =
   | { kind: 'error'; error_name: string; error_value: string; traceback_lines: string[] }
   | { kind: 'unsupported'; mime_type: string; message: string };
 
+/**
+ * A problem with ONE output value, reported next to that value.
+ *
+ * Output-level problems have no code of their own (SPEC §7's table is closed and
+ * this project does not mint codes), and a call-level code cannot say WHICH output
+ * was affected — a model that cannot locate it will rewrite the cell and destroy
+ * the output. So the item carries the detail and the call-level projection lifts
+ * the code up (review v9 V9-5).
+ */
+export interface OutputWarning {
+  readonly code: 'output_truncated';
+  readonly message: string;
+}
+
 /** Decoded image payload handed to the artifact layer for materialization. */
 export interface ExtractedImage {
   /** Index of this image's OutputItem inside the mapped items array. */
@@ -344,6 +421,19 @@ export interface ExtractedImage {
   readonly height: number | null;
   readonly sha256Hex: string;
   readonly decodeFailed: boolean;
+  /**
+   * The payload as canonical base64 — the exact string a returned image block
+   * must carry. Present exactly when `decodeFailed` is false.
+   *
+   * Why the block cannot read the document value instead: the value on disk may
+   * be a `data:` URL, a whitespace-wrapped payload or an array joined into one
+   * string, all of which DECODE fine here and none of which `atob` accepts. The
+   * SDK validates `ImageContent.data` with `atob`, and a rejection is a
+   * protocol-level `-32602` for the WHOLE call — the model loses the notebook,
+   * not one image (review v9 V9-1). Canonicalizing once, next to the decode that
+   * already happened, is the only way the two paths cannot drift again.
+   */
+  readonly base64: string | null;
 }
 
 export interface MapOutputsResult {
@@ -383,9 +473,27 @@ const TRACEBACK_TAIL_LINES = 20;
  * SPEC §5.4 row 7's "parse failure degrades to `text`" is about a value that cannot
  * be represented as json at all; that case no longer arises here, because every JSON
  * value is now emittable as-is.
+ *
+ * The THIRD instance of the same family is a number that JavaScript cannot hold:
+ * `parseJsonExact` keeps such an integer as a marker (review v9 V9-5), and this
+ * function is where the model is told about it. The value is passed through as the
+ * number the marker says, and the exact literal travels in the output's warning so
+ * the model is not left believing it saw the file's value.
  */
-function jsonValueOf(value: unknown): JsonValue {
-  return (value === undefined ? null : value) as JsonValue;
+function jsonValueOf(value: unknown): { value: JsonValue; warnings: OutputWarning[] } {
+  if (isExactNumber(value)) {
+    const literal = value.__ipynb_exact_number__;
+    return {
+      value: Number(literal) as JsonValue,
+      warnings: [
+        {
+          code: 'output_truncated',
+          message: `json value ${literal} is outside the range this tool can represent exactly; the exact digits are in this warning and in the file, but a JSON client will read it as ${String(Number(literal))}`,
+        },
+      ],
+    };
+  }
+  return { value: (value === undefined ? null : value) as JsonValue, warnings: [] };
 }
 
 export function mapRawOutputs(rawOutputs: readonly RawOutput[], options: MapOutputsOptions): MapOutputsResult {
@@ -445,7 +553,26 @@ export function mapRawOutputs(rawOutputs: readonly RawOutput[], options: MapOutp
       data['image/png'] !== undefined ? 'image/png' : data['image/jpeg'] !== undefined ? 'image/jpeg' : null;
     if (imageMediaType !== null) {
       const rawImage = imageValue(imageMediaType);
-      if (rawImage === null) {
+      // A `data:` URL is what people paste and what some tools emit. Jupyter cannot
+      // render one either (`base64.b64decode` fails on the prefix), so this is not
+      // legal data being dropped — but the prefix is unambiguous and stripping it is
+      // both cheap and what the user meant (review v8 V8-3).
+      //
+      // The SAME helper builds the returned block (see `canonical` below): a value
+      // that decodes here and fails `atob` at the SDK boundary used to turn one bad
+      // image into `-32602` for the entire call (review v9 V9-1).
+      const canonical = rawImage === null ? null : imageBlockBase64(rawImage, imageMediaType);
+      if (rawImage === null || canonical === null) {
+        const reason = rawImage === null ? 'image value is not a string' : imageDecodeProblem(rawImage);
+        const fallback = mimeText(data['text/plain']) ?? '';
+        // Register the failure so the caller emits the documented
+        // `image_materialize_failed` warning. Without this entry the output would
+        // be silently "an image with no artifact", which is the kind of quiet
+        // degradation this project exists to avoid.
+        //
+        // An empty payload lands here too: `atob('')` succeeds and yields zero
+        // bytes, so "empty" used to reach the model as a real image whose artifact
+        // was also empty, with no warning at all (review v8 V8-3's follow-up).
         items.push({
           kind: 'image',
           media_type: imageMediaType,
@@ -454,34 +581,26 @@ export function mapRawOutputs(rawOutputs: readonly RawOutput[], options: MapOutp
           bytes: 0,
           artifact_path: null,
           image_index: null,
-          text_fallback: mimeText(data['text/plain']) ?? '',
+          text_fallback: fallback === '' ? reason : fallback,
         });
-        // Register the failure so the caller emits the documented
-        // `image_materialize_failed` warning. Without this entry the output would
-        // be silently "an image with no artifact", which is the kind of quiet
-        // degradation this project exists to avoid.
         extractedImages.push({
           outputIndex: items.length - 1,
           mediaType: imageMediaType,
           bytes: new Uint8Array(0),
           width: null,
           height: null,
-          sha256Hex: options.hasher.sha256Hex(String(rawImage ?? '')),
+          sha256Hex: options.hasher.sha256Hex(rawImage ?? ''),
           decodeFailed: true,
+          base64: null,
         });
         continue;
       }
-      // A `data:` URL is what people paste and what some tools emit. Jupyter cannot
-      // render one either (`base64.b64decode` fails on the prefix), so this is not
-      // legal data being dropped — but the prefix is unambiguous and stripping it is
-      // both cheap and what the user meant (review v8 V8-3).
-      const base64 = stripDataUrlPrefix(rawImage, imageMediaType);
       // Cheap pre-check on the ENCODED length before decoding: base64 is 4/3 of
       // the payload, so an obviously oversized image never needs the decode
       // (which itself costs ~2.5x the image in transient copies) nor the
       // SHA-256 pass. Behaviour is unchanged — the check below still reports
       // the exact byte count for anything that gets decoded (review v3 PERF-2).
-      const approxBytes = approximateBase64Bytes(base64);
+      const approxBytes = approximateBase64Bytes(canonical);
       if (approxBytes > options.maxImageBytes) {
         items.push({
           kind: 'unsupported',
@@ -490,7 +609,7 @@ export function mapRawOutputs(rawOutputs: readonly RawOutput[], options: MapOutp
         });
         continue;
       }
-      const decoded = decodeBase64(base64);
+      const decoded = decodeBase64(canonical);
       if (decoded !== null && decoded.byteLength > options.maxImageBytes) {
         // Oversized images become unsupported and never materialize (SPEC §4.4).
         items.push({
@@ -523,8 +642,9 @@ export function mapRawOutputs(rawOutputs: readonly RawOutput[], options: MapOutp
           bytes: new Uint8Array(0),
           width: null,
           height: null,
-          sha256Hex: options.hasher.sha256Hex(base64),
+          sha256Hex: options.hasher.sha256Hex(canonical),
           decodeFailed: true,
+          base64: null,
         });
         continue;
       }
@@ -547,6 +667,11 @@ export function mapRawOutputs(rawOutputs: readonly RawOutput[], options: MapOutp
         height: size?.height ?? null,
         sha256Hex: options.hasher.sha256Hex(decoded),
         decodeFailed: false,
+        // Re-encoded rather than reused: `canonical` satisfies the decoder but is
+        // NOT necessarily padded (`atob` accepts both), and the SDK's validator —
+        // the only judge that matters — does not. Re-encoding is the identity for
+        // everything it accepts, and cannot emit a string it rejects.
+        base64: encodeBase64(decoded),
       });
       continue;
     }
@@ -577,7 +702,8 @@ export function mapRawOutputs(rawOutputs: readonly RawOutput[], options: MapOutp
     // longer has a case to apply to, because every JSON value is now emittable.
     const jsonKey = Object.keys(data).find((key) => isJsonMime(key));
     if (jsonKey !== undefined) {
-      items.push({ kind: 'json', value: jsonValueOf(data[jsonKey]) });
+      const projected = jsonValueOf(data[jsonKey]);
+      items.push({ kind: 'json', value: projected.value, warnings: projected.warnings });
       continue;
     }
     // 8. text
@@ -624,24 +750,48 @@ function stripDataUrlPrefix(value: string, mediaType: 'image/png' | 'image/jpeg'
 }
 
 function decodeBase64(base64: string): Uint8Array | null {
-  const cleaned = base64.replace(/\s+/g, '');
-  // Reject anything that is not base64 before handing it to `atob`, so the failure
-  // can say WHICH way it is wrong. `atob` throws a bare "Invalid character" that
-  // reaches the model as a zero-byte image, which reads as "the image is empty"
-  // rather than "this value is not base64" (review v8 V8-3).
-  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(cleaned) || cleaned.length % 4 !== 0) {
+  const cleaned = canonicalBase64(base64);
+  // Reject anything that is not base64 before handing it to the decoder, so the
+  // failure can say WHICH way it is wrong. A bare "Invalid character" reaches the
+  // model as a zero-byte image, which reads as "the image is empty" rather than
+  // "this value is not base64" (review v8 V8-3).
+  return cleaned === null ? null : decodeBase64ToBytes(cleaned);
+}
+
+/**
+ * A base64 string in the one shape every reader accepts, or null.
+ *
+ * "Every reader" is the point: `atob` — and therefore the MCP SDK's
+ * `ImageContent.data` validator — tolerates the base64 alphabet, `=` padding and
+ * whitespace, but nothing else. A value that decodes through a laxer decoder and
+ * then fails `atob` does not degrade, it kills the call, so canonicalizing is a
+ * correctness step and not cosmetics (review v9 V9-1).
+ */
+export function canonicalBase64(value: string): string | null {
+  const cleaned = value.replace(/\s+/g, '');
+  return isBase64Shaped(cleaned) ? cleaned : null;
+}
+
+/**
+ * The canonical base64 an image block may carry for a RAW document value, or null
+ * when the value cannot produce one.
+ *
+ * The block-building paths used to read the document value again and hand it to
+ * the SDK untested, so a `data:` URL was decodable for materialization and
+ * simultaneously invalid as a block. Both paths now come through here, which is
+ * what makes "decodes" and "can be returned" the same question again (SPEC §4.4).
+ */
+export function imageBlockBase64(value: string, mediaType: 'image/png' | 'image/jpeg'): string | null {
+  const payload = stripDataUrlPrefix(value, mediaType);
+  const cleaned = canonicalBase64(payload);
+  // An empty payload is the one case a canonical form cannot express: `atob('')`
+  // succeeds and yields zero bytes, which would serve a block that claims to be an
+  // image and contains nothing. It takes the decode-failure route instead, where
+  // the warning can say "empty" (review v8 V8-3's "empty vs broken" distinction).
+  if (cleaned === null || cleaned === '') {
     return null;
   }
-  try {
-    const binary = atob(cleaned);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i += 1) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    return bytes;
-  } catch {
-    return null;
-  }
+  return cleaned;
 }
 
 /**

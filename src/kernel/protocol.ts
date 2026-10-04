@@ -2,6 +2,8 @@
 // One chunk is NOT one line: bytes accumulate in a buffer and split on '\n';
 // a single line above 64 MiB is a protocol error that kills the sidecar.
 
+import { parseJsonExact } from '../core/json-exact.js';
+
 export interface SidecarRequest {
   readonly id: string;
   readonly op: string;
@@ -179,7 +181,11 @@ export function isSidecarResponse(message: SidecarMessage): message is SidecarRe
 
 export function parseSidecarMessage(line: string): SidecarMessage | null {
   try {
-    const parsed: unknown = JSON.parse(line);
+    // The exact parser, not `JSON.parse`: the sidecar's `json.dumps` writes a Python
+    // int of any size correctly (`2**64` is 20 digits on the wire), and `JSON.parse`
+    // would round it here — before the value is ever stored, so the file would get
+    // the rounded number and nothing upstream could tell (review v9 V9-5).
+    const parsed: unknown = parseJsonExact(line);
     if (typeof parsed === 'object' && parsed !== null) {
       return parsed as SidecarMessage;
     }

@@ -319,12 +319,16 @@ export function applyEditOps(
         }
         cell.outputs = [];
         // NOTE: `execution_count` is deliberately NOT touched — SPEC §4.5 rule 5 is
-        // explicit ("clear_outputs 只清 outputs，不动 execution_count、不动源码"), so
-        // the v8 V8-14 fix lives in the GATE instead: a cell whose outputs this
+        // explicit ("clear_outputs 只清 outputs，不动 execution_count、不动源码").
+        // The v8 V8-14 fix therefore lives in the GATE: a cell whose outputs this
         // operation just removed is not judged by the cell-level `execution_count`
-        // rule, because that rule and the outputs it belongs to are gone. Nulling the
-        // count here would have been the smaller diff and the wrong one — it changes
-        // an operation SPEC §4.5 pins, in order to satisfy a check that is ours.
+        // rule, because that rule and the outputs it belongs to are gone.
+        //
+        // It must STAY that way for the fix to hold. The rule is applied on every
+        // later write too — it asks whether the cell's outputs were emptied by the
+        // write under judgement — so a model that follows the hint and edits the cell
+        // again is not refused, and the count it was told about is still in the file
+        // exactly as SPEC §4.5 rule 5 requires (review v9 V9-8 pins both halves).
         clearedOutputs.add(cell);
         touchedCell = cell;
         break;

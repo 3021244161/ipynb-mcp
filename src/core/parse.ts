@@ -4,6 +4,7 @@
 // array stays array) byte-for-byte after a round trip.
 
 import { IpynbError, type JsonValue } from './errors.js';
+import { parseJsonExact, stringifyJsonExact } from './json-exact.js';
 
 export interface Hasher {
   sha256Hex(input: string | Uint8Array): string;
@@ -43,7 +44,12 @@ export function parseNotebook(rawBytes: Uint8Array, hasher: Hasher): NotebookFil
   const contentHash = `sha256:${hasher.sha256Hex(rawBytes)}`;
   let doc: unknown;
   try {
-    doc = JSON.parse(new TextDecoder().decode(rawBytes));
+    // ONE parser for the whole file, and it is not `JSON.parse`: that turns every
+    // number into an IEEE-754 double, so an `application/json` output holding
+    // `18446744073709551616` is silently rounded on the way in and the rounded
+    // value is what a later write-back stores (review v9 V9-5). The exact parser
+    // builds the same tree for every other value (see core/json-exact.ts).
+    doc = parseJsonExact(new TextDecoder().decode(rawBytes));
   } catch (cause) {
     throw new IpynbError('parse_failed', 'notebook file is not valid JSON', {
       cause: String(cause),
@@ -124,7 +130,11 @@ export function serializeNotebook(notebook: NotebookFile): string {
       cell.execution_count = null;
     }
   }
-  return `${JSON.stringify(notebook.doc, null, 1)}\n`;
+  // The exact serializer, paired with `parseJsonExact` above: a number this file
+  // holds as text goes back out as the same text. SPEC §5.5.7's fidelity claim
+  // ("logically unchanged", not "minimal diff") is about escaping and formatting;
+  // it is not a licence to change a value, which is what rounding did (v9 V9-5).
+  return `${stringifyJsonExact(notebook.doc, 1)}\n`;
 }
 
 /** Which cells a write is responsible for (review v5 GATE-1). */
@@ -263,20 +273,30 @@ export function structuralWarning(problem: Record<string, JsonValue>): string {
  * `execution_count` rule was added that recommendation was wrong for it: the cell
  * count is not in the outputs, `clear_outputs` did not touch it, and the recommended
  * operation was refused by the same rule — leaving `set_cell_type` as the only exit
- * while the model was told to try the other one (review v8 V8-14). A hint is a
- * promise; it may only name operations that work.
+ * while the model was told to try the other one (review v8 V8-14).
  *
- * `clear_outputs` now resets the count as well, so both entries below are true. The
- * mapping stays explicit rather than generic because the next rule added will not
+ * v8's own fix then claimed `clear_outputs` "resets the cell execution count", which
+ * SPEC §4.5 rule 5 forbids and `edit.ts` deliberately does not do. What is true is
+ * narrower and worth saying precisely: once that operation has emptied the outputs,
+ * the cell's count is not judged any more (see `SelfCheckScope`'s
+ * `clearedOutputCellIndexes`), so the file becomes valid WITHOUT the count changing.
+ * A hint is a promise (review v9 V9-8), so it says exactly that.
+ *
+ * The mapping stays explicit rather than generic because the next rule added will not
  * necessarily be cleared by either operation.
  */
 function escapeHatchFor(problem: Record<string, JsonValue>): string {
   const rule = String(problem['rule']);
-  if (rule === 'execution_count_negative' || rule === 'non_code_cell_has_execution_count') {
-    return 'clear_outputs resets the cell execution count, and set_cell_type removes it by changing the cell type';
+  if (rule === 'execution_count_negative') {
+    return 'clear_outputs does not change the count itself, but once the outputs are gone the count is no longer checked, so the file becomes valid; set_cell_type to markdown removes the count entirely';
+  }
+  if (rule === 'non_code_cell_has_execution_count') {
+    // `clear_outputs` is refused here ("requires a code cell"), so recommending it —
+    // which is what the shared message did — sent the model into `invalid_ops`.
+    return `set_cell_type with cell_type "code" moves the count to where it belongs; clear_outputs is not available on a ${String(problem['cell_type'] ?? 'non-code')} cell`;
   }
   if (rule === 'non_code_cell_has_outputs') {
-    return 'set_cell_type converts the cell so the outputs are no longer stored on it';
+    return `set_cell_type with cell_type "code" gives the cell a place to keep the outputs; clear_outputs is not available on a ${String(problem['cell_type'] ?? 'non-code')} cell`;
   }
   return 'clear_outputs removes the outputs this rule is about, and set_cell_type removes them by changing the cell type';
 }
@@ -365,17 +385,31 @@ export function findStructuralProblem(
     //
     // Checked before `outputs` is required, because a cell with no `outputs` key at
     // all still carries the count.
-    // Skipped when THIS operation emptied the cell outputs. SPEC §4.5 rule 5
-    // keeps `execution_count` out of `clear_outputs` reach, so a cell that had a
-    // negative count still has one afterwards — and refusing the operation that
-    // removed the outputs this count belongs to made the recommended escape hatch
-    // fail with the same error it was recommended for (review v8 V8-14).
+    //
+    // WHEN THE RULE APPLIES — the v9 correction. It is about a count that belongs to a
+    // set of outputs, so a cell with NO outputs has no count this rule can be about.
+    // That is a fact about the cell, not about the request that happens to be running:
+    // v8 exempted "this request emptied the outputs" (`clearedOutputCellIndexes`),
+    // which made the file acceptable for exactly one call and refused the model's NEXT
+    // edit with the very rule the hint had just said was handled (review v9 V9-8).
+    // SPEC §4.5 rule 5 keeps `execution_count` out of `clear_outputs` reach, so the
+    // count really does stay in the file; `outputs: []` is what makes it harmless.
+    //
+    // A negative count on a cell that HAS outputs is still refused, which is the shape
+    // a caller produces by writing one (`replace_source` cannot touch the count, so
+    // the only way to introduce it is a store/output rewrite that keeps outputs).
     const outputsWereCleared =
       clearedOutputCellIndexes !== undefined && clearedOutputCellIndexes.has(index);
-    if (!outputsWereCleared && cell.execution_count !== undefined && cell.execution_count !== null) {
-      if (!Number.isInteger(cell.execution_count) || cell.execution_count < 0) {
-        return { cell_index: index, rule: 'execution_count_negative', execution_count: cell.execution_count };
-      }
+    const count = cell.execution_count;
+    const outputsAlreadyEmpty = Array.isArray(cell.outputs) && cell.outputs.length === 0;
+    if (
+      !outputsWereCleared &&
+      !outputsAlreadyEmpty &&
+      count !== undefined &&
+      count !== null &&
+      (!Number.isInteger(count) || count < 0)
+    ) {
+      return { cell_index: index, rule: 'execution_count_negative', execution_count: count };
     }
     const outputs = cell.outputs;
     if (outputs === undefined) {

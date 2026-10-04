@@ -12,12 +12,14 @@ import {
   type Warning,
 } from './core/errors.js';
 import {
+  collectOutputWarnings,
   countTruncatedCells,
   dropUnrepresentableOutputs,
   mapRawOutputs,
   nbformatOutputsOfRaw,
   outputTruncatedWarning,
   representableExecutionCount,
+  type DroppedMime,
   type OutputItem,
 } from './core/outputs.js';
 import { cellSource, readNotebookMetadata, type Hasher, type NotebookDoc, type NotebookFile } from './core/parse.js';
@@ -31,6 +33,32 @@ import type { Logger } from './log.js';
 
 export type RunMode = 'auto' | 'resume' | 'replay' | 'full';
 export type ModeUsed = 'resume' | 'replay' | 'full';
+
+/**
+ * Append the per-call output warnings to `warnings`, once each.
+ *
+ * ONE assembly point for every exit of a run: the successful one, the timeout one,
+ * and (through the already-populated array) the cancelled/kernel_died ones, which
+ * receive this array by reference. The facts it carries all share SPEC §7's
+ * `output_truncated` code because the table is closed: outputs truncated at
+ * `inline_text_chars`, mime values nbformat cannot store, and json numbers the JSON
+ * channel cannot carry exactly.
+ */
+function pushCallWarnings(
+  warnings: Warning[],
+  executed: readonly ExecutedCell[],
+  droppedMimes: readonly DroppedMime[],
+): void {
+  const truncation = outputTruncatedWarning(droppedMimes, countTruncatedCells(executed));
+  if (truncation !== null && !warnings.some((warning) => warning.message === truncation.message)) {
+    warnings.push(createWarning(truncation.code, truncation.message));
+  }
+  for (const lifted of collectOutputWarnings(executed)) {
+    if (!warnings.some((warning) => warning.message === lifted.message)) {
+      warnings.push(createWarning(lifted.code, lifted.message));
+    }
+  }
+}
 
 export interface RunRequest {
   readonly path: string;
@@ -343,9 +371,11 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
   const executed: ExecutedCell[] = [];
   const imageBlocks: RunImageBlock[] = [];
   const executedCellsSet = new Set<number>();
-  // Mime types dropped because nbformat cannot store them, collected across the
-  // whole call so ONE warning can report both this and any truncation (V8-10).
-  const droppedMimes: string[] = [];
+  // Mime values dropped because nbformat cannot store them, collected across the
+  // whole call so ONE warning can report this, any truncation, and any value the
+  // JSON channel cannot carry exactly — see `callWarnings` below. Each entry keeps
+  // the cell it came from.
+  const droppedMimes: DroppedMime[] = [];
   // Guards the failure-path write-back against running twice for one run.
   const abortState: AbortState = { writtenBack: false };
   // Running cursor so image_index stays unique across the whole call
@@ -509,15 +539,12 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
           if (image === undefined || image.kind !== 'image') {
             continue;
           }
-            // items and rawOutputs are index-aligned (each raw output maps to
-            // exactly one item), so the base64 payload sits at the same index.
-          const rawOutput = result.result.rawOutputs[materialized.outputIndex];
-          // Narrowed, not asserted: `RawOutput.data` is `unknown` per mime because a
-          // json mime legitimately holds any JSON value (review v7 V7-1).
-          const base64 = rawOutput?.data?.[image.media_type];
-          if (typeof base64 === 'string') {
-            imageBlocks.push({ data: base64, media_type: image.media_type });
-          }
+          // The payload travels with the materialization decision — it is the base64
+          // of the bytes just written, so the SDK's validator cannot reject it. The
+          // previous version re-read the document value by index, which handed a
+          // `data:` URL straight to the SDK and failed the ENTIRE call with -32602
+          // (review v9 V9-1).
+          imageBlocks.push({ data: materialized.base64, media_type: image.media_type });
         }
 
         executed.push({
@@ -528,6 +555,15 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
             execution_count: result.result.executionCount,
             outputs: mapped.items,
           });
+        // Per-output problems are reported as soon as the output exists, not at the
+        // end of the run: the timeout and abort exits below throw with the warnings
+        // gathered SO FAR, and a value that cannot be represented exactly is exactly
+        // the kind of thing those paths used to lose (review v9 V9-5, v7 V7-8).
+        for (const lifted of collectOutputWarnings([{ outputs: mapped.items }])) {
+          if (!warnings.some((existing) => existing.message === lifted.message)) {
+            warnings.push(createWarning(lifted.code, lifted.message));
+          }
+        }
 
         if (result.result.status === 'timeout') {
             // Half-finished outputs of the interrupted cell never reach the file:
@@ -555,11 +591,11 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
           // one (review v6 GATE-5/CRASH-1).
           const sanitized = dropUnrepresentableOutputs(converted);
           // Collected, not warned here: the warning is emitted once per call by
-          // `outputTruncatedWarning`, which can carry BOTH facts (dropped values
-          // and truncated outputs). Pushing per cell let the first fact silence
-          // the second (review v8 V8-10), and doing it inline made the rule
-          // untestable (review v8 V8-4).
-          droppedMimes.push(...sanitized.droppedMimes);
+          // `callWarnings`, which carries truncation, dropped values and values the
+          // JSON channel cannot represent exactly. Pushing per cell let the first
+          // fact silence the others (review v8 V8-10), and doing it inline made the
+          // rule untestable (review v8 V8-4).
+          droppedMimes.push(...sanitized.droppedMimes.map((mime) => ({ cellIndex: index, mime })));
           cell.outputs = sanitized.outputs;
           cell.execution_count = representableExecutionCount(result.result.executionCount);
           executedCellsSet.add(index);
@@ -576,6 +612,12 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
           // Write back the cells that DID complete (SPEC §4.7 rule 5), then raise
           // exec_timeout with the partial state in detail.
         abortState.writtenBack = true;
+        // Before the write-back, which reports warnings of its own, and before the
+        // throw, which freezes this array: a run that ends here must still say what
+        // its COMPLETED cells lost (truncation, a dropped value, an inexact json
+        // number). v8 assembled those after the loop, so this exit shipped an empty
+        // list (review v9 V9-7).
+        pushCallWarnings(warnings, executed, droppedMimes);
         const timeoutWriteBack = await writeBackCompleted(notebook, effectiveReq, deps, platform, executedCellsSet, warnings);
         const timeoutCell = executed[executed.length - 1];
         throw new IpynbError('exec_timeout', `cell execution timed out after ${req.timeoutSeconds}s (interrupt did not land)`, {
@@ -603,18 +645,13 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
       }
 
       // SPEC §7 defines `output_truncated` as "ANY OutputItem has
-      // `truncated === true`", and says the whole call appends it ONCE. The
-      // dropped-value warning above reuses the same code, and without this guard a
-      // single run could return two or three copies — the read path has had the
-      // same dedup since v6, so the two directions disagreed (review v7 V7-2).
-      // Deduping cannot be done by hiding the drop: that message names the cell and
-      // the mime, and it is the only place the model can learn that a value was
-      // discarded.
-      const truncation = outputTruncatedWarning(droppedMimes, countTruncatedCells(executed));
-      if (truncation !== null) {
-        warnings.push(createWarning(truncation.code, truncation.message));
-      }
-
+      // `truncated === true`", and says the whole call appends it ONCE. Two other
+      // facts share the code (a dropped mime value, a json number this tool cannot
+      // hold exactly), so they are assembled in ONE place — used by the successful
+      // exit and by the timeout exit below. The v8 shape generated this after the
+      // loop, so a timed-out run shipped `warnings: []` even when an earlier cell
+      // had already lost a value (review v9 V9-7).
+      pushCallWarnings(warnings, executed, droppedMimes);
       // ---- stale analysis (SPEC §5.6) --------------------------------------------
       let staleCells: RunOutcome['stale_cells'] = [];
       let staleAnalysis: RunOutcome['stale_analysis'] = null;
