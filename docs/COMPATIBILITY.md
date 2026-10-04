@@ -24,14 +24,14 @@
 
 | 平台 | Node | Python | unit | integration |
 |---|---|---|---|---|
-| Windows 11 x64 | 22.22.2 | 3.10.14（base anaconda：ipykernel 6.25.2 / jupyter_client 8.3.1 / pyzmq 25.1.1） | **595（全绿）**，30 文件 | **69/69**，10 文件全绿（第十一轮本机实跑，约 287 s；新增 `v11-terminal-state.test.ts` 与 `v11-read-warnings.test.ts`。`kernel.test.ts` / `run.test.ts` 自动回退到 base 解释器，见下） |
+| Windows 11 x64 | 22.22.2 | 3.10.14（base anaconda：ipykernel 6.25.2 / jupyter_client 8.3.1 / pyzmq 25.1.1） | **596（全绿）**，30 文件 | **73/73**，11 文件全绿（第十二轮本机实跑；新增 `v12-run-image-warnings.test.ts`。`kernel.test.ts` / `run.test.ts` 自动回退到 base 解释器，见下） |
 | Windows 11 x64 | 22.22.2 | 3.11.11（测试 venv，base conda env 内含 **pyzmq 26.2.0**） | 同上 | **该解释器无法启动 kernel**：sidecar 以 `0xC0000409`（`STATUS_STACK_BUFFER_OVERRUN`）退出，stderr 为 `Bad file descriptor (epoll.cpp:73)` |
-| **WSL Ubuntu 22.04（本机实跑）** | **v22.22.0** | 3.x（无 ipykernel → U20 显式 skip） | **381（全绿）**，25 文件 —— 第八轮实测（**第十轮与第十一轮均未在 WSL 复跑单测**，新增用例只在 Windows 跑过）；**第十一轮同样未在 WSL 复跑单测**，只在 WSL 复跑了 `scripts/linux-check.sh --selftest`（**cases=26 failed=0**，`prefix-only` 变异 4 条转红） | 未在本机跑（需真实 kernel，见下） |
+| **WSL Ubuntu 22.04（本机实跑）** | **v22.22.0** | 3.x（无 ipykernel → U20 显式 skip） | **381（全绿）**，25 文件 —— 第八轮实测（**第十至十二轮均未在 WSL 复跑单测**，新增用例只在 Windows 跑过）；**第十一轮与第十二轮均未在 WSL 复跑单测**，只在 WSL 复跑了 `scripts/linux-check.sh --selftest`（**cases=26 failed=0**，`prefix-only` 变异 4 条转红） | 未在本机跑（需真实 kernel，见下） |
 | ubuntu-latest | 22 / 24 | 3.10 / 3.12 | CI | CI（`pip install ipykernel jupyter_client nbformat` + `IPYNB_REQUIRE_NBFORMAT=1`） |
 | windows-latest | 22 / 24 | 3.x | CI | CI |
 | macos-latest | **22 only** | — | CI | **不跑 integration**（见下） |
 
-**其他实测项（第十一轮本机实跑）**：`pnpm typecheck` exit 0；`pnpm lint` 0 警（oxlint **71 文件 / 99 规则** + `scripts/check-format.mjs` + `scripts/check-indent.mjs`（**28 个自测样本**）+ `scripts/check-docs.mjs`（**12 个自测变异**，真文档对照通过；变异源由当前文本推导，合法修订不会误报；另有条目**指纹**与状态表 ✅ 的**可 grep 产物**两条机械门禁））；
+**其他实测项（第十二轮本机实跑）**：`pnpm typecheck` exit 0；`pnpm lint` 0 警（oxlint **78 文件 / 99 规则** + `scripts/check-format.mjs` + `scripts/check-indent.mjs`（**28 个自测样本**）+ `scripts/check-docs.mjs`（**17 个自测变异**，真文档对照通过；变异源由当前文本推导，合法修订不会误报；另有条目**指纹**与状态表 ✅ 的**可 grep 产物**两条机械门禁））；
 `pnpm smoke` **26/26**（真 stdio server + 真 SDK 客户端，含 `data:` URL 图片的读写与 `nbformat.validate`）；
 `pnpm check:package` **ok（140 文件，22 个变异全被抓到）**；`npm pack --dry-run` **140 项**，含 `lib/bin.js`（shebang ✓）与 `python/ipynb_sidecar.py`；
 `git ls-files --eol` 全树 LF（110 个 tracked 文件，0 CRLF / 0 mixed）。

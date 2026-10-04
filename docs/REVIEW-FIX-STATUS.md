@@ -1,6 +1,6 @@
 # 代码审查整改状态（review fix status）
 
-> **来源**：`docs/review/ipynb-mcp-code-review.md`（第一轮）、`…-v2.md`、`…-v3.md`、`…-v4.md`、`…-v5.md`、`…-v6.md`、`…-v7.md`、`…-v8.md`、`…-v9.md`、`…-v10.md`、`…-v11.md`（第十一轮 / 本轮）
+> **来源**：`docs/review/ipynb-mcp-code-review.md`（第一轮）、`…-v2.md`、`…-v3.md`、`…-v4.md`、`…-v5.md`、`…-v6.md`、`…-v7.md`、`…-v8.md`、`…-v9.md`、`…-v10.md`、`…-v11.md`、`…-v12.md`（第十二轮 / 本轮）
 > **权威**：`SPEC.md` + `AGENTS.md`。整改只做「实现与被 SPEC 判定不符」的部分；
 > SPEC 自身的缺陷按 AGENTS §0 记入 `DEVIATIONS.md` 后按 SPEC 继续。
 >
@@ -21,10 +21,51 @@
 > 这正是 P0-a 要的结果：在唯一会自动运行的环境里，产物合法性**确实被外部权威检查过**（此前 `nbformat` 不在依赖闭包里，三条断言被 `if` 静默跳过而套件仍全绿）。
 > 集成用到的解释器与三平台默认根见 `COMPATIBILITY.md`。
 >
-> **上面这段门禁数字是第六轮当时的快照**（不随轮次改动）。**当前数字见第十一轮段的开篇**。
+> **上面这段门禁数字是第六轮当时的快照**（不随轮次改动）。**当前数字见第十二轮段的开篇**。
 ---
 
-## 〇、第十一轮（`ipynb-mcp-code-review-v11.md`，本轮）
+## 〇、第十二轮（`ipynb-mcp-code-review-v12.md`，发布前最后一轮）
+
+> 本轮的 🔴 是**第十一轮自己引入的回归**：把数值判据改成"按值"是对的方向，但零那一格被单独早退成
+> `if (value === 0) return isNegativeZero(literal)`——**上溢被照顾到了，下溢落进了缝里**。
+> 两条 🟠 也都是"守卫覆盖了被改的那一层"：run 路径的图片警告按 **code** 去重（read 已修、run 没修，且该路径**零覆盖**），
+> 状态表三行"已修"没有产物而**新加的门禁抓不到**。
+>
+> **门禁实测（第十二轮整改后，亲跑）**：`pnpm typecheck` exit 0 ｜ `pnpm lint` **0 警 0 错** +
+> `format check: ok` + `structural indent check: ok (28 self-test samples)` +
+> `documentation self-test: ok (17 mutation(s) detected, 0 skipped, control clean)` +
+> `documentation check: ok` ｜ 单测 **596 passed / 30 文件** ｜ 集成 **73 passed / 11 文件** ｜
+> `pnpm smoke` **26/26** ｜ `pnpm check:package` **ok（140 文件，22 变异）** ｜
+> `python scripts/check-connection-sweep.py` **PASS** ｜ `pnpm build` exit 0 ｜ 工作树干净。
+
+### 12.1 本轮条目（完整清单）
+
+| 条目 | 状态 | 处置与证据 |
+|---|---|---|
+| **V12-1** 🔴 下溢到零的字面量被静默改写成 `0`（本轮新引入的回归） | ✅ | 删掉"零"的笼统早退，拆成三种情形：`-0` 族（保留字节 + 负零文案）、**尾数为零**的字面量（`0e-5`/`0.0e-400` 等，确实表示零，只规范化写法）、**尾数非零**（`1e-400`，下溢 → 保留字节 + 专门的 "underflows to zero" 文案）。判据只看**尾数**（`denotationIsNonzero`），所以 `0e-400` 不会被指数里的数字误判。登记 **D-056 的 v12 订正**。证据：形态表 26→34、`[V12-1]` 用例、集成 2 例（无关编辑后盘上保留 + 默认出口也报告）。**变异验证**：把早退改回去 → **19 条红** |
+| **V11-5 的判据同构**（子代理发现，我采纳） | ✅ | 表里对"不打标记"的断言是 `String(parsed) === String(Number(literal))`，而对 `1e-400` **两边都是 `'0'`** —— 加进表里也会绿。改成断言**用户能观察到的事实**：盘上字节 = `String(Number(literal))`，下溢单独断言逐字节保留 |
+| **V12-2** 🟡 D-056 的 `1e21` 例子与实现不符 | ✅ | 实测它确实被规范化为 `1e+21`（属于"值不变、写法变"），例子按实现改正并写明同类共 16 种。D-056 的不变式②从"盘上字节不得被改写"改成"**数值**不得被改写"，并补上 `1e400`/`1e-400` 两个真正的逐字节保留例 |
+| **V12-3** 🟠 run 路径按 code 去重、归因全丢、零覆盖 | ✅ | 去重键改为 **message**（与 read 路径一致）；新增 `tests/integration/v12-run-image-warnings.test.ts`（真 kernel、3 cell 坏图 → 3 条可区分消息 + 不累积）。**变异验证**：去重键改回 code → 2 条红，打印出评审实测的那一条。**这条用例同时封住了"整段关掉也全绿"**（旧状态下把警告全关，595 条单测仍绿） |
+| **V12-4** 🟠 三行"已修"无产物 + 门禁抓不到 | ✅ | 三行订正并**真补产物**：`src/run.ts` 第二处幽灵符号改掉、D-050 补克隆订正段、D-054 补两格已知行为。门禁三处收紧：词表补"已修"/"fixed"等、判定改为**声明形态**（`isDeclared`）、声称修产品代码时佐证必须来自 `src`/`python`（测试里的同名局部变量不算）。**变异验证**：六种形态逐个跑（"已修"无产物 → 红；`callWarnings` 只存在于测试 → 红；真实声明/真实路径/测试文件路径 → 绿；不存在的符号 → 红），三条绕过形态进自测 |
+| **V12-5①** 🟢 `oxlint` 文件数 | ✅ | **71 → 78**（实测） |
+| **V12-5②** 🟢 V11-1 的变异红数 | ✅ | **12 → 11**（实测：`json-exact.test.ts` 1 + `json-number-forms.test.ts` 10） |
+| **V12-5③** 🟢 §11.2 关于 `3.0` 的说法写反 | ✅ | 订正为"Python `json` 把它解析成 **float**，nbformat 因此判 INVALID，所以 `3.0 → 3` 是把被拒的写法规范成被接受的写法" |
+| **V12-5④** 🟢 `json-exact.ts` 两句与用例相反的注释 | ✅ | 按实际行为重写（55 位那个是**被报告**的，不是 "accepted"；`1e21` 的行为写对），并把"注释里的例子也要跑"写进 AGENTS §9 |
+| **V12-5⑤** 🟢 `run.ts` 注释缩进错位 | ✅ | 已修（`scripts/check-indent.mjs` 本来就放行，属观感；证据 `src/run.ts`） |
+| **V12-5⑥** 🟢 json mime 的非有限值以 `"inf"` 交付且零警告 | ✅（登记为**已知行为**） | 与 `['a','b']` 同族，两格一起写进 **D-054** 的 v12 追加段；采纳评审建议**不**加通用魔数检查或字面量黑名单（会误伤 Jupyter 自己的分行 base64 与用户的合法字符串） |
+| **V12-6** 🟢 值等价的写法规范化覆盖 16/28 种字面量 | ✅（知会 + 措辞订正） | 确认**不是缺陷**（SPEC §5.5.7 明确许可，`README` 原先第 89 行已声明）。采纳评审给的**可选建议之外**的最小改动：把 README 的保真声明改成它实际的意思——规范化的对象是**写法**（与 Python `json.dumps` 的输出同族），**值一律不改**；存不下的值逐字节保留并附精确数字的警告。"静默保留 vs 规范化"的产品取向留给 SPEC v3.1 决定，本轮不动行为 |
+| **V11-11 的最后一个洞** 🟡 删掉整行 `entries:` | ✅ | 缺失的声明行现在是**问题**而不是"跳过该规则"（把规则的输入删掉就关掉规则，是让守卫失效最便宜的方式，而且看起来与"通过"一模一样）。自测加一格变异（17 个） |
+
+### 12.2 未做与残留
+
+- **E1–E9 真实第三方客户端矩阵**：仍 **0/9**。十二轮之后代码侧的边际收益已经很低，评审建议下一轮预算**全部**投到这里——**这是发布前唯一剩下的非代码门**。
+- **macOS / arm64**：未在 macOS 复跑任何东西（SPEC §9 的既定分层）。
+- **`execution_count` 的写法规范化**（`3.0` → `3`）：仍是一格已知的字节级规范化，未单独立项。
+- **`--images=never` 与超限时 artifact 已写**：v10 登记的固有序，未动。
+- **"静默保留原文"这一取向**：V12-6 提出的可选方案（打 marker 但不发警告）会同时满足字节保真与"不误报"，但会让未修改区域出现更多整文件 diff；本轮**不改行为**，留给 SPEC v3.1 决定。
+- **`"inf"`/`"NaN"` 字符串与 `['a','b']` 的 join**：按已知行为登记（D-054），不加魔数检查。
+
+## 〇-0、第十一轮（`ipynb-mcp-code-review-v11.md`）
 
 > 本轮的三条 🟠 有一个共同点：**都在 v10 的"已修"里**。V10-3 的修复（保护数值不被改写）把判据定成了"写法"，
 > 于是**对模型陈述假事实**；V10-7 的修复（装配 warnings）解决了"装配"没解决"**送达**"；V10-1 的修复（递归投射）
@@ -44,11 +85,11 @@
 
 | 条目 | 状态 | 处置与证据 |
 |---|---|---|
-| **V11-1** 🟠 完全精确、只是写法不同的数字被报成"无法精确表示" | ✅ | 判据从**写法**改为**值**：`normalizedSpelling(literal) === String(Number(literal))`，`normalizedSpelling` 只去掉无信息的写法差异（指数正号/前导零、尾随 `.0` 与多余零、整数写法）。`100.0`/`2.0`/`1e2`/`1.5e3`/`0.10`/`1.5e-07`/`2.5e-05`/`1e+100` 现在**零警告**；`2**64`/`1e21`/高精度小数/`1e400` 仍被保护。`-0` 单独一条"符号无法传递"的文案。登记 **D-056**。证据：`json-exact.test.ts` 的**显式表**（两组字面量写死）、`json-number-forms.test.ts` 的 26 形态 × 8 位置 + 37 条规范化器期望。**变异验证**：把判据退回"写法相同"→ 12 条红 |
+| **V11-1** 🟠 完全精确、只是写法不同的数字被报成"无法精确表示" | ✅ | 判据从**写法**改为**值**：`normalizedSpelling(literal) === String(Number(literal))`，`normalizedSpelling` 只去掉无信息的写法差异（指数正号/前导零、尾随 `.0` 与多余零、整数写法）。`100.0`/`2.0`/`1e2`/`1.5e3`/`0.10`/`1.5e-07`/`2.5e-05`/`1e+100` 现在**零警告**；`2**64`/`1e21`/高精度小数/`1e400` 仍被保护。`-0` 单独一条"符号无法传递"的文案。登记 **D-056**。证据：`json-exact.test.ts` 的**显式表**（两组字面量写死）、`json-number-forms.test.ts` 的 34 形态 × 8 位置 + 37 条规范化器期望。**变异验证**：把判据退回"写法相同"→ **11 条红**（`json-exact.test.ts` 1 + `json-number-forms.test.ts` 10；v12 复核订正了原先写的 12） |
 | **V11-1 附带** 🟠 守卫用被测函数推导期望值 | ✅ | `inexactLiteralsIn()` 删除，改为 `expectedWarnedLiterals()`（从**写死的 FORMS 表**推导，带数字 token 边界以免 `1e-07` 里的 `-0` 被当成字面量）。这正是 v11 说的"期望自我循环" |
-| **V11-2** 🟠 `structuredClone` 前提是反的，且撑住 marker 的全部身份保证 | ✅ | 实测确认（`isExactNumber(structuredClone(marker)) === false`、克隆后是**可扩展**的、序列化会把 marker **对象**写进文件），注释改为真话并写明**已知限制**而非不变量：marker 只保证不被**文件**伪造，任何克隆都会让它失效，因此**序列化路径必须使用未经克隆的原始文档**（今天确实如此：`structuredClone` 只用于比较用的快照）。新增 `[V11-2]` 断言把这条假设变成**测量**。D-050 的叙述同步订正 |
+| **V11-2** 🟠 `structuredClone` 前提是反的，且撑住 marker 的全部身份保证 | ✅ | 实测确认（`isExactNumber(structuredClone(marker)) === false`、克隆后是**可扩展**的、序列化会把 marker **对象**写进文件），注释改为真话并写明**已知限制**而非不变量：marker 只保证不被**文件**伪造，任何克隆都会让它失效，因此**序列化路径必须使用未经克隆的原始文档**（今天确实如此：`structuredClone` 只用于比较用的快照）。新增 `[V11-2]` 断言把这条假设变成**测量**。**v12 复核订正**：本行原先还宣称 "D-050 的叙述同步订正"，而 `git diff` 显示该轮对 D-050 **无任何改动**——D-050 当时仍在用"克隆后 marker 依然有效"的措辞暗示克隆安全。**第十二轮已补**（D-050 增订正句 + 明确"序列化必须用原始解析树"）。产物：`isExactNumber`、`tests/unit/json-exact.test.ts` 的 `[V11-2]` |
 | **V11-3** 🟠 取消后的"空壳终态" | ✅ | 新增 `facts_pending`（`RunHandle` + 两个载荷），取消时置 `true`，后台任务在**最后一条语句**里清 `false`。登记 **D-055**。证据：`tests/integration/v11-terminal-state.test.ts`（真 kernel：cell0 丢值完成 → cell1 在途 → 取消 → **立刻**读 status）。**变异验证**：去掉 raise → 用例立刻红并打印出评审实测的那个空壳载荷（`executed: []` / `warnings: []` / `write_back.performed: false`） |
-| **V11-4** 🟡 状态表虚报（两项宣称已修而都没修） | ✅ | 该行订正为 ⚠️ 并**真修**：幽灵符号 `callWarnings` → `pushCallWarnings`（可 `git grep`），恒真断言 `Number(literal) !== NaN` → `losesPrecision(literal)`。新增机械门禁：`✅` 行含"已订正/已删除/已改名"等词时必须点名一个**存在**的符号或路径。**变异验证**：不存在的符号 → 红；存在且点名 → 绿；什么都不点名 → 红。门禁**第一版失效**（在 `docs/` 里搜符号，于是那一行在自己身上找到自己），已修正为只在代码目录里搜 |
+| **V11-4** 🟡 状态表虚报（两项宣称已修而都没修） | ✅ | 该行订正为 ⚠️ 并**真修**：幽灵符号 `callWarnings` → `pushCallWarnings`（可 `git grep`），恒真断言 `Number(literal) !== NaN` → `losesPrecision(literal)`。新增机械门禁：`✅` 行含"已订正/已删除/已改名"等词时必须点名一个**存在**的符号或路径。**变异验证**：不存在的符号 → 红；存在且点名 → 绿；什么都不点名 → 红。**v12 复核订正**：门禁的两版都失效过（第一版在 `docs/` 里搜符号，于是那一行在自己身上找到自己；第二版被 `tests/unit/json-exact.test.ts` 里一个**同名局部变量**背书），且 `src/run.ts` 的**第二处**幽灵符号当时仍在。**第十二轮已补**：门禁改为"词表含`已修`/`fixed`"+"符号必须是 `src`/`python` 里的**声明**"（`isDeclared`），第二处幽灵符号一并改掉，三条绕过形态进自测（17 个变异）。产物：`pushCallWarnings`、`claimProblems`、`isDeclared` |
 | **V11-5** 🟠 默认出口（`summary`）静默舍入且零警告 | ✅ | 警告提升移出 `full` 分支，`none` 除外。证据：`tests/integration/v11-read-warnings.test.ts`（四种出口的矩阵 + 干净输入零警告）。**变异验证**：只给 `full` → 默认与 summary 两条红 |
 | **V11-6** 🟡 marker 从 `execution_count` 漏进响应；合法文件被拒且 hint 不实 | ✅ | 计数在 `parseNotebook` **归一化一次**：字段变成 accessor（**读者拿数字、写者拿 marker**，写回时由 `restoreExecutionCountMarkers` 还原，字节不变），规则拆出 `execution_count_not_an_integer`，hint 按规则分述（不再用 `-1` 的措辞描述大整数）。证据：`v10-regressions.test.ts` 的 3 条 V11-6（读大整数是数字、合法文件可编辑且字节不变、`1.5` 被拒且 hint 含 "whole number of executions"） |
 | **V11-7** 🟡 message 上界只数条目、不限单条长度 | ✅ | 每个 mime 名截到 64 字符（`DROPPED_MIME_NAME_LIMIT`），用例断言 `message.length`。证据：`run-reporting.test.ts` 的 `[V11-7]`（20 000 字符的名单条 < 400；八个最长名 < 1000；能放下的名字不被截） |
@@ -57,17 +98,17 @@
 | **V11-10** 🟡 图片降级警告不指名 cell；read 不去重、run 去重 | ✅ | 文案改为 `image at cell N (output M) …`，`ExtractedImage` 新增 `cellIndex`，两处调用方传入。登记 **D-057**。证据：`image-blocks.test.ts` 的 `[V11-10]`（三 cell 坏图 → 三条互不相同的消息） |
 | **V11-11** 🟡 `check-docs` 还剩两格 | ✅ | ① 加**不可自证**的锚：文档头部 `> digest:`（编号的 sha256 前 16 位），由 `--print-digest` 生成；删末行 + 改计数 → **红**。② `declareCount` 放宽到 40 行且接受 `entries: 54 rows` 这类修饰，缺 digest 行本身也算问题（"规则被关掉"不能看起来像"规则通过"）。自测变异 **10 → 12** |
 | **V11-12①** 🟢 `1e400` 文案说会读到 `Infinity`，实际交付 `null` | ✅ | 文案按**实际交付的载荷**分三种生成（超范围 → null、`-0` → 符号、其余 → 舍入值）。 |
-| **V11-12②** 🟢 `['a','b']` 仍可能被 join 成 1 字节"图片" | ✅（登记为**已知行为**） | 采纳评审建议**不加**魔数检查（会误伤 Jupyter 自己的分行 base64），在 **D-054** 里写明这一格：从值本身无法分辨，属于已知行为而非缺陷。 |
+| **V11-12②** 🟢 `['a','b']` 仍可能被 join 成 1 字节"图片" | ✅（登记为**已知行为**） | 采纳评审建议**不加**魔数检查（会误伤 Jupyter 自己的分行 base64）。**v12 复核订正**：本行原先宣称 "在 D-054 里写明这一格"，而该轮对 D-054 **无任何改动**。**第十二轮已补**，并连带登记了同族的 `"inf"`/`"NaN"` 字符串那一格（D-054 的 v12 追加段）。产物：`imageValueText`、`docs/DEVIATIONS.md` 的 D-054 |
 
 ### 11.2 未做与残留
 
 - **E1–E9 真实第三方客户端**：仍 **0/9**，发布前最后一道非代码门（与前几轮相同）。
 - **macOS / arm64**：本轮未在 macOS 复跑任何东西；集成不在 macOS 上跑是 SPEC §9 的既定决策。
-- **`execution_count` 的写法规范化**：文件里写 `3.0` 时，本工具写回 `3`（值相同、nbformat 对**浮点拼写**本来就判 INVALID，而 `3.0` 经 Python `json` 解析后是整数 3，所以两种权威的结论不同）。这是一格**已知的字节级规范化**，未在 D-056 之外单独立项。
+- **`execution_count` 的写法规范化**：文件里写 `3.0` 时，本工具写回 `3`（值相同；**v12 复核订正**：nbformat 判 `3.0` INVALID 是真的——Python `json` 把 `3.0` 解析为 **float**，而 schema 要 `"integer"`——所以本工具的 `3.0 → 3` 是**把一种 nbformat 拒绝的写法规范成它接受的写法**，不是两种权威结论不同。原先那句话把两个权威的说法写反了）。这是一格**已知的字节级规范化**，未在 D-056 之外单独立项。
 - **`--images=never` 与超限时 artifact 已写**：v10 登记的固有序（先物化后组装）未动。
 - **`facts_pending` 的 spec 缺口**：SPEC §4.8 的 status 载荷与 cancel 载荷都没有这个字段，属于**新增返回字段**（D22 允许只增不改），已按 AGENTS §0 登记为 **D-055**。
 
-## 〇-0、第十轮（`ipynb-mcp-code-review-v10.md`）
+## 〇-1、第十轮（`ipynb-mcp-code-review-v10.md`）
 
 > 本轮的两条 🔴 有一条是**新引入的回归**，而且它比被修的那条更重：为 V9-5 换上自研 JSON parser 之后，
 > 对象键用 `result[key] = value` 承接，`__proto__` 命中的是 `Object.prototype` 的 **setter** —— 该键既不进对象也不进响应，
@@ -109,7 +150,7 @@
 - **两处仍值得将来处理的形状**（本轮未做，非阻塞）：① `--images=never` 与超限时，若某 cell 的块被 `result.ts` 丢弃，其 `artifact_path` 可能已指向刚写的文件——"先物化后组装"的固有序；② `run.test.ts` 的权威解释器用例依赖 `resolvedTestInterpreter()`，在没有 venv 的裸机上仍会走 base 解释器（这是设计，但值得在 CI 里断言它确实用了 venv）。
 
 
-## 〇-1、第九轮（`ipynb-mcp-code-review-v9.md`）
+## 〇-2、第九轮（`ipynb-mcp-code-review-v9.md`）
 
 > 本轮的两条 🔴 是**同一个错误的第四次与第五次形态**。v8 为修"data-URL 图片看得见读不出"只改了**解码/物化**那一层，
 > 断言停在内部 `OutputItem`（`bytes > 0`、`__decodeFailed === false`），而**内容块**那一层仍把文档里的 `data:` 原值交给 SDK
@@ -175,7 +216,7 @@ V9-3/D-047 则把"组装结果"这一层也纳入了闸门——**不能假定�
   （`git show HEAD:.github/workflows/ci.yml` → 第 90 行 `- run: pnpm smoke`，第 86 行 `- run: pnpm check:package`），所以"19/19 目前只是本机"这条不成立。
   本轮 smoke 的唯一缺口是**本轮尚未在 CI 上跑过**（本机 26/26，CI 结果看下一次运行）。
 
-## 〇-2、第八轮（`ipynb-mcp-code-review-v8.md`）
+## 〇-3、第八轮（`ipynb-mcp-code-review-v8.md`）
 
 > 第八轮的两条 TOP 都指向同一件事：**v7 的修复只覆盖了等价类的一半，而 v7 的复验也只跑了上一轮点名的那一格**。
 > 因此本轮把"修数据形状缺陷 = 补该字段全部合法类型的矩阵 + 逐项先红后绿"写进 `AGENTS.md` §9（见"新增硬规则"一节），
@@ -233,7 +274,7 @@ V9-3/D-047 则把"组装结果"这一层也纳入了闸门——**不能假定�
 > `fileParallelism: false` 加 `tests/unit/test-venv-ownership.test.ts` 的所有权用例（理由与证据见第九轮段对应两行）。
 
 
-## 〇-3、第七轮（`ipynb-mcp-code-review-v7.md`）
+## 〇-4、第七轮（`ipynb-mcp-code-review-v7.md`）
 
 > 第七轮的核查对象是**读方向**、**守卫之间的一致性**，以及**文档与代码是否相符**。
 > 它给出的三条 TOP：V7-1（读方向把合法的 `application/json` 静默改写/丢弃）、P0-a（唯一的外部权威在唯一的自动化环境里恒缺席）、
@@ -279,7 +320,7 @@ V9-3/D-047 则把"组装结果"这一层也纳入了闸门——**不能假定�
   于是"实现明明已修"却始终为红。改用每条用例一个空缓存后立刻转绿；这条经验（被测世界与缓存必须同生命周期）写进了注释。
 - 本轮**没有**再出现"声称已修但代码里没有"：三条第六轮虚报逐条订正为真实状态，其中两条在本轮真正做完，一条如实标 ⚠️。
 
-## 〇-4、第六轮（`ipynb-mcp-code-review-v6.md`）
+## 〇-5、第六轮（`ipynb-mcp-code-review-v6.md`）
 
 > 本轮的核查对象是**仓库自己的测试与脚本**（把守卫当被测对象做变异），加上 **CI 首次真跑**的失败
 > （GitHub issue #1）。结论：v5 的修复是真的，但新加的写前闸门、缩进检查器与几处测试本身有缺陷，
@@ -332,10 +373,10 @@ V9-3/D-047 则把"组装结果"这一层也纳入了闸门——**不能假定�
 
 | v5 条目 | 五轮状态 | 六轮处置 |
 |---|---|---|
-| GATE-1 闸门审整份文档 | ✅ 已修 | ✅ 复验通过（六轮用同一复现复跑） |
-| GATE-2 比 nbformat 严 | ✅ 已修 | ✅ 复验通过 |
-| GATE-3 `execution_count` 类型 | ✅ 已修 | ✅ 复验通过 |
-| FRAME-1 守卫恒真 | ✅ 已修 | ✅ 复验通过（两个变异各命中一条断言） |
+| GATE-1 闸门审整份文档 | ✅ 已修 | ✅ 复验通过（六轮用同一复现复跑）。产物：`SelfCheckScope.touchedCellIndexes`（`src/core/parse.ts`） |
+| GATE-2 比 nbformat 严 | ✅ 已修 | ✅ 复验通过。产物：`findStructuralProblem` 的 `lenientKinds` 分支 |
+| GATE-3 `execution_count` 类型 | ✅ 已修 | ✅ 复验通过。产物：`execution_count_not_an_integer` 规则与 `tests/unit/run-reporting.test.ts` |
+| FRAME-1 守卫恒真 | ✅ 已修 | ✅ 复验通过（两个变异各命中一条断言）。产物：`tests/unit/run-reporting.test.ts` 的 `[V10-5]` |
 | **INDENT-HOLE** `if` 体不受检 | ⬜ **漏列** | ✅ **本轮修复**：`check-indent.mjs` 重写（`thenStatement`/`else`/`switch`/箭头/访问器 + 自测 + "语句必须独占一行"），并用它发现并修好了 `run.ts` 等 5 个文件里 68 行真实错位 |
 | **NEW5-REPRO** 终态可二次翻转 | ⬜ **漏列** | ✅ **本轮修复**：`RunStore.settle()` 单写者 + `progress.completed` 收口 + 写回前 abort 复查 |
 | **TST-CI** 用例全绿但 exit 1 | ⬜ **漏列** | ✅ **本轮修复**：`settled = inflight.then(...)`，在 kill 之前挂上 handler；I15 的相位错误同时修掉 |
