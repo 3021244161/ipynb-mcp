@@ -413,8 +413,23 @@ class KernelDiedError(RuntimeError):
 
 
 def send(obj: dict) -> None:
+    # The frames carry the user's own text — a traceback from a cell, a path with Chinese
+    # characters — and `ensure_ascii=False` writes it as raw UTF-8. The stream's encoding is
+    # chosen by the ENVIRONMENT, not by us: a Windows console defaults to cp1252 and a POSIX
+    # process with `LANG=C` gets ANSI_X3.4-1968, and `sys.stdout.write` then raises
+    # `UnicodeEncodeError` in the middle of a response. That is not a theoretical failure: the
+    # same shape took out `scripts/check-connection-sweep.py` in CI, where the runner's console
+    # could not encode a `→` in its own report. For the sidecar the stakes are higher — the
+    # exception would escape `main`, kill the process, and take every kernel with it, with the
+    # client seeing only `Connection closed`.
+    #
+    # `errors="replace"` after the encoding attempt: a `?` in a diagnostic beats a dead
+    # sidecar, and the JSON envelope itself is ASCII, so the protocol stays parseable.
     with STDOUT_LOCK:
-        sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        try:
+            sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        except UnicodeEncodeError:
+            sys.stdout.write(json.dumps(obj, ensure_ascii=True) + "\n")
         sys.stdout.flush()
 
 
@@ -562,6 +577,18 @@ def op_exec_cell(params: dict) -> dict:
     outputs: list[dict] = []
     status = "ok"
     interrupt_deadline = None
+    # A cell that raised, seen on iopub. Authoritative for `error`, because the shell reply can
+    # be missing (see the error branch below).
+    exec_error = False
+    # Did we send the interrupt that a TIMEOUT requires? If the cell then ends
+    # with a `KeyboardInterrupt`, the status is still `timeout`: SPEC §4.7 rule 6
+    # makes `timeout` a value of the `status` field and says a timeout marks the
+    # kernel dead, so it cannot depend on whether the platform's interrupt lands.
+    # It does land on Linux, and the cell used to come back as `error` there —
+    # the same run reported `exec_timeout` on Windows and `internal` on Linux
+    # (measured in CI, review D-025 收尾). The caller cannot act on that
+    # difference: it asked for a deadline, and the deadline was exceeded.
+    timed_out = False
 
     while True:
         now = time.monotonic()
@@ -597,6 +624,7 @@ def op_exec_cell(params: dict) -> dict:
                 # limitations — the shutdown that follows the timeout is what
                 # actually reclaims the CPU (SPEC §4.7 rule 6, D-025).
                 interrupt_deadline = now + INTERRUPT_GRACE_SECONDS
+                timed_out = True
                 continue
             if interrupt_deadline is not None and now >= interrupt_deadline:
                 if not entry.km.is_alive():
@@ -630,6 +658,12 @@ def op_exec_cell(params: dict) -> dict:
                 "metadata": content.get("metadata", {}),
             })
         elif msg_type == "error":
+            # Record that the cell raised. The shell reply normally says the same thing, but it
+            # is a SECOND message that may never arrive inside `SHELL_REPLY_BUDGET_SECONDS`
+            # (that budget exists because it sometimes does not), and a run that reported `ok`
+            # for a cell whose traceback it had already collected would be a silent lie about
+            # the result. The iopub error is first-hand evidence; the reply is corroboration.
+            exec_error = True
             outputs.append({
                 "outputType": "error",
                 "ename": content.get("ename", ""),
@@ -673,8 +707,24 @@ def op_exec_cell(params: dict) -> dict:
         execution_count = reply_content.get("execution_count")
         break
 
-    if status == "ok" and reply_status == "error":
+    if status == "ok" and (reply_status == "error" or exec_error):
         status = "error"
+    if timed_out:
+        # The deadline was exceeded and we sent the interrupt for it, so the answer is
+        # `timeout` whether or not the interrupt landed. The two platforms differ in HOW the
+        # cell ends — Windows: the sleep ignores the interrupt, nothing arrives, the grace
+        # deadline above fires; Linux: SIGINT lands, the kernel raises KeyboardInterrupt and
+        # reports `error` — and a caller cannot act on that difference. SPEC §4.7 rule 6 puts
+        # `timeout` in the `status` enum and says it marks the kernel dead, so reporting
+        # `error` here also mislabelled a user's own exception as a platform artefact.
+        #
+        # `execution_count` is preserved (the kernel DID run the cell) and `outputs` keeps
+        # what the cell managed to print before the deadline; both are carried, while `status`
+        # is what drives the terminal `exec_timeout` and the "do not write this cell back"
+        # rule (SPEC §4.7 rules 5/6). On the Windows path outputs are empty by construction,
+        # which is the one remaining asymmetry — and it is inherent: there is no idle message
+        # to stop at, so nothing was collected.
+        status = "timeout"
     if execution_count is not None:
         entry.execution_count = execution_count
 
@@ -832,6 +882,16 @@ def handle_request(request: dict) -> None:
 
 
 def main() -> int:
+    # Both directions of the protocol carry the user's text, and neither stream's encoding is
+    # ours to assume: a cp1252 console on Windows or `LANG=C` on POSIX makes `sys.stdin`
+    # decode ASCII and `sys.stdout` encode it, so a notebook with a Chinese path fails on the
+    # way in as well as on the way out (the outgoing half is also defended in `send`, which
+    # must keep working even if this call is unavailable).
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):  # pragma: no cover - non-reconfigurable stream
+            pass
     send_log("info", "sidecar ready")
     # Before starting any kernel: clear the connection files an earlier crashed or
     # SIGKILLed run could not delete. Doing it at startup rather than at exit is

@@ -35,6 +35,21 @@ import sys
 # at cache-write time, not at interpreter startup.
 sys.dont_write_bytecode = True
 
+# The report uses `→` and `—`, and a Windows console does not: Python picked cp1252 for
+# stdout on the CI runner, printing an assertion line raised
+# `UnicodeEncodeError: 'charmap' codec can't encode characters in position 18-19` — so the
+# gate died on its own success message (the FAILING line printed, the PASSING line crashed)
+# while passing locally, where the console is UTF-8. Two ways out: strip the typography, or
+# tell the stream what it is. The second keeps the output readable and fixes every future
+# non-ASCII character at once. `errors="replace"` is the belt for an environment that
+# refuses even UTF-8, because a guard whose failure mode is an encoding crash is worse than
+# one that prints a `?`.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, ValueError):  # pragma: no cover - non-reconfigurable stream
+    pass
+
 import importlib.util
 import os
 import shutil
