@@ -49,7 +49,7 @@
 - `tests/unit/json-number-forms.test.ts` 重写为**显式表**（26 形态 × 8 位置）+ 37 条规范化器期望。
 - `tests/unit/image-blocks.test.ts` 新增 `[V11-10]`（三 cell 坏图 → 三条互不相同的消息）。
 - `tests/unit/test-venv-ownership.test.ts` 新增 `[V11-9]`（外来目录字节级未变、两轮驱动、无 marker）。
-- 单测 **552 → 600**（32 文件）；集成 **58/8 → 69/10 文件**；`check-docs --selftest` 变异 **10 → 12**。
+- 单测 **552 → 595**（30 文件）；集成 **58/8 → 69/10 文件**；`check-docs --selftest` 变异 **10 → 12**。
 
 ## [Unreleased] 0.1.0 — 第十轮代码复核整改（未发布）
 
