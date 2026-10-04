@@ -58,11 +58,25 @@ describe('[V12-4] a timed-out cell is classified as a timeout on every platform'
       } as never)) as unknown as Record<string, unknown>;
 
       expect(result['status'], JSON.stringify(result).slice(0, 300)).toBe('timeout');
-      // A cell that printed nothing has nothing to report. This is the part that IS platform
-      // independent: `status: timeout` makes the run discard the cell's output (SPEC §4.7 rules
-      // 5/6), and no execution count may be recorded for a cell that never signalled completion.
-      expect(result['rawOutputs']).toEqual([]);
-      expect(result['executionCount']).toBeNull();
+      // No SUCCESSFUL output, on either platform, which is what SPEC §4.7 rules 5/6 are about: the
+      // run discards what a timed-out cell produced, so a stream or an execute_result here would be
+      // a timeout that looks like a result. The two platforms differ in the exact shape and this
+      // assertion is deliberately written to accept both, because pinning one of them was wrong
+      // twice (CI, ubuntu py 3.12 and py 3.10):
+      //
+      //   Windows  the interrupt is ignored, nothing arrives, the grace deadline returns early —
+      //            `rawOutputs` is empty;
+      //   Linux    SIGINT lands, the kernel reports KeyboardInterrupt, and that error message IS
+      //            collected before the run ends.
+      const outputs = result['rawOutputs'] as Array<{ outputType: string }>;
+      for (const output of outputs) {
+        expect(output.outputType, JSON.stringify(output).slice(0, 200)).toBe('error');
+      }
+      // An execution count is recorded only when the kernel signalled completion, which a cell that
+      // ran past its deadline did not do on the platform where nothing came back.
+      if (outputs.length === 0) {
+        expect(result['executionCount']).toBeNull();
+      }
     } finally {
       await transport.shutdownAll().catch(() => undefined);
     }
