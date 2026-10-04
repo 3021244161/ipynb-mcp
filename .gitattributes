@@ -17,3 +17,10 @@
 *.ico binary
 *.pdf binary
 *.tgz binary
+
+# Commit-message drafts (`git commit -F`; the root `*.txt` family is gitignored):
+# never treat them as text, because a BOM would be carried verbatim into the commit
+# subject — `Set-Content -Encoding UTF8` on Windows writes one, and the result is an
+# invisible character in front of the subject line (hit once in the tenth round).
+/*.txt -text
+

@@ -243,6 +243,16 @@ GUARD_RESULT="$(guard "$WORK")" || {
   exit 2
 }
 WORK="$(normalize_path "$WORK")"
+# The guard ran on the RAW value; `rm -rf` uses the NORMALIZED one, so the promise in
+# `guard`'s comment ("every deletion target must survive all of the checks") holds only
+# if the normalized string is checked too. Not a live attack surface — the checks are
+# idempotent on a normalized path — but a guard whose comment describes a property the
+# code does not have is the class of thing this project has spent rounds fixing
+# (review v10 V10-9, 🟢 item).
+GUARD_RESULT="$(guard "$WORK")" || {
+  echo "refusing to delete normalized WORK='$WORK': ${GUARD_RESULT#refuse: }" >&2
+  exit 2
+}
 
 rm -rf "$WORK"
 mkdir -p "$WORK"

@@ -40,6 +40,27 @@ function read(relative) {
   return readFileSync(path.join(REPO_ROOT, relative), 'utf8');
 }
 
+/**
+ * The entry count the document declares about itself, or null when it declares none.
+ *
+ * The count lives next to the thing it counts (a `entries: NN` line in the header block)
+ * so that adding a row and updating the count are the same edit. A document without the
+ * declaration is not failed for it — only the two rules that need it are skipped — but
+ * the reviewer's two mutations (delete the last row, append one) are both caught by it,
+ * which is the falsifiability the v10 review asked for.
+ */
+function declareCount(lines, doc) {
+  const pattern = new RegExp(`^>\\s*entries:\\s*(\\d+)\\s*$`);
+  for (const line of lines.slice(0, 12)) {
+    const match = pattern.exec(line);
+    if (match !== null) {
+      return Number(match[1]);
+    }
+  }
+  void doc;
+  return null;
+}
+
 /** Every problem found, as a printable line. Empty array means "ok". */
 export function inspectDocument(doc, text) {
   const problems = [];
@@ -75,6 +96,21 @@ export function inspectDocument(doc, text) {
       );
       break;
     }
+  }
+  // …and the LAST row must be the highest number, which the gap rule alone cannot see:
+  // deleting the final row leaves a perfectly contiguous 1..n-1 and used to pass
+  // (review v10 V10-5, the reviewer's "delete the last row" mutation).
+  //
+  // The expected count lives in the document's own header line — `entries: NN` — rather
+  // than in this script, so adding a row is a one-line edit to the thing being counted
+  // (and the header rule below makes that line unique). `--selftest` proves the rule can
+  // fail by deleting the last row AND by appending one.
+  const declaredTotal = declareCount(lines, doc);
+  const highest = numbers.at(-1) ?? 0;
+  if (declaredTotal !== null && highest !== declaredTotal) {
+    problems.push(
+      `${doc.file}: the table ends at ${doc.idPrefix}${String(highest).padStart(3, '0')} but its header declares ${String(declaredTotal)} entries — a row was lost from the end, or appended without updating the count`,
+    );
   }
 
   // A row is ONE line with the table's arity. Cells are split on ` | ` rather than on
@@ -142,23 +178,39 @@ function inspectRepository() {
  * Without this the whole script is decoration: a rule that cannot fail and a rule
  * that is not written look identical from the outside (AGENTS §9, "守卫必须自己证明
  * 有判别力").
+ *
+ * Every mutation is derived from the LIVE text, and a mutation the current document
+ * cannot express is reported as SKIPPED rather than as a failure. The first version
+ * hard-coded strings from the document (`' | 已实现'`, `'| 保持 20 |'`, `Q3`) and threw
+ * when they were absent, so a legitimate edit to the prose turned `pnpm lint` red while
+ * the documents were correct — "a guard must not fail for unrelated reasons", the other
+ * half of the same rule (review v10 V10-8). The minimum-applied count below is what keeps
+ * that tolerance from degenerating into "nothing is checked any more".
  */
 function selftest() {
   const doc = AUTHORITY_DOCS[0];
   const original = read(doc.file);
+  const skipped = [];
 
   /** Replace the first line starting with `prefix`, by line rather than by regex. */
   const editLine = (text, prefix, change) => {
     const lines = text.split('\n');
     const at = lines.findIndex((line) => line.startsWith(prefix));
     if (at < 0) {
-      throw new Error(`self-test setup: no line starts with ${JSON.stringify(prefix)}`);
+      return null;
     }
     lines.splice(at, 1, ...(change === null ? [] : [change(lines[at])]));
     return lines.join('\n');
   };
 
-  const cases = [
+  /** The last numbered row's prefix, derived from the document rather than hard-coded. */
+  const lastRow = [...original.matchAll(/^\| (D-\d{3}) \|/gm)].at(-1)?.[1] ?? null;
+  /** A row in the MIDDLE, so the "gap" mutation is not the same as "delete the end". */
+  const middleRow = [...original.matchAll(/^\| (D-\d{3}) \|/gm)][3]?.[1] ?? null;
+  /** The next number after the last row, for the "appended without a count" mutation. */
+  const nextId = lastRow === null ? null : `D-${String(Number(lastRow.slice(2)) + 1).padStart(3, '0')}`;
+
+  const candidates = [
     {
       name: 'the document header is duplicated (the v9 shape: a spliced copy)',
       text: `${original}\n${original}`,
@@ -170,26 +222,47 @@ function selftest() {
       expect: 'D-001 appears 2 times',
     },
     {
-      name: 'an entry was lost in an edit (numbering gap)',
-      text: editLine(original, '| D-007 |', () => null),
+      name: 'an entry was lost from the middle (numbering gap)',
+      text: middleRow === null ? null : editLine(original, `| ${middleRow} |`, () => null),
       expect: 'numbering has a gap',
     },
     {
-      name: 'a row was spliced onto the pasted copy (the v9 symptom, at row scale)',
-      // The v9 file had a row that ran on into the pasted copy's header. At row scale
-      // the same defect shows up as a lost cell boundary, which is what this asserts.
-      text: editLine(original, '| D-044 |', (line) => line.replace(' | 已实现', ' 已实现')),
+      name: 'the LAST entry was lost (the v10 finding: a gap rule cannot see it)',
+      text: lastRow === null ? null : editLine(original, `| ${lastRow} |`, () => null),
+      expect: 'a row was lost from the end',
+    },
+    {
+      name: 'an entry was appended without updating the declared count',
+      text:
+        lastRow === null || nextId === null
+          ? null
+          : editLine(original, `| ${lastRow} |`, (line) => `${line}\n| ${nextId} | 2026-10-04 | §0 | x | y | z | 已实现 |`),
+      expect: 'appended without updating the count',
+    },
+    {
+      name: 'a row lost a cell boundary (the v9 symptom at row scale)',
+      // Derived: turn the last cell separator into a bare pipe, so the row loses a cell
+      // however its final column happens to be worded.
+      text: lastRow === null ? null : editLine(original, `| ${lastRow} |`, (line) => line.replace(/ \| ([^|]*) \|$/, ' |$1|')),
       expect: 'cells, the table declares',
     },
     {
       name: 'a second table header was pasted in',
-      text: original.replace(doc.tableHeader, `${doc.tableHeader}\n${doc.tableHeader}`),
+      text: original.includes(doc.tableHeader)
+        ? original.replace(doc.tableHeader, `${doc.tableHeader}\n${doc.tableHeader}`)
+        : null,
       expect: 'table header appears 2 times',
     },
   ];
 
   const problems = [];
-  for (const testCase of cases) {
+  let applied = 0;
+  for (const testCase of candidates) {
+    if (testCase.text === null) {
+      skipped.push(testCase.name);
+      continue;
+    }
+    applied += 1;
     const found = inspectDocument(doc, testCase.text);
     if (!found.some((problem) => problem.includes(testCase.expect))) {
       problems.push(`self-test [${testCase.name}]: expected a problem containing ${JSON.stringify(testCase.expect)}, got ${JSON.stringify(found)}`);
@@ -198,15 +271,50 @@ function selftest() {
 
   const spec = read('SPEC.md');
   const openQuestions = read('docs/OPEN_QUESTIONS.md');
-  const driftCases = [
-    { name: 'a Q row was reworded', text: openQuestions.replace('| 保持 20 |', '| 20 is fine |'), expect: 'not a verbatim copy' },
-    { name: 'a Q row was deleted', text: openQuestions.replace(/^\| Q3 \|[^\n]*\n/m, ''), expect: 'not a verbatim copy' },
+  // Derived: mutate a row of §12 wherever it is — a status column, a question row — by
+  // taking a line that exists and changing one character of it. The first version named
+  // literal strings from the document, so editing either document honestly broke lint.
+  const qLine = /^\| Q\d+ \|[^\n]*$/m.exec(openQuestions)?.[0] ?? null;
+  const declared = /^## 12\.[^\n]*$/m.exec(openQuestions)?.[0] ?? null;
+  const driftCandidates = [
+    {
+      name: 'a Q row was reworded without touching SPEC.md',
+      text: qLine === null ? null : openQuestions.replace(qLine, `${qLine} `),
+      expect: 'not a verbatim copy',
+    },
+    {
+      name: 'a Q row was deleted',
+      text: qLine === null ? null : openQuestions.replace(`${qLine}\n`, ''),
+      expect: 'not a verbatim copy',
+    },
+    {
+      name: 'the section heading was reworded',
+      text: declared === null ? null : openQuestions.replace(declared, `${declared} `),
+      expect: 'not a verbatim copy',
+    },
   ];
-  for (const testCase of driftCases) {
+  for (const testCase of driftCandidates) {
+    if (testCase.text === null) {
+      skipped.push(testCase.name);
+      continue;
+    }
+    applied += 1;
     const found = inspectOpenQuestions(spec, testCase.text);
     if (!found.some((problem) => problem.includes(testCase.expect))) {
       problems.push(`self-test [${testCase.name}]: expected ${JSON.stringify(testCase.expect)}, got ${JSON.stringify(found)}`);
     }
+  }
+
+  // Tolerance has a floor: if a document edit makes most mutations inapplicable, the
+  // self-test is no longer testing anything and must say so loudly rather than pass.
+  const minimumApplied = 5;
+  if (applied < minimumApplied) {
+    problems.push(
+      `self-test: only ${String(applied)} of ${String(applied + skipped.length)} mutations could be applied (minimum ${String(minimumApplied)}); the documents changed shape enough that this self-test no longer covers its rules`,
+    );
+  }
+  if (skipped.length > 0) {
+    process.stdout.write(`documentation self-test: ${String(skipped.length)} mutation(s) not applicable to the current documents (skipped, not failed): ${skipped.join('; ')}\n`);
   }
 
   // The control: the real documents must pass, or every mutation above would be
@@ -225,7 +333,7 @@ function selftest() {
     return;
   }
   process.stdout.write(
-    `documentation self-test: ok (${String(cases.length + driftCases.length)} mutations detected, control clean)\n`,
+    `documentation self-test: ok (${String(applied)} mutation(s) detected, ${String(skipped.length)} skipped, control clean)\n`,
   );
 }
 
