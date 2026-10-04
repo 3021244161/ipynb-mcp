@@ -20,7 +20,7 @@ import { SidecarTransport } from '../../src/kernel/sidecar-transport.js';
 // `tests/integration/test-venv.ts` had been written to be the only one (review v8 V8-5,
 // still open in v9). Two consequences of the copy were real: the copies drifted, and
 // the helper nobody called could not be trusted to be correct.
-import { BASE_PYTHON, TEST_VENV_PY, prepareVenv, resolvedTestInterpreter } from '../integration/test-venv.js';
+import { BASE_PYTHON, TEST_VENV_PY, canRunSidecar, prepareVenv, resolvedTestInterpreter } from '../integration/test-venv.js';
 
 // Whether a unit-test file may touch Python at all. The suite must pass on a machine
 // with no interpreter (AGENTS §9), so the decision is made once and every case is
@@ -109,23 +109,25 @@ function runs(candidate: string, snippet: string): boolean {
 }
 
 /**
- * Decide the venv BEFORE anything reads `interpreter()`.
+ * The interpreter this suite used BEFORE `prepareVenv` ran, so the assertion in
+ * `afterAll` can tell "we did not have one" from "we deleted it".
  *
- * The whole arrangement — build, validate, ownership marker, fall back to the base
- * interpreter, remove an unusable one — lives in `tests/integration/test-venv.ts`.
- * This file used to carry its own copy of it (the sixth), which is how the same
- * cleanup bug had to be fixed in six places (review v8 V8-5 / v9 V8-5).
- *
- * A healthy venv is deliberately KEPT: rebuilding it costs ~18 MB and several
- * seconds, and the shared helper removes it only when it cannot serve the sidecar.
+ * The v9 version of this file captured `existsSync(TEST_VENV_PY)` and asserted the path
+ * still existed — which fails for a legitimate reason too: when the shared venv was
+ * present and unusable, `prepareVenv` DELETES it (that is the V8-12 ownership rule
+ * working as designed) and rebuilds it; if the rebuild cannot run (`python -m venv`
+ * unavailable, the classic Debian case) the path is legitimately gone, and the failure
+ * message accused the suite of deleting an environment it had created (review v10 V10-9
+ * item ②). What may not happen is the suite deleting a venv it did NOT create, so that is
+ * what is asserted now.
  */
-let venvExistedBefore = false;
+let preExistingVenvWasUsable = false;
 
 beforeAll(() => {
   if (!PYTHON_AVAILABLE) {
     return;
   }
-  venvExistedBefore = existsSync(TEST_VENV_PY);
+  preExistingVenvWasUsable = existsSync(TEST_VENV_PY) && canRunSidecar(TEST_VENV_PY, REQUIRED_MODULES);
   prepareVenv({ modules: REQUIRED_MODULES });
 }, 180_000);
 
@@ -134,18 +136,19 @@ afterAll(() => {
   // `IPYNB_TEST_VENV` with the integration suite, and its cleanup used to delete that
   // venv at the end of a unit run — pulling the interpreter out from under a
   // concurrently running integration case. Resolving is not owning, so a venv that was
-  // there before this file ran must still be there afterwards.
+  // there AND USABLE before this file ran must still be there afterwards.
   //
   // What this can and cannot catch: it observes the end state of THIS run, so it sees
   // the old `afterAll(removeOwnedVenv)` (which deleted unconditionally) and any future
   // cleanup that treats "resolved" as "owned". The window where two separate PROCESSES
   // race on the same venv is not reproducible inside one process; `fileParallelism:
   // false` in vitest.config.ts closes the part of it this repository controls, and the
-  // ownership rule in `tests/integration/test-venv.ts` closes the rest for anyone else.
-  if (PYTHON_AVAILABLE && venvExistedBefore) {
+  // ownership rule in `tests/integration/test-venv.ts` — with its own cases in
+  // `tests/unit/test-venv-ownership.test.ts` — closes the rest.
+  if (PYTHON_AVAILABLE && preExistingVenvWasUsable) {
     expect(
       existsSync(TEST_VENV_PY),
-      `the unit run removed the shared test venv at ${TEST_VENV_PY}; test files must not delete an environment they did not create`,
+      `the unit run removed the usable shared test venv at ${TEST_VENV_PY}; test files must not delete an environment they did not create`,
     ).toBe(true);
   }
 });
