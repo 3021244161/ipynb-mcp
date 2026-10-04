@@ -43,17 +43,26 @@ describe('[V12-4] a timed-out cell is classified as a timeout on every platform'
 
       const result = (await transport.execCell({
         kernelId: 'timeout-classification',
-        // Far past the deadline, so the timeout is unambiguous. `print` before the sleep is there
-        // so a landed interrupt has something to have collected.
-        code: "import time\nprint('before')\ntime.sleep(30)\nprint('after')",
+        // Far past the deadline, so the timeout is unambiguous.
+        //
+        // NOTHING IS PRINTED, deliberately. The first version printed `before` and `after`, then
+        // asserted the output did not contain `after` — which passed on Windows, where the timeout
+        // path returns `rawOutputs: []`, and failed on Linux, where the interrupt lands and the cell
+        // can still run to completion inside the 5 s grace window, so its later line IS collected.
+        // The status is what this case is about and it is identical on both platforms; the raw
+        // output is not, and pinning it asserted a platform detail instead of the rule (CI,
+        // `integration (ubuntu-latest, py 3.12)`).
+        code: 'import time\ntime.sleep(30)',
         timeoutMs: 3_000,
         storeOutputs: true,
       } as never)) as unknown as Record<string, unknown>;
 
       expect(result['status'], JSON.stringify(result).slice(0, 300)).toBe('timeout');
-      // "after" must not be there: the cell did not finish, and a timeout that carried the rest of
-      // the cell's output would be indistinguishable from success.
-      expect(JSON.stringify(result['rawOutputs'] ?? [])).not.toContain('after');
+      // A cell that printed nothing has nothing to report. This is the part that IS platform
+      // independent: `status: timeout` makes the run discard the cell's output (SPEC §4.7 rules
+      // 5/6), and no execution count may be recorded for a cell that never signalled completion.
+      expect(result['rawOutputs']).toEqual([]);
+      expect(result['executionCount']).toBeNull();
     } finally {
       await transport.shutdownAll().catch(() => undefined);
     }
