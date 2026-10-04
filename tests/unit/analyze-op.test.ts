@@ -5,8 +5,8 @@
 // and skips (with a recorded reason) when no Python is available, keeping
 // the "no Python required" guarantee for unit tests.
 
-import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -15,51 +15,32 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createLogger } from '../../src/log.js';
 import { SIDECAR_REQUIRED_MODULES } from '../../src/kernel/interpreter.js';
 import { SidecarTransport } from '../../src/kernel/sidecar-transport.js';
+// The venv arrangement is shared, not copied. This file used to hold the SIXTH copy
+// of it — build, validate, marker-file ownership, fallback to base, cleanup — while
+// `tests/integration/test-venv.ts` had been written to be the only one (review v8 V8-5,
+// still open in v9). Two consequences of the copy were real: the copies drifted, and
+// the helper nobody called could not be trusted to be correct.
+import { BASE_PYTHON, TEST_VENV_PY, prepareVenv, resolvedTestInterpreter } from '../integration/test-venv.js';
 
-// The venv used to live at `<repo>/tests/.venv-test`, i.e. inside the working
-// tree: a test run created it there, left it behind, and any tool that globs the
-// repository saw a virtualenv (review v5 TST-5). It lives in the temp directory
-// now, so the repository is never a side effect of running the suite; override
-// with IPYNB_TEST_VENV to reuse one across runs.
-const VENV_DIR = process.env['IPYNB_TEST_VENV'] ?? path.join(tmpdir(), 'ipynb-mcp-test-venv');
-const WINDOWS = process.platform === 'win32';
-const VENV_PY = WINDOWS ? path.join(VENV_DIR, 'Scripts', 'python.exe') : path.join(VENV_DIR, 'bin', 'python');
-const BASE_PYTHON = process.env['IPYNB_TEST_PYTHON'] ?? (WINDOWS ? 'python' : 'python3');
-
+// Whether a unit-test file may touch Python at all. The suite must pass on a machine
+// with no interpreter (AGENTS §9), so the decision is made once and every case is
+// guarded by it rather than by whatever `prepareVenv` happened to do.
 const PYTHON_AVAILABLE =
-  existsSync(VENV_PY) ||
-  spawnSync(WINDOWS ? 'python' : 'python3', ['-c', ''], { timeout: 5000 }).status === 0;
+  existsSync(TEST_VENV_PY) || spawnSync(BASE_PYTHON, ['-c', ''], { timeout: 5000 }).status === 0;
 
-let chosenInterpreter: string | null = null;
+/** The interpreter every case here uses — resolved in ONE place, by the shared helper. */
+function interpreter(): string {
+  return resolvedTestInterpreter();
+}
 
 /**
- * The interpreter every case in this file will use — and the one the capability
- * probe must judge. Resolving it once, in one place, is the fix for a CI failure
- * that had nothing to do with the product: the probe validated the BASE
- * interpreter (no venv existed yet) and the case then created a venv and ran with
- * THAT, so the first CI run passed and the second failed on the same code, purely
- * because the venv it left behind could not import jupyter_client.
+ * Every module the sidecar imports at startup, plus what the ANALYZER cases need.
  *
- * A venv is only preferred when it can actually run the sidecar; one that cannot
- * is removed so it cannot mislead a later run either. Override the location with
- * IPYNB_TEST_VENV.
+ * `nbformat` is in the list because this file's purpose is to check the analyzer
+ * against real source; asking for it here means the resolve cannot hand back an
+ * interpreter that would make the cases skip for an environment reason.
  */
-function interpreter(): string {
-  if (chosenInterpreter !== null) {
-    return chosenInterpreter;
-  }
-  if (existsSync(VENV_PY) && canRunSidecar(VENV_PY)) {
-    chosenInterpreter = VENV_PY;
-    return chosenInterpreter;
-  }
-  chosenInterpreter = BASE_PYTHON;
-  return chosenInterpreter;
-}
-
-/** Every module the sidecar imports at startup (see SIDECAR_REQUIRED_MODULES). */
-function canRunSidecar(candidate: string): boolean {
-  return SIDECAR_REQUIRED_MODULES.every((module) => runs(candidate, `import ${module}`));
-}
+const REQUIRED_MODULES = [...SIDECAR_REQUIRED_MODULES];
 
 /**
  * Can this machine actually run a kernel?
@@ -130,92 +111,45 @@ function runs(candidate: string, snippet: string): boolean {
 /**
  * Decide the venv BEFORE anything reads `interpreter()`.
  *
- * A venv is created only when the base interpreter can serve it, and an existing
- * venv that cannot run the sidecar is removed rather than preferred. Both halves
- * matter: creating it lazily is what made CI pass once and fail once on the same
- * code (the first run probed the base interpreter and then ran in a venv it had
- * just created; the second run found that venv and probed IT), and leaving an
- * unusable one behind is what makes the failure survive into later runs.
- */
-/**
- * Deletes the venv only when this test owns it.
+ * The whole arrangement — build, validate, ownership marker, fall back to the base
+ * interpreter, remove an unusable one — lives in `tests/integration/test-venv.ts`.
+ * This file used to carry its own copy of it (the sixth), which is how the same
+ * cleanup bug had to be fixed in six places (review v8 V8-5 / v9 V8-5).
  *
- * `VENV_DIR` comes from `IPYNB_TEST_VENV`, so pointing that at a real environment —
- * a plausible thing to do, since the variable exists precisely to reuse one — made
- * `rmSync(VENV_DIR, { recursive: true })` delete the user's virtualenv
- * (review v7 V7-14). Ownership is recorded in a marker file this test writes when
- * it creates the venv, and both delete sites go through here.
+ * A healthy venv is deliberately KEPT: rebuilding it costs ~18 MB and several
+ * seconds, and the shared helper removes it only when it cannot serve the sidecar.
  */
-const VENV_MARKER = '.ipynb-mcp-test-venv';
+let venvExistedBefore = false;
 
-function removeOwnedVenv(): void {
-  if (!existsSync(path.join(VENV_DIR, VENV_MARKER))) {
-    // Not ours: leave it, and say so, because the caller is about to fall back to
-    // the base interpreter and that decision should be explicable.
-    process.stderr.write(
-      `[analyze-op] ${VENV_DIR} exists but was not created by this test; leaving it alone\n`,
-    );
-    return;
-  }
-  rmSync(VENV_DIR, { recursive: true, force: true });
-}
-
-/**
- * Decide the venv BEFORE anything reads `interpreter()`.
- *
- * A venv is created only when the base interpreter can serve it, and an existing
- * venv that cannot run the sidecar is removed rather than preferred. Both halves
- * matter: creating it lazily is what made CI pass once and fail once on the same
- * code, and leaving an unusable one behind is what makes the failure survive into
- * later runs.
- */
-function prepareTestVenv(): void {
+beforeAll(() => {
   if (!PYTHON_AVAILABLE) {
     return;
   }
-  if (existsSync(VENV_PY)) {
-    if (!canRunSidecar(VENV_PY)) {
-      removeOwnedVenv();
-    }
-    return;
-  }
-  // Only build one from an interpreter that can actually serve it.
-  if (!canRunSidecar(BASE_PYTHON)) {
-    return;
-  }
-  try {
-    execFileSync(BASE_PYTHON, ['-m', 'venv', '--system-site-packages', VENV_DIR], {
-      stdio: 'ignore',
-      timeout: 120_000,
-    });
-    // Ownership marker, written first so a failed capability check can still clean
-    // up what it just made.
-    writeFileSync(path.join(VENV_DIR, VENV_MARKER), 'created by tests/unit/analyze-op.test.ts\n');
-  } catch {
-    // A venv is an optimisation here, not a requirement: the base interpreter
-    // already passed the capability check, so fall back to it.
-    return;
-  }
-  if (!canRunSidecar(VENV_PY)) {
-    removeOwnedVenv();
-  }
-}
+  venvExistedBefore = existsSync(TEST_VENV_PY);
+  prepareVenv({ modules: REQUIRED_MODULES });
+}, 180_000);
 
-/**
- * Ownership is dropped at the end, but a HEALTHY venv is deliberately KEPT:
- * rebuilding it costs ~18 MB and several seconds, and the next run benefits. What
- * must not happen is an UNUSABLE venv surviving to change what the next run
- * measures, which is why `removeOwnedVenv` deletes that case immediately — see
- * `prepareTestVenv`. The earlier comment here claimed the venv is removed in
- * `afterAll`, which the code never did (review v8 V8-15).
- */
 afterAll(() => {
-  removeOwnedVenv();
+  // V8-12's regression, pinned where it bit: this suite shares the venv at
+  // `IPYNB_TEST_VENV` with the integration suite, and its cleanup used to delete that
+  // venv at the end of a unit run — pulling the interpreter out from under a
+  // concurrently running integration case. Resolving is not owning, so a venv that was
+  // there before this file ran must still be there afterwards.
+  //
+  // What this can and cannot catch: it observes the end state of THIS run, so it sees
+  // the old `afterAll(removeOwnedVenv)` (which deleted unconditionally) and any future
+  // cleanup that treats "resolved" as "owned". The window where two separate PROCESSES
+  // race on the same venv is not reproducible inside one process; `fileParallelism:
+  // false` in vitest.config.ts closes the part of it this repository controls, and the
+  // ownership rule in `tests/integration/test-venv.ts` closes the rest for anyone else.
+  if (PYTHON_AVAILABLE && venvExistedBefore) {
+    expect(
+      existsSync(TEST_VENV_PY),
+      `the unit run removed the shared test venv at ${TEST_VENV_PY}; test files must not delete an environment they did not create`,
+    ).toBe(true);
+  }
 });
 
-beforeAll(() => {
-  prepareTestVenv();
-}, 180_000);
 
 describe('[U18][D2] the symtable analyzer maps real source to defs/uses', () => {
   it.skipIf(!PYTHON_AVAILABLE)('tuple unpacking lands in module-level defs (regex cannot)', async () => {

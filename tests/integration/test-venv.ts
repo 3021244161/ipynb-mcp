@@ -54,6 +54,22 @@ export function canImport(candidate: string, modules: readonly string[]): boolea
 /** Alias kept for the analyze-op call site's wording. */
 export const canRunSidecar = canImport;
 
+/**
+ * The interpreter a test file is USING, once it has called {@link prepareVenv}.
+ *
+ * It exists so a capability question can be asked about the RIGHT interpreter. The
+ * nbformat cases in `run.test.ts` asked about `VENV_PY` while the run under test used
+ * whatever the resolve picked, which may be the base interpreter — so a venv that
+ * lacked nbformat reported an ENVIRONMENT gap as a product failure (review v8 V8-11).
+ * Defaults to the base interpreter, so a read before the resolve cannot silently
+ * answer "the venv".
+ */
+let resolvedInterpreter: string = BASE_PYTHON;
+
+export function resolvedTestInterpreter(): string {
+  return resolvedInterpreter;
+}
+
 export interface PrepareVenvOptions {
   /** Modules the venv must be able to import. */
   readonly modules: readonly string[];
@@ -78,6 +94,11 @@ export interface PrepareVenvOptions {
  * for the next run to trip over.
  */
 export function prepareVenv(options: PrepareVenvOptions): string {
+  resolvedInterpreter = resolveVenv(options);
+  return resolvedInterpreter;
+}
+
+function resolveVenv(options: PrepareVenvOptions): string {
   const { modules, requireVenv = process.env['IPYNB_TEST_REQUIRE_VENV'] === '1' } = options;
 
   if (existsSync(TEST_VENV_PY) && canImport(TEST_VENV_PY, modules)) {
@@ -127,19 +148,6 @@ export function prepareVenv(options: PrepareVenvOptions): string {
     throw new Error(
       `IPYNB_TEST_REQUIRE_VENV=1 but the venv built at ${TEST_VENV_DIR} cannot import ${modules.join(', ')}`,
     );
-  }
-  return BASE_PYTHON;
-}
-
-/**
- * The venv's interpreter when it exists and can import what the sidecar needs,
- * otherwise the base interpreter.
- *
- * Kept as the read-only view for callers that must not build anything.
- */
-export function usableInterpreter(requiredModules: readonly string[]): string {
-  if (existsSync(TEST_VENV_PY) && canImport(TEST_VENV_PY, requiredModules)) {
-    return TEST_VENV_PY;
   }
   return BASE_PYTHON;
 }

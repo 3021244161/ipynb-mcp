@@ -5,11 +5,13 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import {
+  collectOutputWarnings,
   dropUnrepresentableOutputs,
   mapRawOutputs,
   rawOutputsOfCell,
   type RawOutput,
 } from '../../src/core/outputs.js';
+import { exactNumber } from '../../src/core/json-exact.js';
 import { parseNotebook } from '../../src/core/parse.js';
 import { applyImagePolicy, shouldReturnImages } from '../../src/fs/artifact.js';
 import { hasher } from '../../src/hash.js';
@@ -152,7 +154,35 @@ describe('[step6] mapRawOutputs ordered dispatch (SPEC §5.4)', () => {
     // mime, which is how `{'application/json': 'hello'}` lost its type entirely
     // (review v8 V8-2).
     const { items } = mapOutputs([{ outputType: 'execute_result', data: { 'application/json': '{broken' } }]);
-    expect(items[0]).toStrictEqual({ kind: 'json', value: '{broken' });
+    expect(items[0]).toStrictEqual({ kind: 'json', value: '{broken', warnings: [] });
+  });
+
+  it('[V9-5] a json integer too large for a double is reported, not silently rounded', () => {
+    // The value is built as RAW FILE TEXT because `JSON.stringify` cannot carry it:
+    // `String(18446744073709551616)` is already `18446744073709552000`, which is
+    // exactly the bug — the model was handed a value the file does not contain, with
+    // `warnings: []` (review v9 V9-5).
+    const { items } = mapOutputs([
+      { outputType: 'execute_result', data: { 'application/json': exactNumber('18446744073709551616') } },
+    ]);
+    const item = items[0];
+    expect(item).toMatchObject({ kind: 'json' });
+    const warnings = (item as { warnings: Array<{ code: string; message: string }> }).warnings;
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]!.code).toBe('output_truncated');
+    // The exact digits must be IN the answer: the value that can be sent as a number
+    // is the rounded one, so the warning is the only place they can survive.
+    expect(warnings[0]!.message).toContain('18446744073709551616');
+    // …and the lifted, call-level form carries the same message (SPEC §7's table is
+    // where a client looks; the code is shared, which is why the message must be
+    // self-describing).
+    expect(collectOutputWarnings([{ outputs: items }]).map((warning) => warning.message))
+      .toEqual([warnings[0]!.message]);
+  });
+
+  it('[V9-5] a json integer inside the safe range carries no warning', () => {
+    const { items } = mapOutputs([{ outputType: 'display_data', data: { 'application/json': 2 ** 53 - 1 } }]);
+    expect(items[0]).toStrictEqual({ kind: 'json', value: 9007199254740991, warnings: [] });
   });
 
   it('parses png/jpeg dimensions from headers, metadata takes priority', () => {
@@ -561,10 +591,13 @@ describe('[V8-2][V8-1] the READ direction preserves EVERY legal value for every 
 
   for (const mime of JSON_MIMES) {
     it.each(JSON_TYPES)(`${mime} with a %s value round-trips unchanged`, (label, value) => {
-      // `toStrictEqual` on the whole item: `kind`, `value`, and the absence of any
-      // other field. A weaker matcher would let the projection add a `text`/`mime`
-      // field and still pass, which is how the mime rewrite went unnoticed.
-      expect(project(mime, value), `${mime} / ${label}`).toStrictEqual({ kind: 'json', value });
+      // `toStrictEqual` on the whole item: `kind`, `value`, `warnings`, and the
+      // absence of any other field. A weaker matcher would let the projection add a
+      // `text`/`mime` field and still pass, which is how the mime rewrite went
+      // unnoticed. `warnings` is asserted explicitly rather than skipped because it
+      // is now part of the item's shape: a value that needs no warning must say so
+      // with an empty array, not by omitting the field (review v9 V9-5).
+      expect(project(mime, value), `${mime} / ${label}`).toStrictEqual({ kind: 'json', value, warnings: [] });
     });
   }
 
@@ -675,6 +708,13 @@ describe('[P1-b] text-bearing mimes are narrowed before they reach the model', (
       [{ outputType: 'display_data', data: { 'image/png': 123, 'text/plain': 5 }, metadata: {} }],
       options,
     );
-    expect(mapped.items[0]).toMatchObject({ kind: 'image', text_fallback: '' });
+    // The fallback describes the IMAGE problem instead of the unusable
+    // `text/plain` value: an empty string here reads as "the image is empty",
+    // which is the distinction v8 V8-3 added and v9's matrix keeps (the field is
+    // never filled with `5`, the stringified non-string value).
+    const item = mapped.items[0];
+    expect(item).toMatchObject({ kind: 'image' });
+    expect(typeof (item as { text_fallback: string }).text_fallback).toBe('string');
+    expect((item as { text_fallback: string }).text_fallback).not.toContain('5');
   });
 });

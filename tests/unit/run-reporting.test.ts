@@ -5,7 +5,7 @@
 // deleting the actual guard from `run.ts` left the suite green — the reviewer's
 // mutation M1 (review v8 V8-4). A guard that cannot be made to fail is not a guard.
 import { EventEmitter } from 'node:events';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -48,7 +48,10 @@ function docWithCell(cell: Record<string, unknown>): ReturnType<typeof parseNote
 
 describe('[P1-a] a negative CELL execution_count is refused by the gate', () => {
   it('the structural gate reports it, with the count in the detail', () => {
-    const doc = docWithCell({ execution_count: -1 });
+    const doc = docWithCell({
+      execution_count: -1,
+      outputs: [{ output_type: 'stream', name: 'stdout', text: 'ran\n' }],
+    });
     expect(findStructuralProblem(doc.doc)).toMatchObject({
       cell_index: 0,
       rule: 'execution_count_negative',
@@ -77,16 +80,42 @@ describe('[P1-a] a negative CELL execution_count is refused by the gate', () => 
     }
   });
 
-  it('a rewritten cell carrying a negative count fails the write (D-037 rule 2)', () => {
+  it('[V9-8] the rule is about a count that has outputs to belong to', () => {
+    // v9 V9-8 moved the boundary from "this REQUEST emptied the outputs" to "this CELL
+    // has no outputs". The request-shaped version accepted the file for exactly one
+    // call and then refused the model's next edit with the rule the hint had just said
+    // was handled; the cell-shaped version is stable, which is what makes the hint's
+    // promise true. The count itself is untouched, as SPEC §4.5 rule 5 requires.
+    const withOutputs = docWithCell({
+      execution_count: -1,
+      outputs: [{ output_type: 'stream', name: 'stdout', text: 'stale\n' }],
+    });
+    expect(findStructuralProblem(withOutputs.doc)).toMatchObject({ rule: 'execution_count_negative' });
+    // Empty outputs, and no outputs key at all: nothing for the count to belong to.
+    expect(findStructuralProblem(docWithCell({ execution_count: -1, outputs: [] }).doc)).toBeNull();
+    expect(findStructuralProblem(docWithCell({ execution_count: -1 }).doc)).toBeNull();
+  });
+
+  it('a rewritten cell that KEEPS its outputs and a negative count fails the write (D-037 rule 2)', () => {
     // The gate only judges the cells a write is responsible for, so this is the
     // exact contradiction the review found: the cell IS in scope and the file IS
     // invalid, yet the edit succeeded.
-    const doc = docWithCell({ execution_count: -1 });
+    const doc = docWithCell({
+      execution_count: -1,
+      outputs: [{ output_type: 'stream', name: 'stdout', text: 'stale\n' }],
+    });
     const serialized = JSON.stringify({
       nbformat: 4,
       nbformat_minor: 5,
       metadata: {},
-      cells: [{ cell_type: 'code', id: 'c0', metadata: {}, source: 'x = 2', outputs: [], execution_count: -1 }],
+      cells: [{
+        cell_type: 'code',
+        id: 'c0',
+        metadata: {},
+        source: 'x = 2',
+        outputs: [{ output_type: 'stream', name: 'stdout', text: 'stale\n' }],
+        execution_count: -1,
+      }],
     });
     expect(() => {
       selfCheckNotebook(serialized, hasher, {
@@ -141,11 +170,15 @@ describe('[V7-2][V8-10] output_truncated is emitted once, and carries both facts
   // from `run.ts` kept the suite green (review v8 V8-4, mutation M1) — the same class
   // of fake guard as a source-text assertion, only harder to notice.
 
-  it('reports a dropped value', () => {
-    expect(outputTruncatedWarning(['text/plain'], 0)).toEqual({
+  it('reports a dropped value, naming the cell it came from', () => {
+    expect(outputTruncatedWarning([{ cellIndex: 3, mime: 'text/plain' }], 0)).toEqual({
       code: 'output_truncated',
       message: expect.stringContaining('dropped 1'),
     });
+    // V9-7: the cell index is part of the fact. Without it the model is told a value
+    // was lost but not where, which is what D-042 claimed the message did.
+    expect(outputTruncatedWarning([{ cellIndex: 3, mime: 'text/plain' }], 0)!.message)
+      .toContain('cell 3: text/plain');
   });
 
   it('reports truncation', () => {
@@ -159,17 +192,40 @@ describe('[V7-2][V8-10] output_truncated is emitted once, and carries both facts
     // V8-10: the drop notice used to be pushed first and the truncation notice was
     // deduped away, so a call that had lost a value AND truncated an output told the
     // model about only one of them.
-    const warning = outputTruncatedWarning(['image/png', 'text/plain'], 3);
+    const warning = outputTruncatedWarning(
+      [{ cellIndex: 0, mime: 'image/png' }, { cellIndex: 1, mime: 'text/plain' }],
+      3,
+    );
     expect(warning).not.toBeNull();
     expect(warning!.message).toContain('dropped 2');
     expect(warning!.message).toContain('3 output(s) exceeded');
-    expect(warning!.message).toContain('image/png');
+    expect(warning!.message).toContain('cell 0: image/png');
+    expect(warning!.message).toContain('cell 1: text/plain');
   });
 
-  it('deduplicates the mime names (one value per mime is not two drops)', () => {
-    const warning = outputTruncatedWarning(['text/plain', 'text/plain', 'text/plain'], 0);
+  it('deduplicates one cell losing the same mime twice', () => {
+    const warning = outputTruncatedWarning(
+      [
+        { cellIndex: 1, mime: 'text/plain' },
+        { cellIndex: 1, mime: 'text/plain' },
+        { cellIndex: 1, mime: 'text/plain' },
+      ],
+      0,
+    );
     expect(warning!.message).toContain('dropped 1');
     expect(warning!.message.match(/text\/plain/g)).toHaveLength(1);
+  });
+
+  it('does NOT deduplicate the same mime lost by two different cells', () => {
+    // The distinction the flattened `string[]` erased: two cells losing a value is
+    // two facts, and a model told "one" will go looking in one place (review v9 V9-7).
+    const warning = outputTruncatedWarning(
+      [{ cellIndex: 0, mime: 'text/plain' }, { cellIndex: 2, mime: 'text/plain' }],
+      0,
+    );
+    expect(warning!.message).toContain('dropped 2');
+    expect(warning!.message).toContain('cell 0: text/plain');
+    expect(warning!.message).toContain('cell 2: text/plain');
   });
 
   it('is silent when nothing was lost — the case a blanket push would break', () => {
@@ -199,7 +255,7 @@ describe('[V7-2][V8-10] output_truncated is emitted once, and carries both facts
   });
 });
 
-describe('[V7-8] a timeout detail carries the warnings gathered so far', () => {
+describe('[V7-8][V9-7] a timeout detail carries the warnings gathered so far', () => {
   it('the exec_timeout detail keeps a warnings array on the wire', async () => {
     // V8-4: this used to assert SOURCE TEXT (`expect(source).toContain('warnings:')`),
     // which passes even when the line sits inside a comment. It drives the real
@@ -210,7 +266,7 @@ describe('[V7-8] a timeout detail carries the warnings gathered so far', () => {
     const error = new IpynbError('exec_timeout', 'cell execution timed out', {
       cell_index: 2,
       completed_cells: 2,
-      warnings: [{ code: 'output_truncated', message: 'dropped 1 mime value(s) (text/plain)' }],
+      warnings: [{ code: 'output_truncated', message: 'dropped 1 mime value(s) (cell 1: text/plain)' }],
     });
     const outcome = await (await import('../../src/mcp/tools/result.js')).runTool(async () => {
       throw error;
@@ -221,8 +277,35 @@ describe('[V7-8] a timeout detail carries the warnings gathered so far', () => {
     expect(body['code']).toBe('exec_timeout');
     // The point of V7-8: the earlier cells' warnings must survive into the failure.
     expect(body['detail']).toMatchObject({
-      warnings: [{ code: 'output_truncated', message: 'dropped 1 mime value(s) (text/plain)' }],
+      warnings: [{ code: 'output_truncated', message: 'dropped 1 mime value(s) (cell 1: text/plain)' }],
     });
+  });
+
+  it('[V9-7] the run assembles those warnings in ONE place, used on every exit', async () => {
+    // V8-4's finding was that this file proved the PROJECTION and nothing about the
+    // run: deleting the call site in `run.ts` kept everything green. The v9 shape
+    // routed both exits through `callWarnings`, so what has to be pinned is that the
+    // helper exists, is what the timeout path calls, and that the assembly is not
+    // inlined back into the happy path.
+    const source = await readFile(new URL('../../src/run.ts', import.meta.url), 'utf8');
+    expect(source).toContain('function pushCallWarnings(');
+    // Call sites: the timeout exit and the successful exit, and nothing else pushes
+    // `outputTruncatedWarning` directly.
+    const assemblyCalls = source.match(/pushCallWarnings\(/g) ?? [];
+    expect(assemblyCalls.length).toBeGreaterThanOrEqual(3); // 1 definition + 2 exits
+    // Exactly one CALL, which must be inside the helper: a second one would be the
+    // inlined happy-path shape coming back.
+    expect(source.match(/= outputTruncatedWarning\(/g) ?? []).toHaveLength(1);
+    const helperStart = source.indexOf('function pushCallWarnings(');
+    const helperEnd = source.indexOf('\n}', helperStart);
+    expect(source.indexOf('= outputTruncatedWarning(')).toBeGreaterThan(helperStart);
+    expect(source.indexOf('= outputTruncatedWarning(')).toBeLessThan(helperEnd);
+    // The truncation fact must be assembled BEFORE the timeout throw, or the timeout
+    // path ships an empty list again (the regression this test exists for).
+    const timeoutThrow = source.indexOf("throw new IpynbError('exec_timeout'");
+    const timeoutAssembly = source.indexOf('pushCallWarnings(warnings, executed, droppedMimes);');
+    expect(timeoutAssembly).toBeGreaterThan(0);
+    expect(timeoutAssembly).toBeLessThan(timeoutThrow);
   });
 });
 

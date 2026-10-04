@@ -23,7 +23,20 @@ import { RunStore } from '../../src/mcp/run-store.js';
 import { PathFence } from '../../src/fs/fence.js';
 import { nbformatSkipReason, validateNotebook } from './nbformat-validator.js';
 import { createLogger } from '../../src/log.js';
-import { BASE_PYTHON, VENV_PY, prepareVenv } from './test-venv.js';
+import { BASE_PYTHON, VENV_PY, prepareVenv, resolvedTestInterpreter } from './test-venv.js';
+
+/**
+ * The interpreter the EXTERNAL AUTHORITY must run in.
+ *
+ * It is the interpreter this file's runs actually use, not the venv path: the resolve
+ * falls back to the base interpreter whenever the venv cannot serve the sidecar, and
+ * asking `VENV_PY` about nbformat in that situation reported an ENVIRONMENT gap as a
+ * product failure (review v8 V8-11, still open in v9). `prepareVenv` runs in
+ * `beforeAll`, so by the time any case asks this question the answer is final.
+ */
+function authorityInterpreter(): string {
+  return resolvedTestInterpreter();
+}
 
 const WINDOWS = process.platform === 'win32';
 // An interpreter that exists but CANNOT import ipykernel (I17). If absent on
@@ -907,7 +920,7 @@ describe('[FID-1] the file the run writes is valid nbformat', () => {
     // and FAILS when the environment requires it: an external authority that is
     // merely optional degrades to "nothing was checked" on a bare machine, which
     // is exactly what happened in CI (review v7 P0-a).
-    const skip = nbformatSkipReason(VENV_PY);
+    const skip = nbformatSkipReason(authorityInterpreter());
     if (skip !== null) {
       context.skip(skip);
       return;
@@ -945,7 +958,7 @@ describe('[FID-1] the file the run writes is valid nbformat', () => {
     expect('execution_count' in executeResult!).toBe(true);
 
     {
-      const validation = validateNotebook(nb, VENV_PY);
+      const validation = validateNotebook(nb, authorityInterpreter());
       expect(validation.ok, `nbformat.validate rejected the written file:\n${validation.message}`).toBe(true);
     }
 
@@ -956,7 +969,7 @@ describe('[FID-1] the file the run writes is valid nbformat', () => {
   }, 180_000);
 
   it('[FID-3] code -> markdown leaves a document the validator accepts', async (context) => {
-    const skip = nbformatSkipReason(VENV_PY);
+    const skip = nbformatSkipReason(authorityInterpreter());
     if (skip !== null) {
       context.skip(skip);
       return;
@@ -978,7 +991,7 @@ describe('[FID-1] the file the run writes is valid nbformat', () => {
     expect('outputs' in onDisk.cells[0]!).toBe(false);
 
     {
-      const validation = validateNotebook(nb, VENV_PY);
+      const validation = validateNotebook(nb, authorityInterpreter());
       expect(validation.ok, `nbformat.validate rejected the converted file:\n${validation.message}`).toBe(true);
     }
   }, 120_000);

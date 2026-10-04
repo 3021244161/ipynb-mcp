@@ -11,6 +11,7 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import type { IpynbConfig } from '../../src/config.js';
+import { findStructuralProblem, parseNotebook } from '../../src/core/parse.js';
 import { hasher } from '../../src/hash.js';
 import { KernelRegistry } from '../../src/kernel/registry.js';
 import type { ToolContext } from '../../src/mcp/context.js';
@@ -474,7 +475,7 @@ describe('[V8-14] the refusal must recommend an operation that actually works', 
     return nb;
   }
 
-  it('step 1: rewriting the cell is refused, and the hint names what works', async () => {
+  it('step 1: rewriting the cell is refused, and the hint states what the operations do', async () => {
     const nb = await negativeCountNotebook('v814-a.ipynb');
     const { isError, body } = await runEdit({
       path: nb,
@@ -484,14 +485,18 @@ describe('[V8-14] the refusal must recommend an operation that actually works', 
     expect(body['code']).toBe('selfcheck_failed');
     const detail = body['detail'] as Record<string, unknown>;
     expect(detail['problem']).toMatchObject({ rule: 'execution_count_negative' });
-    // The hint must name an operation that clears THIS rule. It used to say
-    // "clear_outputs or set_cell_type" for every rule.
+    // V9-8: the hint must be TRUE, not merely mention an operation. v8 asserted
+    // `toContain('clear_outputs')` and the sentence it pinned claimed the operation
+    // "resets the cell execution count" — which SPEC §4.5 rule 5 forbids, which
+    // `edit.ts` deliberately does not do, and which step 2 below now measures.
     const hint = String(detail['hint'] ?? '');
     expect(hint).toContain('execution_count_negative');
     expect(hint).toContain('clear_outputs');
+    expect(hint).toContain('does not change the count');
+    expect(hint).toContain('set_cell_type');
   });
 
-  it('step 2: the recommended clear_outputs SUCCEEDS and leaves a valid file', async () => {
+  it('step 2: the recommended clear_outputs SUCCEEDS and leaves a file the gate accepts', async () => {
     const nb = await negativeCountNotebook('v814-b.ipynb');
     const { isError, body } = await runEdit({
       path: nb,
@@ -503,15 +508,30 @@ describe('[V8-14] the refusal must recommend an operation that actually works', 
       outputs_cleared: true,
     });
 
-    // SPEC §4.5 rule 5: the count is NOT touched by this operation…
+    // SPEC §4.5 rule 5: the count is NOT touched by this operation. That is exactly
+    // what the hint has to say, and the reason the file is nevertheless accepted:
+    // with the outputs gone, the count is no longer part of any rule the gate applies.
     const written = JSON.parse(await readFile(nb, 'utf8')) as {
       cells: Array<Record<string, unknown>>;
     };
     expect(written.cells[0]!['outputs']).toEqual([]);
     expect(written.cells[0]!['execution_count']).toBe(-1);
-    // …and the file is still not valid nbformat, which is the honest outcome: the
-    // count is a pre-existing defect this operation is specified not to fix. What
-    // must NOT happen is the operation being refused.
+    expect(findStructuralProblem(parseNotebook(new TextEncoder().encode(await readFile(nb, 'utf8')), hasher).doc))
+      .toBeNull();
+  });
+
+  it('step 2b: the hint is a promise — a SECOND edit of the cleared cell is not refused', async () => {
+    // The reviewer's four-step session: after following the hint, the model carries
+    // on working. v8's version of this file left the notebook INVALID, so the next
+    // unrelated edit would have failed again.
+    const nb = await negativeCountNotebook('v814-b2.ipynb');
+    await runEdit({ path: nb, ops: [{ op: 'clear_outputs', cell_index: 0 }] });
+    const { isError, body } = await runEdit({
+      path: nb,
+      ops: [{ op: 'replace_source', cell_index: 0, expected_text: 'x = 1', new_text: 'x = 42' }],
+    });
+    expect(body['code'], JSON.stringify(body)).toBeUndefined();
+    expect(isError).toBeUndefined();
   });
 
   it('step 3: the other recommended operation (set_cell_type) also works', async () => {
@@ -551,14 +571,15 @@ describe('[V8-14] the refusal must recommend an operation that actually works', 
     });
   });
 
-  it('the skip is scoped to the cleared cell, not to the whole request', async () => {
-    // A request that clears ONE cell's outputs while rewriting another: the rewritten
-    // cell keeps its outputs, so the count rule still applies to it. Without this the
-    // implementation could pass everything above by skipping the rule whenever any
-    // cell was cleared.
+  it('the skip is scoped to the cell whose rule is gone, not to the whole request', async () => {
+    // A request that clears ONE cell's outputs while rewriting another. Cell 1's
+    // outputs are NOT empty, so its negative count still belongs to something and the
+    // rule still applies to it. Without this the implementation could pass everything
+    // above by skipping the rule whenever any cell was cleared.
     const nb = await negativeCountNotebook('v814-f.ipynb');
     const doc = JSON.parse(await readFile(nb, 'utf8')) as { cells: Array<Record<string, unknown>> };
     doc.cells[1]!['execution_count'] = -5;
+    doc.cells[1]!['outputs'] = [{ output_type: 'stream', name: 'stdout', text: 'kept\n' }];
     await writeFile(nb, JSON.stringify(doc));
 
     const { isError, body } = await runEdit({
@@ -570,10 +591,29 @@ describe('[V8-14] the refusal must recommend an operation that actually works', 
     });
     expect(isError).toBe(true);
     expect(body['code']).toBe('selfcheck_failed');
-    // The refusal points at cell 1 — the one that was NOT cleared.
+    // The refusal points at cell 1 — the one that still has outputs to carry the count.
     expect((body['detail'] as Record<string, unknown>)['problem']).toMatchObject({
       rule: 'execution_count_negative',
       cell_index: 1,
     });
+  });
+
+  it('[V9-8] the escape hatch is stable: the NEXT edit of the cleared cell is accepted', async () => {
+    // The reviewer's four-step session ends by carrying on. v8's fix made the cleared
+    // cell acceptable for exactly one call (`outputs_cleared` is a property of the
+    // REQUEST), so the model's next edit was refused by the rule it had just been told
+    // was handled (review v9 V9-8). Both halves are asserted here: the count is still
+    // in the file (SPEC §4.5 rule 5), and the rule no longer applies to that cell.
+    const nb = await negativeCountNotebook('v814-g.ipynb');
+    await runEdit({ path: nb, ops: [{ op: 'clear_outputs', cell_index: 0 }] });
+    const { isError, body } = await runEdit({
+      path: nb,
+      ops: [{ op: 'replace_source', cell_index: 0, expected_text: 'x = 1', new_text: 'x = 2' }],
+    });
+    expect(body['code'], JSON.stringify(body)).toBeUndefined();
+    expect(isError).toBeUndefined();
+    const written = JSON.parse(await readFile(nb, 'utf8')) as { cells: Array<Record<string, unknown>> };
+    expect(written.cells[0]!['execution_count']).toBe(-1);
+    expect(written.cells[0]!['outputs']).toEqual([]);
   });
 });
