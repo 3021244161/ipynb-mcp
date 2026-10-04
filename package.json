@@ -25,6 +25,7 @@
     "test": "vitest run",
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "smoke": "node scripts/e2e-smoke.mjs",
+    "check:release": "node scripts/release-check.mjs",
     "prepack": "tsc -p tsconfig.json",
     "prepublishOnly": "npm run typecheck && npm run lint && npm test && npm run check:package"
   },
