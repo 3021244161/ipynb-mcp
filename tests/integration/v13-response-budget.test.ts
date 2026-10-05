@@ -48,14 +48,19 @@ afterAll(async () => {
   await rm(workspace, { recursive: true, force: true });
 });
 
-/** A notebook with a single stored output of `chars` characters, written directly as text. */
-async function writeLargeNotebook(name: string, chars: number): Promise<string> {
+/**
+ * A notebook with a single stored output, written directly as text.
+ *
+ * `chars` builds an ASCII payload of that many characters; `literal` overrides it with any string, which is
+ * how the escaping-heavy cases below are built. Both become a `display_data` with a `text/plain` value, NOT
+ * a `stream`: the only per-item cap in the server applied to `stream` items, so a large `text/plain`,
+ * `text/html` or `application/json` output went to the client unchecked. A stream fixture would have been
+ * truncated by `inline_text_chars` and the frame budget would never have mattered — the blind spot that hid
+ * the original defect through a whole review round, and then hid the ESTIMATOR defect again because every
+ * fixture was `'x'.repeat(...)`.
+ */
+async function writeLargeNotebook(name: string, chars: number, literal?: string): Promise<string> {
   const target = path.join(workspace, name);
-  // The output is a `display_data` with a `text/plain` value, NOT a `stream`. That detail is the whole
-  // reason this case exists: the only per-item cap in the server applied to `stream` items, so a large
-  // `text/plain`, `text/html` or `application/json` output went to the client unchecked. A stream
-  // fixture would have been truncated by `inline_text_chars` and the frame budget would never have
-  // mattered — the same blind spot that hid the defect through a whole review round.
   const payload = JSON.stringify({
     cells: [
       {
@@ -65,7 +70,7 @@ async function writeLargeNotebook(name: string, chars: number): Promise<string> 
         metadata: {},
         outputs: [
           {
-            data: { 'text/plain': 'x'.repeat(chars) },
+            data: { 'text/plain': literal ?? 'x'.repeat(chars) },
             metadata: {},
             output_type: 'display_data',
           },
@@ -160,5 +165,121 @@ describe('[V13-1] a response that would exceed the client frame limit is degrade
     // The connection is still usable, which is the property that matters.
     const after = await callRead(target, 'none');
     expect(after.body['cell_count']).toBe(1);
+  }, 180_000);
+});
+
+/**
+ * [V14-13] The estimate must be in the unit the CLIENT enforces, on the content this project's users
+ * actually have.
+ *
+ * The first version measured UTF-16 code units and ignored JSON escaping, so payloads made of backslashes,
+ * quotes, control characters or non-ASCII text were estimated 2-6x low and went out whole: measured, 3 MiB
+ * of backslashes killed the client while 3 MiB of ASCII was fine, and a matrix of Chinese/emoji/latin-1
+ * payloads all killed it. Chinese notebooks and Windows paths are the norm here, so this is not an edge —
+ * it is the half of V13-1 that stayed broken.
+ *
+ * The fixtures are the key difference from the v13 cases: those all used `'x'.repeat(...)`, which is exactly
+ * why they passed against the broken estimator.
+ */
+describe('[V14-13] escaping-heavy content is degraded before it can kill the client', () => {
+  const shapes: Array<[string, string]> = [
+    ['backslashes', '\\'.repeat(3 * 1024 * 1024)],
+    ['double quotes', '"'.repeat(3 * 1024 * 1024)],
+    ['CJK', '中'.repeat(4 * 1024 * 1024)],
+    ['control characters', '\u0001'.repeat(2 * 1024 * 1024)],
+    // Sized to overshoot the 8 MiB budget AFTER escaping, which for this content is roughly 2x: a fixture
+    // that stays under the budget proves nothing about degradation (the first version of this line was
+    // ~4.7 MB encoded, fitted comfortably, produced no warning, and the assertion failed for the right
+    // reason — so the assertion stays and the fixture grew).
+    ['windows paths', 'C:\\Users\\somebody\\notebooks\\data\\file.csv\n'.repeat(400_000)],
+  ];
+
+  for (const [label, payload] of shapes) {
+    it(`[V14-13] a ${label} output is degraded, and the session survives`, async () => {
+      const target = await writeLargeNotebook(`escape-${label.replace(/[^a-z]/gi, '')}.ipynb`, 0, payload);
+      const { bytes, body } = await callRead(target, 'full');
+
+      // Measured the way the client measures it: UTF-8 bytes of the delivered text.
+      expect(bytes, `${label}: response was ${(bytes / 1024 / 1024).toFixed(2)} MiB`).toBeLessThan(10 * 1024 * 1024);
+      const warnings = (body['warnings'] ?? []) as Array<{ code: string; message: string }>;
+      expect(
+        warnings.some((warning) => warning.code === 'output_truncated'),
+        `${label}: warnings were ${JSON.stringify(warnings).slice(0, 200)}`,
+      ).toBe(true);
+
+      // The link is alive, which is the difference between "degraded" and "the session died".
+      const after = await callRead(target, 'none');
+      expect(after.body['cell_count']).toBe(1);
+    }, 180_000);
+  }
+});
+
+/**
+ * [V14-12] A FAILING run must be able to deliver its response too.
+ *
+ * The budget first ran on the success path only, so the failure paths were exactly the ones still
+ * unbounded — and `detail.executed[]` carries the outputs of every cell that completed. Measured by the
+ * reviewer: cell 0 produces a 12 MiB output, cell 1 sleeps past the timeout, and the response dies with
+ * `-32000 Connection closed`. That is the worst shape of all, because the file has ALREADY been written
+ * back while the model learns neither that the run timed out nor which cells completed (SPEC §4.7 rule 5,
+ * §4.8 rule 3).
+ *
+ * The fixture has to make the big-output cell ACTUALLY RUN — the reviewer's own first attempt only ran the
+ * sleeping cell, so `detail.executed` held no large output and the response was small. That correction is
+ * why this case asserts the large output is really in the executed set.
+ */
+describe('[V14-12] a failed run still fits the frame', () => {
+  it('[V14-12] a large completed output plus a timeout delivers a bounded, readable failure', async () => {
+    const target = path.join(workspace, 'timeout-large.ipynb');
+    await writeFile(
+      target,
+      `${JSON.stringify({
+        cells: [
+          {
+            cell_type: 'code',
+            execution_count: null,
+            id: 'c0',
+            metadata: {},
+            outputs: [],
+            // A 12 MiB `text/plain` value, produced by the cell that runs FIRST and completes.
+            source: ["display({'text/plain': 'A' * 12 * 1024 * 1024}, raw=True)"],
+          },
+          {
+            cell_type: 'code',
+            execution_count: null,
+            id: 'c1',
+            metadata: {},
+            outputs: [],
+            source: ['import time\ntime.sleep(60)'],
+          },
+        ],
+        metadata: {
+          kernelspec: { display_name: 'Python 3', language: 'python', name: 'python3' },
+          language_info: { name: 'python' },
+        },
+        nbformat: 4,
+        nbformat_minor: 5,
+      })}\n`,
+      'utf8',
+    );
+
+    const result = await client.callTool({
+      name: 'notebook_run',
+      arguments: { path: target, cell_selector: 'all', timeout_seconds: 3, write_outputs: true },
+    });
+    const blocks = (result.content ?? []) as Array<{ type: string; text?: string }>;
+    const text = blocks.find((block) => block.type === 'text')?.text ?? '';
+    expect(Buffer.byteLength(text, 'utf8')).toBeLessThan(10 * 1024 * 1024);
+
+    // The failure must still be READABLE: the code, and the fact that cell 0 completed. A response that
+    // merely fits but says nothing would satisfy the size assertion and lose the point of the report.
+    const body = JSON.parse(text) as Record<string, unknown>;
+    expect(String(body['code'] ?? body['error'] ?? ''), text.slice(0, 200)).toContain('exec_timeout');
+    const detail = (body['detail'] ?? {}) as Record<string, unknown>;
+    expect(Array.isArray(detail['executed'])).toBe(true);
+
+    // And the session survives, which is what the reviewer's case lost.
+    const after = await callRead(target, 'none');
+    expect(after.body['cell_count']).toBe(2);
   }, 180_000);
 });

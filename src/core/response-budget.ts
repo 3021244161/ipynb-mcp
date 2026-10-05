@@ -1,81 +1,141 @@
-// The whole-response budget (review v13 V13-1).
+// The whole-response budget (review v13 V13-1; rewritten for v14 V14-11/V14-12/V14-13).
 //
-// WHY THIS EXISTS. Every tool result travels to the client as ONE newline-delimited JSON-RPC frame,
-// and the MCP SDK's `ReadBuffer` rejects a frame larger than `STDIO_DEFAULT_MAX_BUFFER_SIZE`
-// (10 MiB) by throwing — the client's connection dies with `McpError -32000: Connection closed` and
-// every later call answers "Not connected". Nothing in this server bounded a response: the only
-// limit was `inline_text_chars`, and it applied to `stream` items ONLY, so a `text/plain`,
-// `text/html`, `application/json` or image output of any size went straight through. Measured with a
-// real SDK client: 9.9 MiB succeeded silently, 10.2 MiB killed the session, and 60 small items
-// totalling 17.6 MiB killed it too — the cliff is on the FRAME, not on any one item.
+// WHY THIS EXISTS. Every tool result travels to the client as ONE newline-delimited JSON-RPC frame, and
+// the MCP SDK's `ReadBuffer` rejects a frame larger than `STDIO_DEFAULT_MAX_BUFFER_SIZE` by throwing —
+// the client's connection dies with `McpError -32000: Connection closed` and every later call answers
+// "Not connected". Nothing in this server bounded a response: the only limit was `inline_text_chars`, and
+// it applied to `stream` items ONLY, so a `text/plain`, `text/html`, `application/json` or image output of
+// any size went straight through. Measured with a real SDK client: 9.9 MiB succeeded silently, 10.2 MiB
+// killed the session, and 60 small items totalling 17.6 MiB killed it too — the cliff is on the FRAME, not
+// on any one item. The worst instance is a `notebook_run`: the outputs are written to the user's file
+// successfully and the model never learns the run happened.
 //
-// The worst version of that is a `notebook_run`: the server writes the outputs to the user's file
-// successfully, then the model never learns the run happened, because the response carrying the news
-// was too big to deliver.
+// So this module enforces a byte budget on the frame BEFORE it is sent, degrading the payload rather than
+// truncating the JSON (which would hand the model a parse error). Everything it removes is reported:
+// SPEC §5.4's rule is that truncation is never silent.
 //
-// So this module enforces a byte budget on the serialized frame, BEFORE it is sent, by degrading the
-// payload rather than truncating the JSON (which would hand the model a parse error). Everything it
-// removes is reported: the SPEC §5.4 rule is that truncation is never silent, and the mechanism for
-// that already existed as `truncated` / `truncated_at_chars` on output items plus the
-// `output_truncated` warning code — this extends their reach from "stream items over
-// inline_text_chars" to "any item over what the transport can carry".
+// A DEVIATION, recorded as D-065: SPEC §5.4 and §7 describe truncation only for stream thresholds and say
+// nothing about a total response size, because the 10 MiB ceiling lives in the transport (the SDK), not in
+// the format. Per AGENTS §0 the deviation is registered rather than resolved by editing the SPEC.
 //
-// A DEVIATION, recorded as D-065: SPEC §5.4 and §7 describe truncation only for stream thresholds and
-// say nothing about a total response size, because the 10 MiB ceiling lives in the transport (the
-// SDK), not in the format. Per AGENTS §0 the deviation is registered rather than resolved by editing
-// the SPEC.
+// THREE THINGS THE FIRST VERSION GOT WRONG (v14: all three found by review, all three measured, and the
+// first was worse than the defect it was written to fix):
+//
+//   V14-11  THE TRUNCATION LOOP DID NOT CONVERGE. `keep = Math.max(200, length - overshoot - 512)` could
+//           exceed the field's own length, so the "truncated" value was the original PLUS a marker: every
+//           pass made the payload BIGGER, and the synchronous `for (;;)` never ended. The event loop was
+//           held for good: the server stopped answering ANY request, not just that one. A loop whose job is
+//           to make a payload smaller must PROVE each pass made progress.
+//   V14-12  The budget ran on the SUCCESS path only. Error responses were stringified raw, and
+//           `detail.executed[]` carries outputs, so a run that produced a large output and then timed out
+//           sent an unbounded frame — the worst shape of all, because the file had already been written
+//           back while the model learned neither the timeout nor which cells completed.
+//   V14-13  THE SIZE ESTIMATE MEASURED THE WRONG THING. It counted UTF-16 code units and ignored JSON
+//           escaping, while the SDK's limit is the UTF-8 BYTE length of the serialized line. A backslash,
+//           quote or control character is escaped as `\u00XX` — one input character becoming six bytes — so
+//           the estimate was low by 2-6x on exactly the content this project's users have (Chinese
+//           notebooks, Windows paths, printed JSON). Measured: 3 MiB of backslashes still killed the client
+//           while 3 MiB of ASCII was fine.
+//
+// `tests/unit/response-budget.test.ts` pins all three, each with the mutation that makes it red.
 
 import { createWarning, type JsonValue } from './errors.js';
 
 /** The warning every degradation is reported through — `output_truncated` is the existing code. */
 const TRUNCATION_CODE = 'output_truncated';
 
+/** Appended to whatever survives a truncation, so the model can see the value was cut. */
+export const TRUNCATION_MARKER = '…[truncated to fit the response budget]';
+
+/**
+ * Hard stop for each degradation loop.
+ *
+ * A named cap turns "this cannot terminate" into a bounded, throwable condition. The loops are written to
+ * converge — every pass must strictly reduce the measured size — so this is a backstop against a future
+ * edit, not part of the algorithm. Generous on purpose: thousands of legitimate passes happen when a
+ * payload is made of thousands of small items.
+ */
+const MAX_DEGRADATION_PASSES = 10_000;
+
+/** The fields that carry user text, and so are the ones worth shortening when the frame is too big. */
+const TEXT_FIELDS = ['text', 'value', 'html'] as const;
+
 export interface ResponseBudgetResult {
   /** The payload to serialize. Equal to the input when nothing had to be removed. */
   readonly payload: JsonValue;
   /**
-   * How much the delivery had to give up, as warning entries to append to the payload's `warnings`.
-   * Empty when the payload fits.
+   * How much the delivery had to give up, as warning entries to append to the payload's `warnings`. Empty
+   * when the payload fits.
    */
   readonly warnings: readonly JsonValue[];
-  /** The estimated serialized size after degradation, in bytes. */
+  /** The measured size after degradation, in bytes of the serialized frame. */
   readonly estimatedBytes: number;
   /** True when anything was removed, so callers can tell "fits" from "was made to fit". */
   readonly degraded: boolean;
 }
 
 /**
- * How many bytes a value costs once serialized.
+ * Bytes this string costs inside a JSON frame, ESCAPING INCLUDED.
  *
- * An ESTIMATE, and deliberately a conservative one: it counts a JavaScript string's UTF-16 length
- * rather than its UTF-8 byte length (so non-ASCII costs more here than on the wire) and ignores that
- * `JSON.stringify` escapes some characters. Overestimating is the safe direction — the ceiling is a
- * hard cliff, so being a little pessimistic costs a few characters of context while being optimistic
- * costs the whole session.
+ * The SDK measures `Buffer.byteLength(line)` where `line` is `JSON.stringify(message)`, and a string inside
+ * that is escaped AGAIN by the outer serialization. So one input character can cost six bytes on the wire:
+ * `"` and `\` become `\"`/`\\` (four bytes each counting their own escape) and a control character becomes
+ * `\u00XX` (twelve, because the backslash is itself escaped).
+ *
+ * This mirrors escaping rather than approximating it, because the budget's whole value is that the estimate
+ * is never LOW: an estimate that is low lets through a frame that kills the client, which is the defect
+ * this module exists to remove (v14 V14-13).
+ */
+export function escapedByteLength(value: string): number {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code === 0x22 || code === 0x5c) {
+      bytes += 4;
+    } else if (code < 0x20) {
+      bytes += 12;
+    } else if (code < 0x80) {
+      bytes += 1;
+    } else if (code < 0x800) {
+      bytes += 2;
+    } else if (code >= 0xd800 && code <= 0xdbff) {
+      bytes += 3;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      bytes += 1;
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes + 2; // the surrounding quotes
+}
+
+/**
+ * Bytes this value costs once serialized into a frame.
+ *
+ * Not `JSON.stringify(value).length`: that is UTF-16 units of an already-escaped string, which is wrong in
+ * both directions on non-ASCII content.
  */
 export function estimatedJsonBytes(value: unknown): number {
-  if (value === null) {
+  if (value === null || value === undefined) {
     return 4;
   }
   switch (typeof value) {
     case 'string':
-      return value.length + 2; // quotes
+      return escapedByteLength(value);
     case 'number':
     case 'boolean':
       return String(value).length;
-    case 'undefined':
-      return 0;
     case 'object': {
       if (Array.isArray(value)) {
         let total = 2; // brackets
         for (const entry of value) {
-          total += estimatedJsonBytes(entry === undefined ? null : entry) + 1;
+          total += estimatedJsonBytes(entry) + 1; // comma
         }
         return total;
       }
       let total = 2; // braces
       for (const [key, entry] of Object.entries(value)) {
-        total += key.length + 3 + estimatedJsonBytes(entry) + 1;
+        total += escapedByteLength(key) + 1 + estimatedJsonBytes(entry) + 1; // colon + comma
       }
       return total;
     }
@@ -84,110 +144,29 @@ export function estimatedJsonBytes(value: unknown): number {
   }
 }
 
-/** The fields that carry user text, and so are the ones worth truncating when the frame is too big. */
-const TEXT_FIELDS = ['text', 'value', 'html'] as const;
-
-/**
- * Enforce `maxBytes` on a tool payload, reporting whatever had to be removed.
- *
- * `maxBytes` is the budget for the TEXT frame; image blocks are counted separately by the caller,
- * because they travel as their own content blocks and their degradation is a different decision
- * (drop the block, keep the `artifact_path` that the payload already carries).
- */
-export function enforceResponseBudget(payload: JsonValue, maxBytes: number): ResponseBudgetResult {
-  const initial = estimatedJsonBytes(payload);
-  if (initial <= maxBytes) {
-    return { payload, warnings: [], estimatedBytes: initial, degraded: false };
-  }
-
-  // Copy, so a caller holding the original cannot observe a half-degraded payload. The copy is
-  // shallow-then-structural: only the containers this function actually rewrites are cloned.
-  const working = structuredClone(payload) as Record<string, JsonValue>;
-  let size = initial;
-  let truncatedFields = 0;
-  let removedItems = 0;
-
-  /**
-   * Shrink the largest strings first.
-   *
-   * Largest-first is what makes the budget affordable: a run whose outputs are mostly small should
-   * lose the ONE enormous `text/plain` result rather than a hundred useful previews, and it reaches
-   * the budget in the fewest edits. Each pass recomputes nothing — the estimate is adjusted by the
-   * difference each edit makes.
-   */
-  for (;;) {
-    if (size <= maxBytes) {
-      break;
-    }
-    const biggest = findLargestTextField(working);
-    if (biggest === null) {
-      break;
-    }
-    const { container, key, length } = biggest;
-    // Give back the overshoot plus a margin, and keep at least a readable prefix so the model can see
-    // WHAT was truncated — a field reduced to nothing is indistinguishable from an absent one.
-    const overshoot = size - maxBytes;
-    const keep = Math.max(200, length - overshoot - 512);
-    container[key] = `${(container[key] as string).slice(0, keep)}…[truncated to fit the response budget]`;
-    size += estimatedJsonBytes(container[key]) - (length + 2);
-    truncatedFields += 1;
-  }
-
-  // Still too big with every text field cut down: the payload is made of many items, and the answer is
-  // to drop whole ones so the model gets a truthful, smaller document instead of an undeliverable one.
-  // Arrays of outputs are the only place where dropping is both safe and explainable.
-  for (;;) {
-    if (size <= maxBytes) {
-      break;
-    }
-    const target = findDroppableArray(working);
-    if (target === null) {
-      break;
-    }
-    const last = target.array.pop();
-    if (last === undefined) {
-      break;
-    }
-    size -= estimatedJsonBytes(last) + 1;
-    removedItems += 1;
-  }
-
-  const warnings: JsonValue[] = [];
-  if (truncatedFields > 0) {
-    // Counted separately from streams: a stream cut at `inline_text_chars` is the documented per-item
-    // limit, while these were cut because the WHOLE response would not have fitted. A client that
-    // wants the rest can narrow its request (fewer `cell_indexes`, `include_outputs: 'summary'`).
-    const warning = createWarning(
-      TRUNCATION_CODE,
-      `${String(truncatedFields)} text value(s) were truncated because the response exceeded the ${String(Math.floor(maxBytes / 1024 / 1024))} MiB response budget`,
-    );
-    warnings.push({ code: warning.code, message: warning.message });
-  }
-  if (removedItems > 0) {
-    const warning = createWarning(
-      TRUNCATION_CODE,
-      `${String(removedItems)} output item(s) were dropped because the response exceeded the ${String(Math.floor(maxBytes / 1024 / 1024))} MiB response budget; ask for fewer cells`,
-    );
-    warnings.push({ code: warning.code, message: warning.message });
-  }
-
-  if (warnings.length > 0) {
-    const existing = working['warnings'];
-    working['warnings'] = [...(Array.isArray(existing) ? existing : []), ...warnings];
-    size = estimatedJsonBytes(working);
-  }
-
-  return { payload: working, warnings, estimatedBytes: size, degraded: warnings.length > 0 };
+/** `8.00 MiB`, and never `0 MiB` for a budget that is merely small (v14 F8: the model read a false number). */
+function describeBudget(maxBytes: number): string {
+  const mib = maxBytes / 1024 / 1024;
+  return mib >= 1 ? `${mib.toFixed(2)} MiB` : `${String(Math.round(maxBytes / 1024))} KiB`;
 }
 
 interface TextField {
   readonly container: Record<string, JsonValue>;
   readonly key: (typeof TEXT_FIELDS)[number];
   readonly length: number;
+  /** Bytes this field costs now, so a rewrite is measured rather than assumed. */
+  readonly bytes: number;
 }
 
-/** The largest string still present in one of the text-carrying fields, or null if none remains. */
-function findLargestTextField(root: Record<string, JsonValue>): TextField | null {
+/**
+ * The largest string still present in a text-carrying field, or null if none is left to try.
+ *
+ * `skip` holds fields a pass already failed to shrink. Trying one of those again would recreate the
+ * non-convergence this module was rewritten to remove, so they are left untouched and the drop phase takes
+ * over: losing a whole item is worse for the model than losing part of one, but it is bounded, and a
+ * response that never arrives is worse than both.
+ */
+function findLargestTextField(root: Record<string, JsonValue>, skip: ReadonlySet<string>): TextField | null {
   let best: TextField | null = null;
   const visit = (node: unknown): void => {
     if (Array.isArray(node)) {
@@ -202,8 +181,12 @@ function findLargestTextField(root: Record<string, JsonValue>): TextField | null
     const record = node as Record<string, JsonValue>;
     for (const key of TEXT_FIELDS) {
       const value = record[key];
-      if (typeof value === 'string' && (best === null || value.length > best.length)) {
-        best = { container: record, key, length: value.length };
+      if (typeof value !== 'string' || skip.has(fieldKey(record, key))) {
+        continue;
+      }
+      const bytes = escapedByteLength(value);
+      if (best === null || bytes > best.bytes) {
+        best = { container: record, key, length: value.length, bytes };
       }
     }
     for (const entry of Object.values(record)) {
@@ -214,40 +197,187 @@ function findLargestTextField(root: Record<string, JsonValue>): TextField | null
   return best;
 }
 
-interface DroppableArray {
-  readonly array: JsonValue[];
+/**
+ * Identity for one field, so a failed shrink can be remembered without holding the container.
+ *
+ * A `WeakMap` from container to id keeps this from leaking references, and `containerId` is the only way to
+ * express "this object, in the copy I am mutating" in a primitive key.
+ */
+const containerIds = new WeakMap<object, number>();
+let nextContainerId = 0;
+
+function fieldKey(container: object, key: string): string {
+  let id = containerIds.get(container);
+  if (id === undefined) {
+    nextContainerId += 1;
+    id = nextContainerId;
+    containerIds.set(container, id);
+  }
+  return `${String(id)}:${key}`;
 }
 
 /**
- * The longest array of output-shaped objects, or null.
+ * The longest `outputs` array, or null.
  *
- * Restricted to arrays whose members are objects: those are output lists, where dropping an entry still
- * leaves a coherent document ("here are 3 of the 9 outputs"). Dropping a member of an arbitrary array
- * could break a shape the model has to reason about (`executed[].cell_index` would no longer describe
- * what ran), which is a different kind of lie.
+ * ONLY arrays under an `outputs` key are eligible, and that restriction is a fix (v14 F4): choosing "the
+ * longest array of objects" picked `cells` whenever a notebook had more cells than outputs, so the drop
+ * phase deleted whole CELLS — a measured response reported `cells: []` next to `cell_count: 1` while the
+ * warning said an output had been dropped. Dropping an output is explainable and leaves the document
+ * coherent; dropping a cell removes the thing the caller asked about.
  */
-function findDroppableArray(root: Record<string, JsonValue>): DroppableArray | null {
+function findDroppableOutputs(root: Record<string, JsonValue>): JsonValue[] | null {
   let best: JsonValue[] | null = null;
   const visit = (node: unknown): void => {
     if (Array.isArray(node)) {
-      if (
-        node.length > 0 &&
-        node.every((entry) => typeof entry === 'object' && entry !== null && !Array.isArray(entry)) &&
-        (best === null || node.length > best.length)
-      ) {
-        best = node as JsonValue[];
-      }
       for (const entry of node) {
         visit(entry);
       }
       return;
     }
-    if (typeof node === 'object' && node !== null) {
-      for (const entry of Object.values(node as Record<string, JsonValue>)) {
-        visit(entry);
-      }
+    if (typeof node !== 'object' || node === null) {
+      return;
+    }
+    const record = node as Record<string, JsonValue>;
+    const outputs = record['outputs'];
+    if (
+      Array.isArray(outputs) &&
+      outputs.length > 0 &&
+      outputs.every((entry) => typeof entry === 'object' && entry !== null && !Array.isArray(entry)) &&
+      (best === null || outputs.length > best.length)
+    ) {
+      best = outputs as JsonValue[];
+    }
+    for (const entry of Object.values(record)) {
+      visit(entry);
     }
   };
   visit(root);
-  return best === null ? null : { array: best };
+  return best;
+}
+
+/**
+ * Enforce `maxBytes` on a tool payload, reporting whatever had to be removed.
+ *
+ * `maxBytes` is the budget for the serialized frame. Image blocks are counted separately by the caller,
+ * because they travel as their own content blocks and their degradation is a different decision (drop the
+ * block, keep the `artifact_path` the payload already carries).
+ *
+ * Callers must pass the FINAL payload — see `src/mcp/tools/result.ts`, which applies this on both the
+ * success and the failure exit, since an error body carries `detail.executed[]` and is just as able to
+ * exceed the frame limit (v14 V14-12).
+ */
+export function enforceResponseBudget(payload: JsonValue, maxBytes: number): ResponseBudgetResult {
+  const initial = estimatedJsonBytes(payload);
+  if (initial <= maxBytes) {
+    return { payload, warnings: [], estimatedBytes: initial, degraded: false };
+  }
+
+  // A deep copy, so a caller holding the original cannot observe a half-degraded payload.
+  // `structuredClone` is the only correct way to do that, and the cost — one payload-sized copy — is paid
+  // only on the rare path where the payload does not fit and the alternative is the client losing the whole
+  // session (v14 F7 corrected the comment that claimed this was a partial clone).
+  const working = structuredClone(payload) as Record<string, JsonValue>;
+  let size = initial;
+
+  const unshrinkable = new Set<string>();
+  let truncatedFields = 0;
+  let removedItems = 0;
+  let passes = 0;
+
+  const guardPasses = (): void => {
+    passes += 1;
+    if (passes > MAX_DEGRADATION_PASSES) {
+      // Unreachable while every pass makes progress; a loud failure beats a silent spin.
+      throw new Error(
+        `response budget cannot be satisfied: ${String(MAX_DEGRADATION_PASSES)} passes and still ${String(size)} > ${String(maxBytes)}`,
+      );
+    }
+  };
+
+  // Phase 1: shorten the largest strings first. Largest-first is what makes the budget affordable — a run
+  // whose outputs are mostly small should lose the ONE enormous result rather than a hundred previews.
+  for (;;) {
+    if (size <= maxBytes) {
+      break;
+    }
+    guardPasses();
+    const biggest = findLargestTextField(working, unshrinkable);
+    if (biggest === null) {
+      break;
+    }
+    const { container, key, length, bytes } = biggest;
+    const overshoot = size - maxBytes;
+    // PROGRESS IS REQUIRED: the target is clamped strictly below the current length, because `Math.max` used
+    // to win whenever the arithmetic went negative and the "truncated" value was then the ORIGINAL plus a
+    // marker — longer than what it replaced (v14 V14-11).
+    const target = Math.min(length - 1, Math.max(200, length - overshoot - 512));
+    const replacement =
+      target <= 0
+        ? ''
+        : `${(container[key] as string).slice(0, target)}${TRUNCATION_MARKER}`;
+    const nowBytes = escapedByteLength(replacement);
+    if (nowBytes >= bytes) {
+      // No net progress even at the floor. Leave the value EXACTLY as the caller wrote it and stop
+      // considering this field, rather than growing it.
+      unshrinkable.add(fieldKey(container, key));
+      continue;
+    }
+    container[key] = replacement;
+    size += nowBytes - bytes;
+    truncatedFields += 1;
+  }
+
+  // Phase 2: still too big with every text field shortened, so whole OUTPUT items go.
+  for (;;) {
+    if (size <= maxBytes) {
+      break;
+    }
+    guardPasses();
+    const outputs = findDroppableOutputs(working);
+    if (outputs === null) {
+      break;
+    }
+    const last = outputs.pop();
+    if (last === undefined) {
+      break;
+    }
+    size -= estimatedJsonBytes(last) + 1;
+    removedItems += 1;
+  }
+
+  // ONE WARNING, whichever phases ran. SPEC §7 defines `output_truncated` as a per-CALL warning and U21b
+  // asserts exactly one; the first version emitted one per phase, so a payload that needed both shortening
+  // and omission carried two entries with the same code — a shape the spec forbids and the existing
+  // assertion would have caught if any fixture had needed both phases (v14 F5).
+  const warnings: JsonValue[] = [];
+  if (truncatedFields > 0 || removedItems > 0) {
+    const parts: string[] = [];
+    if (truncatedFields > 0) {
+      parts.push(`${String(truncatedFields)} text value(s) shortened (marked \`${TRUNCATION_MARKER}\`)`);
+    }
+    if (removedItems > 0) {
+      parts.push(`${String(removedItems)} output item(s) omitted`);
+    }
+    // The advice has to hold for the common case, which is ONE cell whose ONE output is large: "ask for
+    // fewer cells" was not actionable there (v14 V14-2). Where the whole value still is, and how to get at
+    // it in pieces, are true either way.
+    warnings.push(
+      warning(
+        `${parts.join('; ')} to fit the ${describeBudget(maxBytes)} response budget. The notebook still holds every value on disk: read it in parts with \`cell_indexes\`, use \`include_outputs='summary'\` for previews, or raise \`--max-response-bytes\` if your client's limit allows`,
+      ),
+    );
+  }
+
+  if (warnings.length > 0) {
+    const existing = working['warnings'];
+    working['warnings'] = [...(Array.isArray(existing) ? existing : []), ...warnings];
+    size = estimatedJsonBytes(working);
+  }
+
+  return { payload: working, warnings, estimatedBytes: size, degraded: warnings.length > 0 };
+}
+
+function warning(message: string): JsonValue {
+  const created = createWarning(TRUNCATION_CODE, message);
+  return { code: created.code, message: created.message };
 }

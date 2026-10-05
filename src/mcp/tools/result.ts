@@ -54,12 +54,22 @@ export function toCallToolResult(
   content: Array<{ type: 'text'; text: string } | ImageBlock>;
   isError?: boolean;
 } {
+  const budget = options?.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
+
   if ('error' in outcome) {
     const error = outcome.error;
-    const body = JSON.stringify({ code: error.code, message: error.message, detail: error.detail ?? null });
-    return { content: [{ type: 'text', text: body }], isError: true };
+    // AN ERROR RESPONSE IS A RESPONSE, and it needs the same budget. `detail.executed[]` carries the outputs
+    // of every cell that completed, so a run that produced a large output and then failed — timeout,
+    // cancel, or a dead kernel — sent an unbounded frame; the client's connection died, and the model
+    // learned neither the failure nor which cells had run, while the file had ALREADY been written back.
+    // That is the worst version of the shape this budget exists for (review v14 V14-12). The first version
+    // applied it on the success path only, so the failure paths were exactly the ones that still broke.
+    const fitted = enforceResponseBudget(
+      { code: error.code, message: error.message, detail: error.detail ?? null } as JsonValue,
+      budget,
+    );
+    return { content: [{ type: 'text', text: JSON.stringify(fitted.payload) }], isError: true };
   }
-  const budget = options?.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
 
   // THE WHOLE FRAME HAS A CEILING, and this is where it is enforced. A frame over the SDK reader's
   // 10 MiB is not a big response — the reader throws, the client's connection closes with
@@ -73,6 +83,8 @@ export function toCallToolResult(
   // Images are counted first because their degradation is the documented one: the payload already
   // carries `artifact_path` and `image_index`, so withholding a block costs a second call rather than
   // the data. Text has no such fallback, so it gets whatever is left after the image total.
+  // Base64 is ASCII, so its UTF-16 length and its byte length agree; the 128 covers the JSON envelope
+  // around the block (`{"type":"image","data":"…","mimeType":"image/png"}`).
   const imageBytes = images.reduce((total, block) => total + block.data.length + 128, 0);
   const fitted = enforceResponseBudget(outcome.payload, Math.max(MIN_TEXT_BUDGET, budget - imageBytes));
   let text = JSON.stringify(fitted.payload);
@@ -82,7 +94,7 @@ export function toCallToolResult(
   // What the text frame left for image blocks. If the payload alone exceeded the budget, this is small
   // or negative and the blocks are withheld — which is the intended order: the model keeps the
   // answer's substance (what ran, what it wrote) plus the paths to the images.
-  let remaining = budget - text.length;
+  let remaining = budget - Buffer.byteLength(text, 'utf8');
   for (const block of images) {
     // The SDK validates `ImageContent.data` with `atob` and a rejection is a
     // PROTOCOL error for the entire result: one malformed value costs the model the
