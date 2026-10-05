@@ -5,6 +5,7 @@
 import { IpynbError, createWarning, type JsonValue } from '../../core/errors.js';
 import { isBase64Shaped } from '../../core/base64.js';
 import { enforceResponseBudget } from '../../core/response-budget.js';
+import { reconcileTruncationFlags } from '../render/read.js';
 import type { Logger } from '../../log.js';
 
 export type ImageBlock = { type: 'image'; data: string; mimeType: 'image/png' | 'image/jpeg' };
@@ -87,7 +88,14 @@ export function toCallToolResult(
   // around the block (`{"type":"image","data":"…","mimeType":"image/png"}`).
   const imageBytes = images.reduce((total, block) => total + block.data.length + 128, 0);
   const fitted = enforceResponseBudget(outcome.payload, Math.max(MIN_TEXT_BUDGET, budget - imageBytes));
-  let text = JSON.stringify(fitted.payload);
+  // STRUCTURED FLAGS MUST AGREE WITH WHAT IS DELIVERED, and the budget cannot enforce that: it edits JSON and
+  // knows nothing about what a field means, while `source_truncated` is a boolean the model reads to decide
+  // whether the source it holds is the whole source. Measured before this line existed: a 12 MiB source
+  // arrived shortened, with a marker and a warning, while the payload still said
+  // `source_truncated: false` — the structural field contradicting the value beside it (review v16 V16-1).
+  // The budget reports which fields it cut; the render layer, which owns the semantics, sets its own flags.
+  const reconciled = reconcileTruncationFlags(fitted.payload, fitted.truncatedFields);
+  let text = JSON.stringify(reconciled);
 
   const content: Array<{ type: 'text'; text: string } | ImageBlock> = [{ type: 'text', text }];
   let droppedBlocks = 0;

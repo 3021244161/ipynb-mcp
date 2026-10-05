@@ -112,6 +112,17 @@ export interface ResponseBudgetResult {
   readonly estimatedBytes: number;
   /** True when anything was removed, so callers can tell "fits" from "was made to fit". */
   readonly degraded: boolean;
+  /**
+   * The FIELDS that were shortened or dropped, deduplicated: `['source']`, `['outputs', 'text']`, …
+   *
+   * A payload can carry a STRUCTURED FLAG that describes a field's completeness — `source_truncated` for
+   * `source`/`source_preview` (SPEC §4.1) — and a flag that still says "complete" after the value was cut is
+   * worse than no flag: the model reads the field, not the string, so it concludes the source it holds is the
+   * whole source (review v16 V16-1). The budget cannot fix that itself: it edits JSON and knows nothing about
+   * what any field MEANS. So it reports WHERE it cut, and the layer that owns the semantics reconciles its own
+   * flags — see `reconcileTruncationFlags` in `src/mcp/render/read.ts`.
+   */
+  readonly truncatedFields: readonly string[];
 }
 
 /**
@@ -353,7 +364,7 @@ function findDroppableOutputs(root: Record<string, JsonValue>): JsonValue[] | nu
 export function enforceResponseBudget(payload: JsonValue, maxBytes: number): ResponseBudgetResult {
   const initial = estimatedJsonBytes(payload);
   if (initial <= maxBytes) {
-    return { payload, warnings: [], estimatedBytes: initial, degraded: false };
+    return { payload, warnings: [], estimatedBytes: initial, degraded: false, truncatedFields: [] };
   }
 
   // A deep copy, so a caller holding the original cannot observe a half-degraded payload.
@@ -542,10 +553,21 @@ export function enforceResponseBudget(payload: JsonValue, maxBytes: number): Res
       warnings: [...warnings],
       estimatedBytes: estimatedJsonBytes(refusal),
       degraded: true,
+      // No field survives in the refusal, so there is no flag left to reconcile — the payload says
+      // `response_budget_exceeded` and nothing else.
+      truncatedFields: [],
     };
   }
 
-  return { payload: working, warnings, estimatedBytes: size, degraded: warnings.length > 0 };
+  return {
+    payload: working,
+    warnings,
+    estimatedBytes: size,
+    degraded: warnings.length > 0,
+    // Deduplicated: a caller reconciling flags wants the set of affected FIELDS, and one cell can be cut
+    // more than once (a long `source` shortened over several passes).
+    truncatedFields: [...new Set([...shortenedScalars, ...shortenedArrays.map((entry) => entry.key)])],
+  };
 }
 
 /**

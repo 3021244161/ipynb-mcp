@@ -219,6 +219,52 @@ try {
         read.bytes < 10 * 1024 * 1024,
         `${(read.bytes / 1024 / 1024).toFixed(2)} MiB, ${refused ? 'refused' : warned ? 'shortened' : 'whole'}`,
       );
+
+      // [V16-1] AND THE FLAGS MUST AGREE WITH THE VALUES. A model reads `source_truncated` rather than the
+      // tail of a multi-megabyte string, so a cut value beside a `false` flag is a trap: it concludes the
+      // source it holds is the whole source. Checked here for every value that arrived with the cut marker.
+      if (!refused) {
+        const cells = read.body.cells ?? [];
+        let markedButNotFlagged = 0;
+        let cutStreams = 0;
+        let streamsNotFlagged = 0;
+        let markedValues = 0;
+        for (const cell of cells) {
+          // BOTH SHAPES: a source whose last line ends in a newline arrives as a STRING (one long line is what
+          // gets cut), and one that does not arrives as an ARRAY. The first version of this check looked only at
+          // strings, so it examined nothing at all — the fixture this trial builds is the array shape, and the
+          // all-zero counters in its output said so.
+          const source = cell.source;
+          const sourceTail = Array.isArray(source)
+            ? (source.length > 0 ? source[source.length - 1] : '')
+            : source;
+          if (typeof sourceTail === 'string' && sourceTail.endsWith('truncated to fit the response budget]')) {
+            markedValues += 1;
+            if (cell.source_truncated !== true) {
+              markedButNotFlagged += 1;
+            }
+          }
+          for (const item of cell.outputs ?? []) {
+            if (item.kind !== 'stream') {
+              continue;
+            }
+            const text = String(item.text ?? '');
+            if (text.endsWith('truncated to fit the response budget]')) {
+              cutStreams += 1;
+              if (item.truncated !== true) {
+                streamsNotFlagged += 1;
+              }
+            }
+          }
+        }
+        check(
+          `${label}: no cut value claims to be whole`,
+          markedButNotFlagged === 0 && streamsNotFlagged === 0,
+          // `checked` is the probe that the check examined something: without it, a fixture that is never cut
+          // makes this assertion vacuously true and the trial reports a pass it did not earn.
+          `checked=${String(markedValues + cutStreams)} markedSources=${String(markedValues)} unflaggedSources=${String(markedButNotFlagged)} cutStreams=${String(cutStreams)} unflaggedStreams=${String(streamsNotFlagged)}`,
+        );
+      }
     } catch (cause) {
       check(`${label}: deliverable and inside the client limit`, false, String(cause).slice(0, 120));
     }

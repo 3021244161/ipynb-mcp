@@ -6,6 +6,7 @@ import {
   escapedByteLength,
   estimatedJsonBytes,
 } from '../../src/core/response-budget.js';
+import { reconcileTruncationFlags } from '../../src/mcp/render/read.js';
 
 /**
  * [V14-11] The degradation loops must TERMINATE, and must never make a payload bigger.
@@ -253,4 +254,106 @@ describe('[V15-1] the budget shortens arrays of strings, not just scalar text', 
     const messages = (body['warnings'] as Array<Record<string, unknown>>).map((entry) => String(entry['message']));
     expect(messages.join(' ')).toContain('cell_indexes');
   }, 30_000);
+});
+
+/**
+ * [V16-1] A structured completeness flag must not outlive the value it describes.
+ *
+ * `source_truncated` is what a model reads to decide whether the source it holds is the whole source
+ * (SPEC §4.1). The budget can shorten `source`/`source_preview` AFTER projection, and it edits JSON, so it
+ * cannot know that a boolean beside the value is meant to describe it. Measured by the reviewer before this
+ * was fixed: a 12 MiB source arrived as 8 387 552 characters ending in the truncation marker while the payload
+ * said `source_truncated: false` — the structural field contradicting the value next to it, which is worse
+ * than having no field, because a model that trusts the flag concludes the source is complete.
+ *
+ * The division of labour is what makes this testable without teaching the budget about read semantics: the
+ * budget reports WHERE it cut, and the render layer reconciles its own flags.
+ */
+describe('[V16-1] reconcileTruncationFlags keeps the flags honest', () => {
+  const cellPayload = (extra: Record<string, unknown>) => ({
+    path: 'x.ipynb',
+    cell_count: 1,
+    cells: [{ cell_index: 0, source_line_count: 740_173, source_truncated: false, ...extra }],
+  });
+
+  it('[V16-1] a shortened `source` sets source_truncated', () => {
+    // The delivered string ENDS WITH THE MARKER the budget appends, which is what the reconciliation reads.
+    const payload = cellPayload({ source: 'y = 1  # padding…[truncated to fit the response budget]' });
+    const reconciled = reconcileTruncationFlags(payload as never, ['source']) as Record<string, unknown>;
+    const cell = ((reconciled['cells'] ?? []) as Array<Record<string, unknown>>)[0] ?? {};
+    expect(cell['source_truncated']).toBe(true);
+  });
+
+  it('[V16-1] a shortened `source_preview` is flagged, and a complete one beside it is not', () => {
+    const marker = 'ab…[truncated to fit the response budget]';
+    const payload = {
+      path: 'x.ipynb',
+      cell_count: 3,
+      cells: [
+        // The budget cut this cell's preview, so its last delivered element carries the marker.
+        { cell_index: 0, source: null, source_preview: ['a', 'b', marker], source_line_count: 500, source_truncated: false },
+        // Complete, so it must NOT be flagged. This is the case the first version got wrong: it flagged every
+        // cell that delivered anything as soon as the field appeared in the cut list.
+        { cell_index: 1, source: null, source_preview: ['c\n', 'd\n'], source_line_count: 3, source_truncated: false },
+        // `include_source='none'` delivers neither field — flagging it would claim a source was cut in a
+        // request that asked for no source at all.
+        { cell_index: 2, source: null, source_preview: [], source_line_count: 9, source_truncated: false },
+      ],
+    };
+    const reconciled = reconcileTruncationFlags(payload as never, ['source_preview']) as Record<string, unknown>;
+    const cells = (reconciled['cells'] ?? []) as Array<Record<string, unknown>>;
+    expect(cells[0]?.['source_truncated']).toBe(true);
+    expect(cells[1]?.['source_truncated']).toBe(false);
+    expect(cells[2]?.['source_truncated']).toBe(false);
+  });
+
+  it('[V16-1] a value without the marker is never called truncated', () => {
+    // The flag follows the VALUE, not the call's cut list: a 4-character cell in a response where another cell
+    // was cut must still report itself complete.
+    const payload = {
+      path: 'x.ipynb',
+      cells: [
+        { cell_index: 1, source: '# a short heading', source_line_count: 1, source_truncated: false },
+      ],
+    };
+    const reconciled = reconcileTruncationFlags(payload as never, ['source']) as Record<string, unknown>;
+    const cell = ((reconciled['cells'] ?? []) as Array<Record<string, unknown>>)[0] ?? {};
+    expect(cell['source_truncated']).toBe(false);
+  });
+
+  it('[V16-1] nothing is touched when nothing was cut', () => {
+    // A single-line cell whose declaration agrees with what is delivered.
+    const payload = {
+      path: 'x.ipynb',
+      cell_count: 1,
+      cells: [{ cell_index: 0, source: 'x = 1', source_line_count: 1, source_truncated: false }],
+    } as unknown;
+    const reconciled = reconcileTruncationFlags(payload as never, []);
+    // Same object, not a copy: the reconciliation must not rewrite payloads the budget left alone.
+    expect(reconciled).toBe(payload);
+  });
+
+  it('[V16-1] a cut in an unrelated field leaves the source flags alone', () => {
+    const payload = {
+      path: 'x.ipynb',
+      cell_count: 1,
+      cells: [{ cell_index: 0, source: 'x = 1', source_line_count: 1, source_truncated: false }],
+    };
+    const reconciled = reconcileTruncationFlags(payload as never, ['text']) as Record<string, unknown>;
+    const cell = ((reconciled['cells'] ?? []) as Array<Record<string, unknown>>)[0] ?? {};
+    expect(cell['source_truncated']).toBe(false);
+  });
+
+  it('[V16-1] the budget reports the fields it cut, deduplicated', () => {
+    // `source` shortened over several passes must appear once, and a payload that fits reports nothing.
+    const lines = Array.from({ length: 4000 }, (_, index) => `line ${String(index)} ${'s'.repeat(200)}`);
+    const payload = { path: 'x.ipynb', cells: [{ source: lines, source_truncated: false }] };
+    const cut = enforceResponseBudget(payload as never, 64 * 1024);
+    expect(cut.truncatedFields).toEqual(['source']);
+    expect(new Set(cut.truncatedFields).size).toBe(cut.truncatedFields.length);
+
+    const fits = enforceResponseBudget({ path: 'x.ipynb' } as never, 64 * 1024);
+    expect(fits.truncatedFields).toEqual([]);
+    expect(fits.degraded).toBe(false);
+  });
 });

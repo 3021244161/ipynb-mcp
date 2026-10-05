@@ -35,7 +35,11 @@ beforeAll(async () => {
   workspace = await mkdtemp(path.join(tmpdir(), 'ipynb-mcp-budget-'));
   transport = new StdioClientTransport({
     command: process.execPath,
-    args: [path.join(REPO_ROOT, 'lib', 'bin.js'), '--root', workspace],
+    // `--inline-text-chars` is raised out of the way for the whole file, so every case here exercises the
+    // RESPONSE BUDGET rather than the per-output limit. With the default (20 000) most fixtures are cut before
+    // the budget ever sees them, which is why one case in this file originally proved nothing: it asserted that
+    // the budget had cut stream items while `truncated` was being set by `inline_text_chars` instead.
+    args: [path.join(REPO_ROOT, 'lib', 'bin.js'), '--root', workspace, '--inline-text-chars', '4000000'],
     env: { ...process.env, IPYNB_PYTHON: resolvedTestInterpreter() ?? BASE_PYTHON } as Record<string, string>,
     stderr: 'pipe',
   });
@@ -474,4 +478,258 @@ describe('[V15-3] the fixture-shape matrix: a large image output', () => {
     const after = await callRead(target, 'none');
     expect(after.body['path']).toBeDefined();
   }, 180_000);
+});
+
+/**
+ * [V16-1] The structured flag must agree with what the client received.
+ *
+ * The reviewer's measurement, before this was fixed: a 12 MiB source arrived as 8 387 552 characters ending in
+ * the truncation marker, with the warning and the marker both correct — and `source_truncated: false` beside
+ * it. `source_truncated` is the signal a model uses INSTEAD of reading the tail of a multi-megabyte string to
+ * decide whether it holds the whole source (SPEC §4.1), so the flag was the load-bearing field and it was
+ * wrong. Same family as V11-12① and V14-1: a payload that describes itself inaccurately.
+ *
+ * Asserted at the client, because that is where the flag is read, and with the marker checked too — a `true`
+ * flag with no marker would be the mirror image of the same defect.
+ */
+describe('[V16-1] a shortened source is flagged as truncated', () => {
+  it('[V16-1] source_truncated is true, and the value ends with the marker', async () => {
+    const unit = 'y = 1  # padding line for the budget\n';
+    const lines = Math.ceil((12 * 1024 * 1024) / unit.length);
+    const target = path.join(workspace, 'flagged-source.ipynb');
+    await writeFile(
+      target,
+      `${JSON.stringify({
+        cells: [
+          { cell_type: 'code', execution_count: 1, id: 'c0', metadata: {}, outputs: [], source: [unit.repeat(lines)] },
+        ],
+        metadata: {
+          kernelspec: { display_name: 'Python 3', language: 'python', name: 'python3' },
+          language_info: { name: 'python' },
+        },
+        nbformat: 4,
+        nbformat_minor: 5,
+      })}\n`,
+      'utf8',
+    );
+
+    const { bytes, body } = await callReadWith(target, { include_source: 'full', include_outputs: 'none' });
+    expect(bytes, `response was ${(bytes / 1024 / 1024).toFixed(2)} MiB`).toBeLessThan(10 * 1024 * 1024);
+
+    const cells = (body['cells'] ?? []) as Array<Record<string, unknown>>;
+    const cell = cells[0] ?? {};
+    const truncated = body['response_budget_exceeded'] === true
+      || JSON.stringify(body['warnings'] ?? []).includes('output_truncated');
+    expect(truncated, 'this fixture must actually have been degraded').toBe(true);
+
+    if (body['response_budget_exceeded'] !== true) {
+      // THE ASSERTION: the flag the model reads says "this is not the whole source".
+      expect(cell['source_truncated'], JSON.stringify(cell).slice(0, 200)).toBe(true);
+      // And the value carries the marker, so a model that reads the string sees the same fact.
+      const source = cell['source'];
+      expect(typeof source).toBe('string');
+      expect(String(source).endsWith('truncated to fit the response budget]')).toBe(true);
+      // The line count still describes the NOTEBOOK's cell, not the shortened delivery — it is the number the
+      // model uses to decide how to re-read the rest.
+      expect(Number(cell['source_line_count'])).toBeGreaterThan(1000);
+    }
+
+    // The session survives the read, which is the property the whole budget exists for.
+    const after = await callRead(target, 'none');
+    expect(after.body['path']).toBeDefined();
+  }, 180_000);
+});
+
+/**
+ * [V16-1] The flag must be PER CELL, and must not appear where nothing was cut.
+ *
+ * The first version of the reconciliation flagged every cell that delivered anything as soon as `source`
+ * appeared in the cut list — so a 4-character cell came back marked truncated in the same response as a
+ * 12 MiB one, while its own value was byte-for-byte complete. It was found by sweeping the whole payload for
+ * this defect class instead of checking only the field the review named, which is the habit that matters
+ * here: "a structured field contradicts its value" is a CLASS, and one instance was reported.
+ *
+ * The assertion is exact because both sides are counts the payload already carries: lines delivered
+ * (derivable from the value) against `source_line_count` (SPEC §4.1, the notebook's real line count).
+ */
+describe('[V16-1] the truncation flag is per cell', () => {
+  it('[V16-1] a large cell is flagged and a small one beside it is not', async () => {
+    const unit = 'y = 1  # padding line for this case\n';
+    const lines = Math.ceil((12 * 1024 * 1024) / unit.length);
+    const target = path.join(workspace, 'per-cell-flags.ipynb');
+    await writeFile(
+      target,
+      `${JSON.stringify({
+        cells: [
+          { cell_type: 'code', execution_count: 1, id: 'c0', metadata: {}, outputs: [], source: [unit.repeat(lines)] },
+          // Small enough to be delivered whole. It must NOT be flagged.
+          { cell_type: 'markdown', id: 'm1', metadata: {}, source: ['# a short heading'] },
+        ],
+        metadata: {
+          kernelspec: { display_name: 'Python 3', language: 'python', name: 'python3' },
+          language_info: { name: 'python' },
+        },
+        nbformat: 4,
+        nbformat_minor: 5,
+      })}\n`,
+      'utf8',
+    );
+
+    const { bytes, body } = await callReadWith(target, { include_source: 'full', include_outputs: 'none' });
+    expect(bytes, `response was ${(bytes / 1024 / 1024).toFixed(2)} MiB`).toBeLessThan(10 * 1024 * 1024);
+    const cells = (body['cells'] ?? []) as Array<Record<string, unknown>>;
+    expect(cells.length).toBe(2);
+
+    const big = cells[0] ?? {};
+    const small = cells[1] ?? {};
+    // The large cell was cut: flagged, and its value says so too.
+    expect(big['source_truncated'], JSON.stringify(big).slice(0, 160)).toBe(true);
+    expect(String(big['source'])).toContain('truncated to fit the response budget');
+    expect(Number(big['source_line_count'])).toBeGreaterThan(1000);
+    // The small cell was delivered whole, so its flag must say so — a `true` here would be the same defect
+    // pointing the other way, and would make the model re-read a cell it already has.
+    expect(small['source_truncated'], JSON.stringify(small).slice(0, 160)).toBe(false);
+    expect(String(small['source'])).toBe('# a short heading');
+    expect(Number(small['source_line_count'])).toBe(1);
+
+    // The session is alive, which is what the budget buys.
+    const after = await callRead(target, 'none');
+    expect(after.body['path']).toBeDefined();
+  }, 180_000);
+});
+
+/**
+ * [V16-1] The same defect class in `outputs_summary`: a cut output must not be measured as if it were whole.
+ *
+ * `line_count` was computed as `item.text.split('\n').length` on text that `inlineTextChars` had ALREADY cut.
+ * An 11 MiB single-line stream therefore summarized as `line_count: 1` with a 200-character preview — every
+ * signal said "one line, nothing to see" about one line of eleven megabytes, and a model that trusts the
+ * summary concludes there is nothing left to fetch. Found by sweeping the payload for the `source_truncated`
+ * defect class rather than fixing only the field the review named.
+ *
+ * `line_count` is optional in SPEC §4.1's summary shape, so the fix is to omit a count the summary cannot know
+ * and report the bound it does know. This case pins both halves.
+ */
+describe('[V16-1] a cut output is not summarized as if it were complete', () => {
+  it('[V16-1] the summary names the cut instead of reporting a false line count', async () => {
+    const target = path.join(workspace, 'cut-stream.ipynb');
+    await writeFile(
+      target,
+      `${JSON.stringify({
+        cells: [
+          {
+            cell_type: 'code',
+            execution_count: 1,
+            id: 'c0',
+            metadata: {},
+            outputs: [{ name: 'stdout', output_type: 'stream', text: ['z'.repeat(11 * 1024 * 1024)] }],
+            source: ['print("z" * 11_000_000)'],
+          },
+        ],
+        metadata: {
+          kernelspec: { display_name: 'Python 3', language: 'python', name: 'python3' },
+          language_info: { name: 'python' },
+        },
+        nbformat: 4,
+        nbformat_minor: 5,
+      })}\n`,
+      'utf8',
+    );
+
+    const { bytes, body } = await callReadWith(target, { include_outputs: 'summary', include_source: 'none' });
+    expect(bytes).toBeLessThan(10 * 1024 * 1024);
+    const cells = (body['cells'] ?? []) as Array<Record<string, unknown>>;
+    const summary = (cells[0]?.['outputs_summary'] ?? []) as Array<Record<string, unknown>>;
+    expect(summary.length).toBe(1);
+    const item = summary[0] ?? {};
+
+    expect(item['kind']).toBe('stream');
+    // The cut is NAMED. An `inline_text_chars` bound is what the summary knows, and it is the fact that tells
+    // the model "there is more".
+    expect(item['truncated']).toBe(true);
+    expect(Number(item['truncated_at_chars'])).toBeGreaterThan(0);
+    // And no line count is claimed: a prefix of the output cannot know how many lines the whole has.
+    expect(item['line_count']).toBeUndefined();
+    // The preview still shows what there is, so nothing is lost by omitting the count.
+    expect(String(item['preview']).length).toBeGreaterThan(0);
+  }, 180_000);
+});
+
+/**
+ * [V16-1] The third instance of the class: `stream` items carry a completeness flag too.
+ *
+ * SPEC §5.4 gives `stream` items `truncated` and `truncated_at_chars`, and the budget can cut a stream's text
+ * like any other string. Measured on a 25-cell notebook whose 50 outputs totalled 35 MB: 39 items came back
+ * with the cut marker INSIDE `text` while `truncated` still said `false`, and the warning beside them said "39
+ * value(s) in `text` shortened" — so the call-level report and the item-level field disagreed about the same
+ * fact. The other item kinds (`text`, `html`, `markdown`, `json`, `error`) have no completeness field in the
+ * SPEC's shape, so the marker inside the value is all they can carry; where a field EXISTS, leaving it false is
+ * a lie the model acts on.
+ *
+ * The counts are asserted together on purpose: the point is not "some flag is true", it is that the item-level
+ * flags and the call-level warning agree.
+ */
+describe('[V16-1] cut stream items are flagged, and the counts agree', () => {
+  it('[V16-1] every stream whose text was cut reports truncated', async () => {
+    const target = path.join(workspace, 'cut-streams.ipynb');
+    // 20 cells x 2 outputs x 700 KiB = 28 MB of text, each output under a raised `inline_text_chars`, so the
+    // BUDGET is what cuts them and not the per-output limit.
+    const cells = Array.from({ length: 20 }, (_, index) => ({
+      cell_type: 'code',
+      execution_count: index + 1,
+      id: `c${String(index)}`,
+      metadata: {},
+      outputs: [
+        { name: 'stdout', output_type: 'stream', text: ['a'.repeat(700 * 1024)] },
+        { name: 'stdout', output_type: 'stream', text: ['b'.repeat(700 * 1024)] },
+      ],
+      source: [`print(${String(index)})`],
+    }));
+    await writeFile(
+      target,
+      `${JSON.stringify({
+        cells,
+        metadata: {
+          kernelspec: { display_name: 'Python 3', language: 'python', name: 'python3' },
+          language_info: { name: 'python' },
+        },
+        nbformat: 4,
+        nbformat_minor: 5,
+      })}\n`,
+      'utf8',
+    );
+
+    // `inline_text_chars` is raised out of the way so the BUDGET is what cuts, not the per-output limit — with
+    // the default, every item is truncated before the budget sees it and the fixture would prove nothing.
+    // --inline-text-chars is raised for the whole file (see eforeAll), so the BUDGET is what cuts here.
+    const { bytes, body } = await callReadWith(target, { include_outputs: 'full', include_source: 'none' });
+    expect(bytes).toBeLessThan(10 * 1024 * 1024);
+    const cellsOut = (body['cells'] ?? []) as Array<Record<string, unknown>>;
+    expect(cellsOut.length).toBe(20);
+    expect(Number(body['cell_count'])).toBe(cellsOut.length);
+
+    let cutItems = 0;
+    let markedButNotFlagged = 0;
+    for (const cell of cellsOut) {
+      for (const item of (cell['outputs'] ?? []) as Array<Record<string, unknown>>) {
+        if (item['kind'] !== 'stream') {
+          continue;
+        }
+        const text = String(item['text'] ?? '');
+        if (text.endsWith('truncated to fit the response budget]')) {
+          cutItems += 1;
+          if (item['truncated'] !== true) {
+            markedButNotFlagged += 1;
+          }
+        }
+      }
+    }
+    // The fixture must actually have been cut, or this case proves nothing.
+    expect(cutItems, 'the budget must have cut stream items in this fixture').toBeGreaterThan(0);
+    // THE ASSERTION: no item carries the marker while claiming to be complete.
+    expect(markedButNotFlagged).toBe(0);
+    // And the call-level warning counts the same items, so the two reports agree.
+    const warning = JSON.stringify(body['warnings'] ?? []);
+    expect(warning).toContain(`${String(cutItems)} value(s) in \`text\` shortened`);
+  }, 240_000);
 });

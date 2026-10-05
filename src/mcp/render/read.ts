@@ -3,7 +3,7 @@
 // cheap (no kernel, no artifacts); full outputs materialize images only when
 // the image policy allows blocks to be returned.
 
-import { createWarning, type Warning } from '../../core/errors.js';
+import { createWarning, type JsonValue, type Warning } from '../../core/errors.js';
 import { mapRawOutputs, rawOutputsOfCell, collectOutputWarnings, type OutputItem } from '../../core/outputs.js';
 import {
   cellSource,
@@ -202,6 +202,102 @@ export async function renderReadResult(input: RenderReadInput): Promise<RenderRe
   return { payload, imageBlocks };
 }
 
+/**
+ * Make the structured completeness flags agree with what is actually being delivered.
+ *
+ * `source_truncated` is the signal a model uses to decide whether the source it holds is the whole source
+ * (SPEC §4.1 defines it as "whether the preview was truncated"). The RESPONSE BUDGET can shorten `source` or
+ * `source_preview` after they have been projected — and it edits JSON, so it cannot know that a boolean beside
+ * the value is supposed to describe it. Measured before this ran: a 12 MiB source arrived as 8 387 552
+ * characters ending in the truncation marker while the payload said `source_truncated: false` — a structural
+ * field asserting the opposite of the truth, which is worse than no field at all because a model that reads
+ * the flag rather than the tail concludes the source is complete (review v16 V16-1).
+ *
+ * The budget reports WHICH fields it cut, and this function — the layer that knows what those fields mean —
+ * reconciles the flags. A cut is a cut whichever stage made it, so the value is set to `true`; nothing here
+ * can set it back to `false`, because only a re-projection could do that and none happens after the budget.
+ */
+export function reconcileTruncationFlags(payload: JsonValue, truncatedFields: readonly string[]): JsonValue {
+  if (truncatedFields.length === 0) {
+    return payload;
+  }
+  const affected = new Set(truncatedFields);
+  // Two field families carry a completeness flag: the cell's source (`source_truncated`, SPEC §4.1) and a
+  // `stream` item's text (`truncated`, SPEC §5.4). Either alone is worth reconciling, and a cut in an unrelated
+  // field (`value`, `html`) needs no flag because the SPEC gives those item kinds none.
+  const touchesSource = affected.has('source') || affected.has('source_preview');
+  const touchesStreamText = affected.has('text');
+  if (!touchesSource && !touchesStreamText) {
+    return payload;
+  }
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+    return payload;
+  }
+  const record = payload as Record<string, JsonValue>;
+  const cells = record['cells'];
+  if (!Array.isArray(cells)) {
+    return payload;
+  }
+  const cutMarker = 'truncated to fit the response budget]';
+  const endsCut = (value: unknown): boolean => typeof value === 'string' && value.endsWith(cutMarker);
+  for (const entry of cells) {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      continue;
+    }
+    const cell = entry as Record<string, JsonValue>;
+    // Per-OUTPUT flags first. SPEC §5.4 gives `truncated`/`truncated_at_chars` to `stream` items, and a stream
+    // can be cut by the budget like anything else: measured in a 25-cell notebook whose outputs totalled 35 MB,
+    // 39 items came back carrying the cut marker INSIDE `text` while their `truncated` still said `false` — the
+    // same "structured field contradicts its value" defect as the reported one. The other item kinds (`text`,
+    // `html`, `markdown`, `json`, `error`) have no completeness field in the SPEC's shape, so the marker inside
+    // the value is all they can carry; where a field does exist, leaving it false is a lie the model acts on.
+    const outputs = cell['outputs'];
+    if (touchesStreamText && Array.isArray(outputs)) {
+      for (const item of outputs as JsonValue[]) {
+        if (typeof item !== 'object' || item === null || Array.isArray(item)) {
+          continue;
+        }
+        const stream = item as Record<string, JsonValue>;
+        if (stream['kind'] === 'stream' && endsCut(stream['text'])) {
+          stream['truncated'] = true;
+        }
+      }
+    }
+    // PER CELL, NOT PER CALL. The first version flagged every cell that delivered anything as soon as `source`
+    // appeared in the cut list — so a 4-character cell was reported truncated in the same response as a 12 MiB
+    // one, while its own value was byte-for-byte complete. Sweeping the payload for this defect class is how
+    // that surfaced, and the fix is to ask the cell's OWN value instead of the call's summary.
+    //
+    // The cut marker is the exact signal, and it is set by the budget at the moment it cuts: any cell whose
+    // delivered source does not end there is complete. No arithmetic on line counts, because Jupyter's own
+    // convention (`source` is an array of lines, all but the last ending in `\n`, plus a trailing empty element
+    // from `split('\n')`) makes `source_line_count` differ by one from the line count of the text a caller would
+    // derive, and a comparison that is off by one in the wrong direction would flag complete cells.
+    const deliveredSource = cell['source'];
+    const preview = cell['source_preview'];
+    let wasCut = endsCut(deliveredSource);
+    if (!wasCut && Array.isArray(preview)) {
+      const elements = preview as JsonValue[];
+      wasCut = elements.length > 0 && typeof elements[elements.length - 1] === 'string' && endsCut(elements[elements.length - 1]);
+    }
+    if (wasCut) {
+      // This cell was cut, whichever field carried the cut.
+      cell['source_truncated'] = true;
+      continue;
+    }
+    // Not cut in the value. `source_truncated` was already true when a `preview` request deliberately shows
+    // fewer lines than the cell has, and that stays true — a cut is a cut whichever stage made it.
+  }
+  return payload;
+}
+
+/** The completeness fields a summary item carries; kind is added by the caller. */
+interface SummaryMeasurement {
+  readonly truncated: boolean;
+  readonly line_count?: number;
+  readonly truncated_at_chars?: number;
+}
+
 interface OutputSummary {
   readonly kind: string;
   [key: string]: unknown;
@@ -214,15 +310,15 @@ function summarizeOutputs(items: readonly OutputItem[]): OutputSummary[] {
         return {
           kind: 'stream',
           stream_name: item.stream_name,
-          line_count: item.text.split('\n').length,
+          ...measuredLines(item.text, item.truncated_at_chars),
           preview: truncatePreview(item.text),
         };
       case 'text':
-        return { kind: 'text', line_count: item.text.split('\n').length, preview: truncatePreview(item.text) };
+        return { kind: 'text', ...measuredLines(item.text, null), preview: truncatePreview(item.text) };
       case 'markdown':
-        return { kind: 'markdown', line_count: item.text.split('\n').length, preview: truncatePreview(item.text) };
+        return { kind: 'markdown', ...measuredLines(item.text, null), preview: truncatePreview(item.text) };
       case 'html':
-        return { kind: 'html', line_count: item.html.split('\n').length, preview: truncatePreview(item.html) };
+        return { kind: 'html', ...measuredLines(item.html, null), preview: truncatePreview(item.html) };
       case 'json':
         return { kind: 'json', preview: truncatePreview(JSON.stringify(item.value)) };
       case 'image':
@@ -245,6 +341,27 @@ function summarizeOutputs(items: readonly OutputItem[]): OutputSummary[] {
       }
     }
   });
+}
+
+/**
+ * `line_count` for a summary item — the field a model reads to judge an output's SIZE from a short preview.
+ *
+ * This used to be `item.text.split('\n').length`, computed on text that `inlineTextChars` had ALREADY cut at
+ * 20 000 characters (default). An 11 MiB single-line stream then summarized as `line_count: 1` beside a 200
+ * character preview: every signal in the summary said "one line, nothing to see", when the truth was one line
+ * of eleven megabytes. A model that trusts the summary concludes there is nothing more to fetch — the same
+ * defect class as `source_truncated` claiming a cut source was whole (review v16 V16-1), and it was found by
+ * sweeping the payload for that class rather than fixing only the reported field.
+ *
+ * `line_count` is OPTIONAL in SPEC §4.1's summary shape, so the honest answer for a cut output is to leave it
+ * out and state the bound that IS known: the item records where it was cut. Omitting a number the summary
+ * cannot know is honest; a confidently wrong one is what this round is about.
+ */
+function measuredLines(text: string, truncatedAtChars: number | null): SummaryMeasurement {
+  if (truncatedAtChars !== null) {
+    return { truncated: true, truncated_at_chars: truncatedAtChars };
+  }
+  return { truncated: false, line_count: text.split('\n').length };
 }
 
 function truncatePreview(text: string): string {
