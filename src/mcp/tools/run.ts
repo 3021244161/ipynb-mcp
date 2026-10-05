@@ -196,7 +196,20 @@ async function executeBackgroundRun(
 ): Promise<void> {
   try {
     const outcome = await runNotebook(
-      { ...request, abort: { signal: handle.abortController.signal, reason: handle.abortReason ?? 'cancelled' } },
+      // `reason` is stated only when somebody actually asked for this run to stop
+      // (`notebook_run_cancel`, or a kernel shutdown/restart), which is what `handle.abortReason`
+      // records. Defaulting it to `'cancelled'` here said "a client cancelled this" for every
+      // background run from the moment it started, so a kernel that died on its own — a cell calling
+      // `os._exit()`, the sidecar being killed — came back as `state: cancelled` / `code: cancelled`.
+      // Leaving it undefined lets `src/run.ts` classify by the trigger that actually fired
+      // (review v13 V13-8).
+      {
+        ...request,
+        abort: {
+          signal: handle.abortController.signal,
+          ...(handle.abortReason === null ? {} : { reason: handle.abortReason }),
+        },
+      },
       {
         registry: ctx.registry,
         hasher: ctx.hasher,

@@ -66,7 +66,13 @@ export interface RunRequest {
   /** Cooperative cancellation: checked between cells; completed cells are still written back. */
   readonly abort?: {
     readonly signal: AbortSignal;
-    readonly reason: 'cancelled' | 'kernel_died';
+    /**
+     * Why this run is being stopped, as far as the CALLER knows. Omitted when the caller has no reason
+     * to give — a background run is abortable from the moment it starts, so `notebook_run` cannot name
+     * one up front. `abortedRunError` resolves the omission from the trigger that actually fired
+     * (SPEC §4.8 rule 1, review v13 V13-8).
+     */
+    readonly reason?: 'cancelled' | 'kernel_died';
   };
 }
 
@@ -342,19 +348,46 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
   // (review v3 ROB-8).
   const kernelAbort = new AbortController();
   const kernelAbortState = { cellInFlight: false };
+  // WHICH ABORT ACTUALLY FIRED. The terminal code has to describe the FACT, and for a background run
+  // the two triggers are merged into one signal, so `req.abort.reason` alone cannot say which one it
+  // was: `notebook_run` passes `reason: 'cancelled'` because a client CAN cancel, and the
+  // kernel-death fallback below (`?? 'kernel_died'`) then never applies. The consequence was that a
+  // kernel dying on its own — a cell calling `os._exit()`, the sidecar being killed — came back as
+  // `state: cancelled` with `error.code: cancelled`, a statement that somebody cancelled a run nobody
+  // cancelled. A client can safely retry or abandon a cancellation; a crashed kernel means the
+  // in-memory state is gone and has to be rebuilt, so the two must not be conflated (SPEC §4.8 rule 1,
+  // review v13 V13-8). The synchronous path was already right; only the background path was not.
+  const firstAbort: { reason: 'cancelled' | 'kernel_died' | null } = { reason: null };
   const unregisterKernelAbort = deps.registry.onRunAbort(req.path, () => {
     if (kernelAbortState.cellInFlight) {
+      firstAbort.reason ??= 'kernel_died';
       kernelAbort.abort();
     }
   });
+  // The client's signal is the other trigger, and the FIRST one to fire is the one that caused this
+  // failure. `??=` keeps that order: if the kernel died first, a cancel arriving during the write-back
+  // does not relabel the run as cancelled.
+  req.abort?.signal?.addEventListener(
+    'abort',
+    () => {
+      firstAbort.reason ??= 'cancelled';
+    },
+    { once: true },
+  );
   // ROB-1: the merged signal registers listeners on a long-lived signal; they
   // must be detached on the normal path too, not only when abort fires.
   const merged = combineAbortSignals(req.abort?.signal, kernelAbort.signal);
   const abort: RunRequest['abort'] = {
     signal: merged.signal,
-    // Without a client signal the only way this run can be aborted is the
-    // kernel terminating, so that is the honest reason (SPEC §4.8 rule 1).
-    reason: req.abort?.reason ?? 'kernel_died',
+    // READ, NOT FROZEN. `abortedRunError` asks `req.abort.reason` for the terminal code, and a plain
+    // property would carry whatever was known when the run STARTED — which for a background run is
+    // `'cancelled'`, because a client is allowed to cancel. A getter keeps the answer current:
+    // `firstAbort` records which trigger actually fired and falls back to the caller's reason, or to
+    // `kernel_died` when there was none, since the only other way to abort is the kernel terminating
+    // (SPEC §4.8 rule 1).
+    get reason(): 'cancelled' | 'kernel_died' {
+      return firstAbort.reason ?? req.abort?.reason ?? 'kernel_died';
+    },
   };
   const effectiveReq: RunRequest = { ...req, abort };
 

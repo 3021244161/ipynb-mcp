@@ -363,6 +363,57 @@ describe('[I16] background run vs kernel restart', () => {
     const fresh = kernels.kernels.find((k) => k['kernel_id'] === newKernelId);
     expect(fresh?.['execution_count']).toBeNull();
   }, 180_000);
+
+  it('[V13-8] a kernel that dies on its own is `failed`/`kernel_died`, not `cancelled`', async () => {
+    // The case above covers an EXPLICIT `notebook_kernel restart`, which sets the abort reason for
+    // the run. This one covers the opposite: nobody asked for anything, and the kernel exits from
+    // inside a cell. The background path used to report `state: cancelled` with
+    // `error.code: cancelled` for it — a statement that somebody cancelled a run nobody cancelled —
+    // while the synchronous path reported `kernel_died` correctly, so the two disagreed about the
+    // same event (review v13 V13-8).
+    //
+    // Why the distinction is worth a test rather than a comment: a client can retry or abandon a
+    // cancellation, but a crashed kernel means the in-memory state is gone and has to be rebuilt with
+    // a replay. Reporting the wrong one sends the model to the wrong next step.
+    const nb = await writeNb('v13-8.ipynb', [
+      codeCell('c0', 'a = 1'),
+      // `os._exit` leaves no traceback and no reply: the process is simply gone, which is different
+      // from a cell that raises, and is the shape the review reproduced.
+      codeCell('c1', 'import os\nos._exit(7)'),
+    ]);
+    const started = await callTool('notebook_run', {
+      path: nb, cell_selector: 'all', timeout_seconds: 300,
+    });
+    const startBody = JSON.parse(String(started.content[0]?.text ?? '{}')) as Record<string, unknown>;
+    expect(startBody['kind']).toBe('background');
+    const runId = String(startBody['run_id']);
+
+    // Wait for the terminal state instead of sleeping a fixed amount: `facts_pending` is the explicit
+    // "still finishing" signal (V11-3), so this also asserts that it lands.
+    const deadline = Date.now() + 60_000;
+    let finalBody: Record<string, unknown> = {};
+    for (;;) {
+      const poll = await callTool('notebook_run_status', { run_id: runId });
+      finalBody = JSON.parse(String(poll.content[0]?.text ?? '{}')) as Record<string, unknown>;
+      if (finalBody['facts_pending'] === false && finalBody['state'] !== 'running') {
+        break;
+      }
+      if (Date.now() > deadline) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+
+    expect(finalBody['facts_pending']).toBe(false);
+    expect(finalBody['state'], JSON.stringify(finalBody).slice(0, 300)).toBe('failed');
+    const error = finalBody['error'] as Record<string, unknown>;
+    expect(error['code'], JSON.stringify(error)).toBe('kernel_died');
+    // The cell that completed before the crash is still reported, and still written back
+    // (SPEC §4.8 rule 3).
+    expect((finalBody['executed'] as unknown[]).length).toBeGreaterThanOrEqual(1);
+    const written = JSON.parse(await readFile(nb, 'utf8')) as { cells: Array<Record<string, unknown>> };
+    expect(written.cells[0]!['execution_count']).toBe(1);
+  }, 180_000);
 });
 
 describe('[I12] stdout purity of the real stdio server', () => {
