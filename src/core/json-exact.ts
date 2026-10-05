@@ -363,6 +363,28 @@ export const JSON_NUMBER = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
  */
 export const MAX_JSON_DEPTH = 512;
 
+/**
+ * The delimiters inside a JSON string: a run of ordinary characters, or one `"` or `\`.
+ *
+ * Module level so the hot read path does not build a regex for every string in the document, and
+ * global so `String.matchAll` can walk the text once (matchAll requires the `g` flag and manages its
+ * own iteration state, which is why `lastIndex` cannot leak between calls the way a shared sticky
+ * regex would).
+ */
+const STRING_TOKEN = /[^"\\]+|["\\]/g;
+
+/** The one-character escapes, decoded. `\u` needs four hex digits and is handled separately. */
+const ESCAPES: Record<string, string | undefined> = {
+  '"': '"',
+  '\\': '\\',
+  '/': '/',
+  b: '\b',
+  f: '\f',
+  n: '\n',
+  r: '\r',
+  t: '\t',
+};
+
 // ---------------------------------------------------------------------------
 // Parser: a straightforward recursive-descent JSON reader. It exists rather than a
 // `JSON.parse` reviver because a reviver is handed the already-parsed Number: the
@@ -518,76 +540,88 @@ class Reader {
     }
   }
 
+  /**
+   * Read a string, in ONE forward pass over its tokens.
+   *
+   * Three versions of this method are worth remembering, because each fixed the previous one and each
+   * is a different lesson:
+   *
+   *  1. **Per character** (`result += char`). Correct and linear in time, but a 200 kB json payload
+   *     became a 200 000-link cons-string chain. Measured on the real-usage trial's 37.5 MiB notebook:
+   *     `parseNotebook` retained 1198 MiB of heap — sixteen times the file, against `JSON.parse`
+   *     needing one — and `notebook_run` crossed the 2048 MiB default heap and died, taking every
+   *     kernel on the server with it while the client saw only `-32000 Connection closed`.
+   *  2. **Bulk copy with two independent searches.** `indexOf('"')` and `indexOf('\\')` from the
+   *     current position each re-scan the WHOLE remaining text on every escape, so the reader went
+   *     quadratic — and escapes are not exotic, because `\n` is one. Measured: 413/1611/6362 ms at
+   *     0.5/1/2 MiB of source with an escape every 20 characters, and 6.3 MiB turned a 335 ms read
+   *     into 56.5 s with the single-threaded server unresponsive (review v13 V13-7).
+   *  3. **This one**: one pass over the delimiters. `String.matchAll` walks the text once, so every
+   *     character is examined exactly once no matter how many escapes there are, and the plain runs
+   *     between delimiters are still copied with a single `slice` each.
+   *
+   * The scan is over TOKENS, not characters: `[^"\\]+|["\\]` matches a run of ordinary characters or
+   * one delimiter. The token boundaries matter more than they look. A delimiter-only pattern (`["\\]`)
+   * emits `\\` as two separate tokens, so the character after the first backslash IS a backslash and
+   * the pair is read as two escapes — which is exactly the shape that made the previous version report
+   * `"a\\\\b"` as three backslashes. Runs keep the tokens aligned: `\\` is `\` + `\` only when the
+   * pattern has no runs, and with runs the backslashes inside a run belong to the run.
+   *
+   * The delimiter pattern is a module constant so this hot path does not rebuild a regex per string,
+   * and `matchAll` hands back its own iterator, so no `lastIndex` can leak between calls.
+   */
   private readString(): string {
-    this.index += 1; // opening quote
+    this.index += 1; // past the opening quote
+    const contentStart = this.index;
     let result: string | null = null;
-    for (;;) {
-      if (this.atEnd()) {
-        throw new SyntaxError('Unterminated string in JSON');
+    let cursor = contentStart;
+    let escapeEnd: number | null = null;
+    // `slice` returns a string view, not a copy, so scanning from the cursor costs nothing and keeps
+    // the match indexes meaningful for the cursor we are actually at.
+    for (const match of this.text.slice(contentStart).matchAll(STRING_TOKEN)) {
+      const at = contentStart + match.index;
+      if (escapeEnd !== null && at < escapeEnd) {
+        // This token is the escaped CHARACTER of a two-character escape that the tokenizer split the
+        // way it splits `\\` into two backslashes, so it carries no syntax of its own: without this,
+        // `\n` would be read as an escape LETTER. The skip is bounded by the escape's own end, so no
+        // later token is ever discarded.
+        continue;
       }
-      // BULK COPY, and this is not an optimisation detail — it is the difference between reading a
-      // notebook and running out of memory. The character-at-a-time version appended one character
-      // per iteration, so a 200 kB json payload (SHAP values, a base64 plot, a dataframe) became a
-      // 200 000-link cons-string chain that V8 held and flattened. Measured on the trial's 37.5 MiB
-      // notebook: `parseNotebook` retained 1198 MiB of heap — sixteen times the file, against
-      // `JSON.parse` needing one — and `notebook_run` then crossed the 2048 MiB default heap and
-      // died, taking every kernel on the server with it while the client saw only
-      // `-32000 Connection closed` (review: real-usage trial).
-      //
-      // So the run up to the next `"` or `\` is copied in ONE `slice`, and per-character work is
-      // left only where the format requires it: an escape sequence, which is the rare case in a
-      // notebook. `tests/unit/json-exact.test.ts` [V13-1] holds this down with an allocation probe
-      // that fails against the character-at-a-time reader.
-      const quote = this.text.indexOf('"', this.index);
-      if (quote < 0) {
-        throw new SyntaxError('Unterminated string in JSON');
+      escapeEnd = null;
+      const token = match[0] as string;
+      if (token === '"') {
+        this.index = at + 1;
+        return this.appendChecked(result, this.text.slice(cursor, at), at + 1);
       }
-      const backslash = this.text.indexOf('\\', this.index);
-      if (backslash < 0 || quote < backslash) {
-        // No escape before the closing quote: the remainder is one slice.
-        return this.appendChecked(result, this.text.slice(this.index, quote), quote + 1);
-      }
-      result = this.appendChecked(result, this.text.slice(this.index, backslash), backslash + 1);
-      const escape = this.text[this.index]!;
-      this.index += 1;
-      switch (escape) {
-        case '"':
-          result += '"';
-          break;
-        case '\\':
-          result += '\\';
-          break;
-        case '/':
-          result += '/';
-          break;
-        case 'b':
-          result += '\b';
-          break;
-        case 'f':
-          result += '\f';
-          break;
-        case 'n':
-          result += '\n';
-          break;
-        case 'r':
-          result += '\r';
-          break;
-        case 't':
-          result += '\t';
-          break;
-        case 'u': {
-          const hex = this.text.slice(this.index, this.index + 4);
+      if (token === '\\') {
+        result = this.appendChecked(result, this.text.slice(cursor, at), at + 1);
+        const escape = this.text[at + 1];
+        if (escape === undefined) {
+          throw new SyntaxError('Unterminated string in JSON');
+        }
+        if (escape === 'u') {
+          const hex = this.text.slice(at + 2, at + 6);
           if (!/^[0-9a-fA-F]{4}$/.test(hex)) {
             throw new SyntaxError('Invalid \\u escape in JSON');
           }
-          this.index += 4;
+          // NO control-character check: the rule forbids RAW control characters, while an escape may
+          // denote one — `JSON.parse('"nul\\u0000here"')` yields a NUL, and the escaped form is the
+          // only legal way to write it. `appendChecked` enforces the raw rule on the runs above.
           result += String.fromCharCode(Number.parseInt(hex, 16));
-          break;
+          this.index = at + 6;
+        } else {
+          const decoded = ESCAPES[escape];
+          if (decoded === undefined) {
+            throw new SyntaxError(`Invalid escape in JSON: \\${escape}`);
+          }
+          result += decoded;
+          this.index = at + 2;
         }
-        default:
-          throw new SyntaxError(`Invalid escape in JSON: \\${escape}`);
+        cursor = this.index;
+        escapeEnd = this.index;
       }
     }
+    throw new SyntaxError('Unterminated string in JSON');
   }
 
   /**
