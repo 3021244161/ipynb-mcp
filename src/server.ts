@@ -76,7 +76,10 @@ export function createServer(ctx: ToolContext): McpServer {
       // The logger receives unexpected stacks, which stay out of the
       // model-visible detail (review v3 SEC-2).
       const outcome = await runTool(() => action(rawArgs, extra), ctx.logger);
-      return toCallToolResult(outcome);
+      // The response budget is applied at the ONE exit every tool shares, so no tool can forget it. It
+      // is the server's promise about what the transport can carry, not a per-tool policy, which is why
+      // it lives here rather than in each handler (review v13 V13-1).
+      return toCallToolResult(outcome, { maxResponseBytes: ctx.config.maxResponseBytes });
     };
   };
 

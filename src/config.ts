@@ -24,6 +24,14 @@ export interface IpynbConfig {
   readonly previewLines: number;
   readonly maxImagesPerCall: number;
   readonly maxImageBytes: number;
+  /**
+   * Budget for one tool response, in bytes.
+   *
+   * The SDK's stdio reader kills the connection on a frame over 10 MiB, and the client sees only
+   * `-32000 Connection closed`, so this must stay below that with room for the JSON-RPC envelope. The
+   * default is 8 MiB. See `src/core/response-budget.ts` and DEVIATIONS D-065.
+   */
+  readonly maxResponseBytes: number;
   readonly logLevel: LogLevel;
 }
 
@@ -70,6 +78,7 @@ const OPTION_SPECS: Readonly<Record<string, OptionSpec>> = {
   'preview-lines': { kind: 'number', env: 'IPYNB_PREVIEW_LINES', min: 1 },
   'max-images-per-call': { kind: 'number', env: 'IPYNB_MAX_IMAGES_PER_CALL', min: 0 },
   'max-image-bytes': { kind: 'number', env: 'IPYNB_MAX_IMAGE_BYTES', min: 1 },
+  'max-response-bytes': { kind: 'number', env: 'IPYNB_MAX_RESPONSE_BYTES', min: 65536 },
   'log-level': { kind: 'enum', enumValues: ['debug', 'info', 'warn', 'error'], env: 'IPYNB_LOG_LEVEL' },
 };
 
@@ -83,6 +92,7 @@ const DEFAULTS: Readonly<Record<string, string>> = {
   'preview-lines': '12',
   'max-images-per-call': '20',
   'max-image-bytes': '20971520',
+  'max-response-bytes': '8388608',
   'log-level': 'info',
 };
 
@@ -105,6 +115,7 @@ Options:
   --preview-lines <n>                 Source preview line count (default: 12)
   --max-images-per-call <n>           Image blocks per tool call (default: 20)
   --max-image-bytes <n>               Max bytes per image (default: 20971520)
+  --max-response-bytes <n>            Response budget in bytes (default: 8388608)
   --log-level <debug|info|warn|error> stderr log level (default: info)
   -h, --help                          Show this help and exit
 
@@ -349,6 +360,7 @@ export function parseConfig(
     previewLines: Number(resolved['preview-lines']),
     maxImagesPerCall: Number(resolved['max-images-per-call']),
     maxImageBytes: Number(resolved['max-image-bytes']),
+  maxResponseBytes: Number(resolved['max-response-bytes']),
     logLevel: resolved['log-level'] as LogLevel,
   };
   return { config, errors: [], helpRequested };

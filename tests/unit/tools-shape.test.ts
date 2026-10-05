@@ -40,6 +40,7 @@ beforeAll(async () => {
     previewLines: 12,
     maxImagesPerCall: 20,
     maxImageBytes: 20971520,
+    maxResponseBytes: 8_388_608,
     logLevel: 'error',
   };
   const registry = new KernelRegistry({ idleSeconds: 3600, logger: createLogger('error') });

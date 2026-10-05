@@ -201,6 +201,7 @@ function toolContext(): Parameters<typeof handleNotebookEdit>[0] {
     previewLines: 12,
     maxImagesPerCall: 20,
     maxImageBytes: 20971520,
+    maxResponseBytes: 8_388_608,
     logLevel: 'error',
   };
   return {

@@ -136,6 +136,7 @@ function config(): IpynbConfig {
     previewLines: 12,
     maxImagesPerCall: 20,
     maxImageBytes: 20971520,
+    maxResponseBytes: 8_388_608,
     logLevel: 'info',
   };
 }
