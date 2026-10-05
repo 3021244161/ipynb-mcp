@@ -1,11 +1,25 @@
 // Real-usage trial harness for ipynb-mcp — scenario scenarios.
 // See trial-changejob.mjs for the driver.
 
-// The notebooks the harness acts on. Override with IPYNB_TRIAL_DIR; the default is the directory the
-// real-usage trial used, and the harness refuses to run unless `--root` matches it (see the guard in
-// trial-changejob.mjs), so a wrong value fails loudly instead of editing the wrong files.
-const TRIAL_DIR = process.env['IPYNB_TRIAL_DIR'] ?? 'E:\\tmp\\ipynb-trial\\nb';
-const P = (name) => `${TRIAL_DIR}\\${name}`;
+// The notebooks these scenarios act on, ALWAYS inside the driver's `--root`. `setTrialRoot` is called once
+// by `trial-changejob.mjs` before any scenario runs, which is what makes it impossible to reach outside the
+// root: an earlier version kept its own hard-coded directory and its comment claimed a guard kept the two in
+// sync, but no such guard existed (v14 V14-6②).
+let trialRoot = null;
+
+/** Called by the driver with `--root`. Throws if a scenario runs before the driver set it. */
+export function setTrialRoot(root) {
+  trialRoot = root;
+}
+
+function rootDir() {
+  if (trialRoot === null) {
+    throw new Error('setTrialRoot() must be called by the driver before running a scenario');
+  }
+  return trialRoot;
+}
+
+const P = (name) => `${rootDir()}\\${name}`;
 
 const PROBE_MD = '## MCP 试跑\n\n由 ipynb-mcp 试跑脚本插入（可删除）。\n';
 
@@ -100,7 +114,7 @@ export default {
     // path simply did not exist, so `path_outside_root` was never the reason for the refusal and the
     // check passed for the wrong reason (review v13 V13-3③). A sibling of the root is outside it
     // everywhere, and this module deliberately has no imports — the driver owns path resolution.
-    const outside = await call('notebook_read', { path: `${TRIAL_DIR}\\..\\outside-root-probe.ipynb` });
+    const outside = await call('notebook_read', { path: `${rootDir()}\\..\\outside-root-probe.ipynb` });
     note(brief(outside, { code: (j) => j.error?.code ?? j.code, msg: (j) => String(j.error?.message ?? j.message ?? '').slice(0, 120) })
       || outside.text.slice(0, 200));
 

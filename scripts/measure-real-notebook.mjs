@@ -15,6 +15,28 @@ const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const BIN = path.join(REPO, 'lib', 'bin.js');
 const mib = (bytes) => `${(bytes / 1024 / 1024).toFixed(1)}`;
 
+/**
+ * Report probe failures and FAIL the run.
+ *
+ * Loud on purpose. The silent version collected these into an array nobody read, so a probe that never
+ * worked still printed `ratio=0.0` — a plausible-looking measurement of nothing, which is worse than a
+ * tool that stops (v13 V13-3②, only actually closed in v14 V14-6①). The same reporter is in
+ * `measure-run-memory.mjs`; the two scripts are independent CLIs, so one cannot import the other without
+ * turning a scratch tool into a module graph.
+ */
+function reportSampleFailures(errors) {
+  if (errors.length === 0) {
+    return;
+  }
+  process.stderr.write(
+    `probe sampling failed ${String(errors.length)} time(s); the numbers below are NOT measurements\n`,
+  );
+  for (const error of errors.slice(0, 3)) {
+    process.stderr.write(`  ${error}\n`);
+  }
+  process.exitCode = 1;
+}
+
 /** Peak working set of the child, in bytes, sampled until it exits. */
 function watchPeak(child, intervalMs = 100) {
   const state = { peak: 0, timer: null };
@@ -93,6 +115,7 @@ async function measure(label, notebook, extraArgs = [], extraEnv = {}) {
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   clearInterval(watcher.timer);
+  reportSampleFailures(watcher.errors);
   const runReply = replies.find((reply) => reply.id === 3);
   const crashed = child.exitCode !== null && runReply === undefined;
   process.stdout.write(

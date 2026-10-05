@@ -404,21 +404,44 @@ function inspectRepository() {
  * half of the same rule (review v10 V10-8). The minimum-applied count below is what keeps
  * that tolerance from degenerating into "nothing is checked any more".
  */
+/**
+ * Splice the given row so it loses a cell, or null when it cannot be spliced.
+ *
+ * The trailing line ending is split off FIRST, and that is not cosmetic: a `$`-anchored replacement does not
+ * match a line ending in `\r`, so on a checkout with CRLF endings this mutation silently became a no-op and
+ * `--selftest` reported that the document was fine about a row it had never edited. A mutation that cannot
+ * be applied must be SKIPPED with a notice, never quietly skipped — which is what returning null does here,
+ * and what the tolerance counter below relies on.
+ */
+function spliceLastRow(original, lastRow) {
+  if (lastRow === null) {
+    return null;
+  }
+  return editLine(original, `| ${lastRow} |`, (line) => {
+    const ending = line.endsWith('\r') ? '\r' : '';
+    const body = ending === '' ? line : line.slice(0, -1);
+    const spliced = body.replace(/ \| ([^|]*) \|$/, ' |$1|');
+    return spliced === body ? null : `${spliced}${ending}`;
+  });
+}
+
+/**
+ * Replace the first line starting with `prefix`, by line rather than by regex.
+ */
+function editLine(text, prefix, change) {
+  const lines = text.split('\n');
+  const at = lines.findIndex((line) => line.startsWith(prefix));
+  if (at < 0) {
+    return null;
+  }
+  lines.splice(at, 1, ...(change === null ? [] : [change(lines[at])]));
+  return lines.join('\n');
+}
+
 function selftest() {
   const doc = AUTHORITY_DOCS[0];
   const original = read(doc.file);
   const skipped = [];
-
-  /** Replace the first line starting with `prefix`, by line rather than by regex. */
-  const editLine = (text, prefix, change) => {
-    const lines = text.split('\n');
-    const at = lines.findIndex((line) => line.startsWith(prefix));
-    if (at < 0) {
-      return null;
-    }
-    lines.splice(at, 1, ...(change === null ? [] : [change(lines[at])]));
-    return lines.join('\n');
-  };
 
   /** The last numbered row's prefix, derived from the document rather than hard-coded. */
   const lastRow = [...original.matchAll(/^\| (D-\d{3}) \|/gm)].at(-1)?.[1] ?? null;
@@ -481,24 +504,12 @@ function selftest() {
     },
     {
       name: 'a row was spliced onto the pasted copy (the v9 symptom, at row scale)',
-      // Derived: turn the last cell separator into a bare pipe, so the row loses a cell however its
-      // final column happens to be worded.
-      //
-      // The line ending is split off FIRST, and that is not cosmetic: a `$`-anchored replacement does
-      // not match a line ending in `\r`, so on a checkout with CRLF endings this mutation silently
-      // became a no-op and `--selftest` failed claiming the guard had no discrimination — reporting
-      // "the row is fine" about a row it never edited. A mutation that cannot be applied must be
-      // SKIPPED with a notice, never quietly skipped (the rule the tolerance counter below exists for).
-      text:
-        lastRow === null
-          ? null
-          : editLine(original, `| ${lastRow} |`, (line) => {
-              const ending = line.endsWith('\r') ? '\r' : '';
-              const body = ending === '' ? line : line.slice(0, -1);
-              const spliced = body.replace(/ \| ([^|]*) \|$/, ' |$1|');
-              // Applied or not, say so: a mutation that changed nothing is not evidence.
-              return spliced === body ? null : `${spliced}${ending}`;
-            }),
+      // Derived: turn the last cell separator into a bare pipe, so the row loses a cell however its final
+      // column happens to be worded. `spliceLastRow` is a named function rather than an arrow inline in the
+      // ternary — the inline version was misindented, which `check-indent` caught the moment it started
+      // covering `scripts/` (v14 V14-6③), and a four-level-nested callback is exactly the shape the check
+      // exists to keep out of this repository.
+      text: spliceLastRow(original, lastRow),
       expect: 'cells, the table declares',
     },
     {

@@ -360,7 +360,7 @@ export function parseConfig(
     previewLines: Number(resolved['preview-lines']),
     maxImagesPerCall: Number(resolved['max-images-per-call']),
     maxImageBytes: Number(resolved['max-image-bytes']),
-  maxResponseBytes: Number(resolved['max-response-bytes']),
+    maxResponseBytes: Number(resolved['max-response-bytes']),
     logLevel: resolved['log-level'] as LogLevel,
   };
   return { config, errors: [], helpRequested };

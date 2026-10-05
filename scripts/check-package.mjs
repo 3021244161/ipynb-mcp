@@ -58,7 +58,7 @@
 // did exactly that, and also required an executable bit on `lib/bin.js`, which npm
 // sets for `bin` entries regardless of the packed mode.
 
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -103,6 +103,34 @@ const FORBIDDEN = [
 const REQUIRED = [SIDECAR, 'README.md', 'LICENSE'];
 
 /**
+ * Every file allowed to sit in the repository ROOT.
+ *
+ * Seven incidents of "a scratch file reached the repository" (patch-*, probe-*, mutate-*, commit-message
+ * drafts, and v14's `tmp-result-backup.ts`, an outdated copy of a source file that no gate could see because
+ * they all scope themselves to `src`/`tests`/`scripts`). Each one added a `.gitignore` pattern, which only
+ * ever fixes the shape that already happened. A whitelist fixes the CLASS: the root is a small, stable set,
+ * so anything unexpected there is either deliberate or leftover, and the difference is a one-line edit to
+ * this list with a reason attached (v14 V14-4).
+ */
+const ROOT_ALLOWED = new Set([
+  '.gitattributes',
+  '.gitignore',
+  '.oxlintrc.json',
+  'AGENTS.md',
+  'CHANGELOG.md',
+  'LICENSE',
+  'README.md',
+  'SPEC.md',
+  'package.json',
+  'pnpm-lock.yaml',
+  'pnpm-workspace.yaml',
+  'tsconfig.json',
+  'tsconfig.test.json',
+  'vitest.config.ts',
+  'vitest.integration.config.ts',
+]);
+
+/**
  * The rules, as a pure function of what was observed, so the self-test can drive them
  * with a synthetic observation instead of a real tarball.
  *
@@ -112,8 +140,17 @@ const REQUIRED = [SIDECAR, 'README.md', 'LICENSE'];
  * `builtModules` every compiled `.js` module under `lib/` in the working tree
  * `repoPython`   names inside `python/` in the working tree
  */
-function inspect({ packaged, binaries, builtModules, repoPython }) {
+function inspect({ packaged, binaries, builtModules, repoPython, rootFiles = [] }) {
   const problems = [];
+
+  // The root whitelist. Reported with the file names, because "which file" is the actionable part, and
+  // scoped to TRACKED-ish observation: the caller passes what is on disk minus what git ignores.
+  const strayRoot = rootFiles.filter((name) => !ROOT_ALLOWED.has(name));
+  if (strayRoot.length > 0) {
+    problems.push(
+      `the repository root has files that are not in the whitelist: ${strayRoot.slice(0, 5).join(', ')} (a scratch file belongs in %TEMP%, a keeper belongs in scripts/ with a reason in ROOT_ALLOWED)`,
+    );
+  }
 
   for (const [pattern, why] of FORBIDDEN) {
     const hits = packaged.filter((file) => pattern.test(file));
@@ -183,6 +220,32 @@ function inspect({ packaged, binaries, builtModules, repoPython }) {
   return problems;
 }
 
+
+/**
+ * Root-level entries that git would actually track.
+ *
+ * Ignored files are excluded on purpose: the root legitimately holds things like `lib/`, `node_modules/` and
+ * a scratch `.txt` during a session, and failing on those would make this rule noise — which is how rules get
+ * deleted (v10 V10-8: a guard must not fail for reasons unrelated to what it guards).
+ */
+function trackedRootEntries() {
+  const listed = spawnSync('git', ['ls-files', '--others', '--cached', '--exclude-standard', '--directory'], {
+    cwd: REPO_ROOT,
+    encoding: 'utf8',
+  });
+  if (listed.status !== 0) {
+    return [];
+  }
+  return [
+    ...new Set(
+      String(listed.stdout)
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => line !== '' && !line.includes('/')),
+    ),
+  ];
+}
+
 // ---------------------------------------------------------------------------
 // The mutation matrix: every rule above, plus the mutation it must catch.
 
@@ -199,6 +262,11 @@ const SELFTEST_MATRIX = [
   // The control is not decoration: without it, a rule that fired on everything would
   // "detect" every mutation below.
   { mutation: 'control: a clean manifest', expect: null, observation: {} },
+  {
+    mutation: 'a scratch file in the repository root',
+    expect: 'not in the whitelist',
+    observation: { rootFiles: ['package.json', 'tmp-result-backup.ts'] },
+  },
   {
     mutation: 'ship a .pyc next to the sidecar',
     expect: 'ships compiled Python bytecode',
@@ -398,6 +466,9 @@ function readObservation() {
     binaries,
     builtModules: readBuiltModules(),
     repoPython: existsSync(pythonDir) ? readdirSync(pythonDir) : [],
+    // Every root entry that is not ignored, so a scratch file that WOULD be committed is caught here
+    // rather than by a reviewer noticing it in a diff.
+    rootFiles: trackedRootEntries(),
   };
 }
 

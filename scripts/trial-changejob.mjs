@@ -117,7 +117,12 @@ if (has('--scan')) {
 
 const scenario = flag('--scenario');
 if (scenario) {
-  const scen = (await import('./trial-scenarios.mjs')).default;
+  const scenarios = await import('./trial-scenarios.mjs');
+  // The scenarios build their notebook paths FROM `--root`, so a path outside it cannot be expressed.
+  // They used to carry their own hard-coded directory with a comment claiming a guard kept the two in
+  // sync — a guard that did not exist (v14 V14-6②).
+  scenarios.setTrialRoot(root);
+  const scen = scenarios.default;
   const fn = scen[scenario];
   if (!fn) {
     process.stderr.write(`unknown scenario ${scenario}; have: ${Object.keys(scen).join(', ')}\n`);

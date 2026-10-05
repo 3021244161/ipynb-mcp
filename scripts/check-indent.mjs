@@ -572,14 +572,20 @@ function collect(target, out = []) {
     }
     return out;
   }
-  if (/\.(ts|mts)$/.test(target)) {
+  // `.mjs` too, and that is V13-2's second half finally done: `scripts/` holds real code — `check-docs.mjs`
+  // IS the honesty gate and `release-check.mjs` is the publishable-artifact gate — and it was covered by
+  // `check-format` alone (tabs and trailing whitespace), so a misindented block there was invisible. The
+  // alternative offered by the review was to register an exemption; a repository whose whole `scripts/`
+  // directory is exempt from the check that exists because "block misalignment happened three times" is the
+  // worse trade (v14 V14-6③).
+  if (/\.(ts|mts|mjs)$/.test(target)) {
     out.push(target);
   }
   return out;
 }
 
 const requested = process.argv.slice(2);
-const targets = requested.length > 0 ? requested : ['src', 'tests'];
+const targets = requested.length > 0 ? requested : ['src', 'tests', 'scripts'];
 for (const file of targets.flatMap((target) => collect(target))) {
   problems.push(...analyse(path.relative(process.cwd(), file), readFileSync(file, 'utf8')));
 }

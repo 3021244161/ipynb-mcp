@@ -417,6 +417,64 @@ describe('[I16] background run vs kernel restart', () => {
   }, 180_000);
 });
 
+describe('[V14-7] a cancel that arrives after the fact must not relabel it', () => {
+  it('[V14-7] a cancel after a kernel death leaves the run failed/kernel_died', async () => {
+    // WHY THIS CASE EXISTS. The `[V13-8]` case shows a kernel death is classified correctly when nothing else
+    // happens. This one shows the classification is not undone by a cancel that arrives afterwards, which is a
+    // different claim: `handleRunCancel` writes `handle.abortReason = 'cancelled'` unconditionally and settles
+    // the run as `cancelled`, so a client cancelling a run whose kernel has already died would be told "you
+    // cancelled it" — losing the fact that the kernel's state was lost.
+    //
+    // The review found this effect had no coverage at all: reverting the getter alone left every case green,
+    // because the only classification test never sent a cancel (v14 V14-7, mutations M3/M4).
+    //
+    // The timing used to be "cancel while the kernel is dying", and that is NOT assertable from here: a cancel
+    // that genuinely arrives first makes `cancelled` the CORRECT answer, so a race would produce a flaky test
+    // asserting the wrong thing half the time (my first version of this case did exactly that, and failed with
+    // `state: "cancelled"` for the right reason). The deterministic, meaningful claim is the one below: once
+    // the kernel death is the recorded fact, a late cancel cannot rewrite it.
+    const nb = await writeNb('v14-7.ipynb', [
+      codeCell('c0', 'a = 1'),
+      codeCell('c1', 'import os\nos._exit(7)'),
+    ]);
+    const started = await callTool('notebook_run', {
+      path: nb, cell_selector: 'all', timeout_seconds: 300,
+    });
+    const startBody = JSON.parse(String(started.content[0]?.text ?? '{}')) as Record<string, unknown>;
+    expect(startBody['kind']).toBe('background');
+    const runId = String(startBody['run_id']);
+
+    // Wait for the kernel death to be the recorded outcome.
+    const deadline = Date.now() + 60_000;
+    let died: Record<string, unknown> = {};
+    for (;;) {
+      const poll = await callTool('notebook_run_status', { run_id: runId });
+      died = JSON.parse(String(poll.content[0]?.text ?? '{}')) as Record<string, unknown>;
+      const error = died['error'] as Record<string, unknown> | undefined;
+      if (error?.['code'] === 'kernel_died') {
+        break;
+      }
+      if (Date.now() > deadline) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    expect((died['error'] as Record<string, unknown>)?.['code'], JSON.stringify(died).slice(0, 300)).toBe(
+      'kernel_died',
+    );
+
+    // Now cancel, and assert the facts do not move.
+    await callTool('notebook_run_cancel', { run_id: runId });
+
+    const after = await callTool('notebook_run_status', { run_id: runId });
+    const finalBody = JSON.parse(String(after.content[0]?.text ?? '{}')) as Record<string, unknown>;
+    expect(finalBody['state'], JSON.stringify(finalBody).slice(0, 300)).toBe('failed');
+    expect((finalBody['error'] as Record<string, unknown>)['code']).toBe('kernel_died');
+    // And the cancel did not claim the run either.
+    expect((finalBody['error'] as Record<string, unknown>)['message']).not.toContain('cancelled');
+  }, 180_000);
+});
+
 describe('[I12] stdout purity of the real stdio server', () => {
   it('every stdout line from the spawned server is valid JSON-RPC', async () => {
     // Build first (lib/bin.js must exist); pnpm is a .cmd on Windows -> shell.

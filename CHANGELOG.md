@@ -2,6 +2,59 @@
 
 本项目的接口变更遵循 D22 兼容承诺（工具名与参数名在 1.x 内不删不改；新增参数一律可选带默认值；返回字段只增不删）。
 
+## [Unreleased] 0.1.0 — 第十四轮代码复核整改（上线前健壮性）
+
+> 来源：`docs/review/ipynb-mcp-code-review-v14.md`（评级 **C**：3 条 🔴 + 7 条 🟡）。
+> **无工具名/参数名变更**；`--max-response-bytes` 仍是可选带默认值；返回字段只增不减。
+>
+> **本轮的性质是新的**：三条 🔴 **全部**出在第十三轮**新写的** `src/core/response-budget.ts` 里——"新加的护栏本身会挂死进程"，从"某个功能不对"升级为"整个 server 对所有后续请求无响应"。
+
+### Fixed — 截断循环不收敛，整个 MCP server 永久挂死（🔴 V14-11）
+
+`keep = Math.max(200, length - overshoot - 512)` 在该字段长度小于约 237 字符时会**超过字段自身长度**，于是"被截断"的值是**原文 + 37 字符标记**：每一轮把载荷**变大**，`for (;;)` 永不退出。它是**同步**循环，事件循环被完全占住——不是这次调用不返回，而是**之后任何调用都不返回**。评审实测：读一个 8 MiB 源码的 notebook，`include_outputs='full'` 30 s 无响应（`McpError -32001`），同文件 `preview` 76 ms 正常。触发面正是本轮旗舰场景（源码撑大载荷 + 小输出）。
+
+修法：**每一轮必须证明有净进展**——目标长度被钳在**严格小于**当前长度，改写后按字节重测，**没有变小就撤回该字段并跳过它**，交给丢弃阶段；两个循环都加 `MAX_DEGRADATION_PASSES` 上界，超限抛错而不是静默自旋。文本字段判定也按**字节**而非字符数选最大项。
+
+### Fixed — 错误响应绕过预算，失败时照样打死客户端（🔴 V14-12）
+
+预算只挂在**成功**分支，错误响应裸 `JSON.stringify({code, message, detail})`，而 `detail.executed[]` 带着每个已完成 cell 的 outputs —— 于是"产出一个大输出 + 随后超时/取消/内核死亡"这条路径没有上界。评审实测量到 `-32000 Connection closed`，而这正是 D-065 想消灭的形态里**最糟**的一种：**文件已经成功写回**，模型既不知道超时、也不知道哪些 cell 跑完了，之后整条会话 `Not connected`。
+
+修法：`toCallToolResult` 的**两个出口**都过预算（错误体也对 `detail` 施加）。
+
+### Fixed — 字节估算按 UTF-16 单元且忽略转义，低估 2–6 倍（🔴 V14-13）
+
+SDK 的 `ReadBuffer` 比的是 `Buffer.byteLength(JSON.stringify(message))`，而字符串在帧里**会被再转义一次**：`"` 与反斜杠各占 4 字节，控制字符写成 `\u00XX` 占 12 字节。原实现按 UTF-16 长度估算，注释还写着"刻意保守"（方向说反了）。评审实测 **3 MiB 反斜杠即 `Connection closed`**，而同尺寸 ASCII 正常；复核方 8 例矩阵（中文/emoji/latin-1/控制字符/引号）**全部**绕过预算——**中文 notebook 用户几乎必然命中**。
+
+修法：`escapedByteLength` 逐字符按**转义后**的 UTF-8 字节计（引号与反斜杠→4、控制字符→12、BMP 外按代理对），断言与 `Buffer.byteLength` 实测逐类对照且**永不低于**真实值。
+
+### Fixed — 守卫与登记的小账（🟡 V14-1/2/4/5/6/8/9、F4/5/8/9/10）
+
+- **丢弃阶段会删掉整个 cell**（F4）：原来按"最长的对象数组"挑目标，cell 多时挑中 `cells` —— 实测响应出现 `cells: []` 而 `cell_count: 1`，警告却说丢了一个 output。现在**只**在 `outputs` 上丢弃。
+- **一次调用出现两条 `output_truncated`**（F5）：§7 规定整次调用只追加一次。截断与丢弃两个阶段现在**合并成一条**消息。
+- **文案里的 MiB 用 floor**（F8）：`--max-response-bytes 65536` 会说 "exceeded the **0 MiB** response budget"——模型可见的假数字。现在按量级输出 `KiB` / `MiB`。
+- **"非真空"断言其实真空**（F9/V14-5）：`outputs.length === 0 || outputs.every(...)` 对空数组恒真。改成 `filter(...)` 后断言 `toEqual([])`，"没有成功输出"成为对**响应**的断言而非重言式；`oxlint` 的 `unicorn/no-useless-length-check` 也随之消失。
+- **`tmp-result-backup.ts` 第七次入库、三套门禁全看不见**（V14-4）：已删除，并新增**仓库根白名单门禁**——`check-package.mjs` 现在断言根目录只有 15 个已知文件，并带自己的变异。这是根治；`.gitignore` 只是每次补一个已经发生过的形状。
+- **`scripts/` 只受 `check-format` 约束**（V14-6③）：`check-indent` 的收集器扩到 `.mjs`，并**立刻抓到我自己**在 `check-docs.mjs` 里写的错位缩进。
+- **两处"守卫是摆设"**（V14-6①②）：`measure-*.mjs` 的采样失败现在**打印并以非零退出**（此前只 push 进一个没人读的数组，坏掉的探针照样打印看起来正常的 `ratio=0.0`）；`trial-scenarios.mjs` 那句"harness refuses to run unless `--root` matches"描述的护栏**不存在**——改为由驱动器 `setTrialRoot(root)` 提供，路径从 `--root` 派生，越界**在构造上不可能**。
+- **状态文档的按轮快照被追溯覆盖**（V14-8）：`REVIEW-FIX-STATUS.md` 的 v12 段落改回 **596·30 / 73·11**（那是 v12 当时的实测），本轮数字只写在本轮段落里。
+- **计时阈值压在噪声带上**（V14-9）：同一夹具 25 轮的比值中位 2.15、**最大 3.22**，阈值 3 → 25 次里 5 次假红。改为**取 5 次运行的最小值**并把阈值放到 4（仍能抓住二次特征的 3.91）；本地连跑 12 次 0 假红。
+- **D-064 的验证列不完整**（V14-7）：补齐四组变异结果，并说明"写回期间的取消"这一效果在**本实现的 MCP 表面上不可观测**（`RunStore.settle` 只在 `running` 时写入，内核死亡的终态先落），因此不再声称它有独立用例；新增的 `[V14-7]` 覆盖可观测的那一半：终态一旦是 `failed`/`kernel_died`，之后的取消不得改写。
+- **D-065 的措辞描述了一个不存在的字段**（V14-1）：`text`/`json` 项在 SPEC §4.3 里没有 `truncated` 字段，条文改为事实（文本内标记 + 调用级警告），并写明 `output_truncated` 在此处的**第四义**与"要结构化标志需人类批准"。
+- **丢弃路径的建议不可执行**（V14-2）："ask for fewer cells" 对"单个 cell 的单个大输出"没有用（那正是最常见形态），改为对两种情形都成立的说法。
+- **`src/config.ts` 的缩进**（V14-10）已修。
+
+### Documented, not changed
+
+- **预算挡下的图片已被物化**（F6）：`applyImagePolicy` 在"该不该返回块"这一层决定物化，而整帧预算在它之后才生效，所以装不下的图**已经落盘**（`artifact_path` 有效），只是块不返回；警告用的是 `image_materialize_failed`。§4.4 的四条路径（`summary`/`--images=never`/超 `max_images_per_call`/解码失败）**都不物化**，U26 断言的正是这四条。真正的修法要把预算前移到物化之前，属独立改动。见 **D-066**。
+- **8–10 MiB 之间、客户端本来能收下的响应也会被截断**（V14-3）：这是"默认值取安全侧"的直接后果，README 已补上这个后果与出路。见 **D-067**。
+
+### Tests
+
+- 新增 `tests/unit/response-budget.test.ts`（7 例）：循环终止与"绝不把值改大"、估算与 `Buffer.byteLength` 逐类对照且**永不低于**、丢弃只动 `outputs`、子 MiB 预算的文案。**变异验证**：三条 🔴 各自单独还原 → 分别 3 条红 / 集成 1 条红 / 集成 5 条红。
+- `tests/integration/v13-response-budget.test.ts` 扩到 8 例：新增 5 类**转义密集**载荷（反斜杠/引号/中文/控制字符/Windows 路径）与 `[V14-12]`"大输出 + 超时"。夹具从 `'x'.repeat(...)` 改为真实内容类型——**旧夹具对着被低估 2–6 倍的坏代码也全绿**。
+- `tests/integration/server.test.ts` 新增 `[V14-7]`；`check-package.mjs` 的变异矩阵 +1（根白名单）。
+- 单测 **607**（32 文件）；集成 **85**（13 文件）；`check:package` **144 文件 / 23 变异**。
+
 ## [Unreleased] 0.1.0 — 第十三轮代码复核整改（发布前最后一轮）
 
 > 来源：`docs/review/ipynb-mcp-code-review-v13.md`（评级 **C**：3 条 🔴 + 4 条 🟡）。

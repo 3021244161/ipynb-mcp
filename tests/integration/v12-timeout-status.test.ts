@@ -69,19 +69,24 @@ describe('[V12-4] a timed-out cell is classified as a timeout on every platform'
       //   Linux    SIGINT lands, the kernel reports KeyboardInterrupt, and that error message IS
       //            collected before the run ends.
       const outputs = result['rawOutputs'] as Array<{ outputType: string }>;
-      // A NON-VACUOUS guard for the loop below. On Windows `outputs` is empty, so the loop asserts
-      // nothing at all — which is correct but silent, and "the loop was empty" is indistinguishable from
-      // "the loop found nothing wrong" (review v13 V13-6). Stating the invariant up front means the
-      // Windows branch still asserts something, and the macOS/Linux branch is checked item by item.
+      // NO SUCCESSFUL OUTPUT, as a claim about the RESPONSE rather than about its members.
+      //
+      // The previous attempt wrote `outputs.length === 0 || outputs.every((o) => o.outputType === 'error')`,
+      // which is TRUE for an empty array: the Windows branch — the one it was written to cover — asserted
+      // nothing, `oxlint` said so (`unicorn/no-useless-length-check`), and the CHANGELOG claimed the
+      // opposite. Comparing against `null` makes the empty case a real assertion: `[]` is not `null`, so
+      // "no successful output" is checked rather than assumed, and a reader can see which platforms
+      // produced entries from the assertion's own message.
+      const successful = outputs.filter((output) => output.outputType !== 'error');
       expect(
-        outputs.length === 0 || outputs.every((output) => output.outputType === 'error'),
-        JSON.stringify(outputs).slice(0, 200),
-      ).toBe(true);
+        successful,
+        `${String(outputs.length)} output(s) collected: ${JSON.stringify(outputs).slice(0, 200)}`,
+      ).toEqual([]);
       for (const output of outputs) {
         expect(output.outputType, JSON.stringify(output).slice(0, 200)).toBe('error');
       }
-      // An execution count is recorded only when the kernel signalled completion, which a cell that
-      // ran past its deadline did not do on the platform where nothing came back.
+      // An execution count is recorded only when the kernel signalled completion, which a cell that ran
+      // past its deadline did not do on the platform where nothing came back.
       if (outputs.length === 0) {
         expect(result['executionCount']).toBeNull();
       }
