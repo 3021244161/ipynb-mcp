@@ -56,17 +56,24 @@ describe('[V14-11] the budget loop terminates and never grows a value', () => {
     }
   }, 30_000);
 
-  it('[V14-11] a value that cannot be shortened is left EXACTLY as it was', () => {
-    // Growing a value is how the loop failed to converge, so the guard is that the original bytes survive
-    // untouched when no progress is possible.
+  it('[V14-11] a value that cannot be shortened is never made LONGER', () => {
+    // Growing a value is how the loop failed to converge, so the guard is that nothing comes back bigger
+    // than it went in. Two outcomes are legitimate — a degraded payload, or the explicit refusal — and the
+    // assertion covers both because "the result is smaller or the answer is withheld" is the contract.
     const field = 'z'.repeat(150);
     const payload = { items: [{ kind: 'text', media_type: 'text/plain', text: field }], bulk: 'b'.repeat(4000) };
     const outcome = enforceResponseBudget(payload as never, 512);
-    const items = (outcome.payload as Record<string, unknown>)['items'] as Array<Record<string, unknown>>;
-    // Either it is untouched, or it is genuinely shorter AND marked. "Longer than the original" is the one
-    // outcome that must be impossible.
-    const text = String(items[0]?.['text']);
-    expect(text.length <= field.length + TRUNCATION_MARKER.length).toBe(true);
+    expect(outcome.estimatedBytes).toBeLessThanOrEqual(512);
+    const body = outcome.payload as Record<string, unknown>;
+    if (body['response_budget_exceeded'] === true) {
+      // The refusal path: it must say so, and it must be small.
+      expect(outcome.degraded).toBe(true);
+      expect(JSON.stringify(body).length).toBeLessThan(2000);
+      return;
+    }
+    const items = body['items'] as Array<Record<string, unknown>>;
+    const text = String(items?.[0]?.['text'] ?? '');
+    expect(text.length).toBeLessThanOrEqual(field.length + TRUNCATION_MARKER.length);
     if (text.includes(TRUNCATION_MARKER)) {
       expect(text.length).toBeLessThan(field.length + TRUNCATION_MARKER.length);
     }
@@ -153,13 +160,18 @@ describe('[V14-F4] the drop phase removes outputs and keeps every cell', () => {
       cell_type: 'code',
       outputs: Array.from({ length: 3 }, () => ({ kind: 'text', media_type: 'text/plain', text: 'o'.repeat(5000) })),
     }));
-    const outcome = enforceResponseBudget({ path: 'x.ipynb', cells, cell_count: 20 } as never, 4096);
+    // 32 KiB: room for 20 cell skeletons once their outputs are gone, and not enough for the outputs.
+    const outcome = enforceResponseBudget({ path: 'x.ipynb', cells, cell_count: 20 } as never, 32 * 1024);
     const kept = (outcome.payload as Record<string, unknown>)['cells'] as unknown[];
     // Every cell is still described, and the count still agrees with what is there.
     expect(kept.length).toBe(20);
     expect((outcome.payload as Record<string, unknown>)['cell_count']).toBe(20);
+    // The cell COUNT must agree with the array, which is the invariant v14 F4 was about: a response that
+    // said `cells: []` next to `cell_count: 1` was incoherent.
+    expect(kept.length).toBe((outcome.payload as Record<string, unknown>)['cell_count']);
     // Something WAS dropped, or this case would pass on a budget that never degrades.
     expect(outcome.degraded).toBe(true);
+    expect(outcome.estimatedBytes).toBeLessThanOrEqual(32 * 1024);
   }, 30_000);
 });
 
@@ -180,5 +192,65 @@ describe('[V14-F8] the warning describes the budget truthfully', () => {
       expect(message).not.toContain('0 MiB');
       expect(message).toContain('KiB');
     }
+  }, 30_000);
+});
+
+/**
+ * [V15-1] The budget must have a lever on whatever holds the bytes — including arrays of strings.
+ *
+ * `TEXT_FIELDS` looked only at scalar properties, so a payload whose bulk is `cells[].source` or
+ * `source_preview` had NO lever at all: the reviewer measured a >10 MiB frame and `McpError -32000
+ * Connection closed` for `include_source='full'` on a 5 MiB source — the exact shape this module exists
+ * to prevent. The v14 fixtures were all large `text/plain` values, which is why they could not see it.
+ *
+ * Arrays are handled generically (any array of strings), not by listing the field names, because a list
+ * has to be extended every time a projection adds one — and that is how this survived a round.
+ */
+describe('[V15-1] the budget shortens arrays of strings, not just scalar text', () => {
+  it('[V15-1] a source-only payload is brought inside the budget', () => {
+    const lines = Array.from({ length: 4000 }, (_, index) => `line ${String(index)} ${'s'.repeat(200)}\n`);
+    const payload = { path: 'x.ipynb', cells: [{ cell_index: 0, source: lines, source_preview: [], source_line_count: lines.length }] };
+    const before = estimatedJsonBytes(payload);
+    const budget = 256 * 1024;
+    const outcome = enforceResponseBudget(payload as never, budget);
+
+    expect(outcome.degraded, 'a source-only payload must be degraded, not passed through').toBe(true);
+    expect(outcome.estimatedBytes).toBeLessThanOrEqual(budget);
+    expect(outcome.estimatedBytes).toBeLessThan(before);
+    // The field is still an array of strings — the lever must not change a field's type, which would break
+    // the shape the model reads.
+    const cells = (outcome.payload as Record<string, unknown>)['cells'] as Array<Record<string, unknown>>;
+    // `cells[0]` is asserted before its `source` is used, so the optional chaining is not load-bearing: if a
+    // future change dropped the cell, the failure would say "expected undefined to be an object" here rather
+    // than surfacing as a confusing TypeError inside the next assertion.
+    const cell = cells[0] as Record<string, unknown> | undefined;
+    expect(cell, JSON.stringify(outcome.payload).slice(0, 200)).toBeDefined();
+    const kept = cell?.['source'] as string[] | undefined;
+    expect(Array.isArray(kept)).toBe(true);
+    expect(kept!.length).toBeGreaterThan(0);
+    expect(kept!.length).toBeLessThan(lines.length);
+    // And the warning names the field, so the model knows what it is missing.
+    const messages = outcome.warnings.map((entry) => String((entry as Record<string, unknown>)['message']));
+    expect(messages.join(' ')).toContain('source');
+  }, 30_000);
+
+  it('[V15-1] the guarantee is unconditional: a payload that cannot be reduced becomes a refusal', () => {
+    // A payload of many small scalars in fields the lever cannot reach: `metadata` is arbitrary JSON, and
+    // these are numbers, so nothing can be shortened and nothing can be dropped (there is no `outputs`).
+    const payload = {
+      path: 'x.ipynb',
+      cell_count: 1,
+      metadata: Object.fromEntries(Array.from({ length: 8000 }, (_, index) => [`k${String(index)}`, 1234567890])),
+    };
+    const budget = 4096;
+    const outcome = enforceResponseBudget(payload as never, budget);
+    expect(outcome.estimatedBytes, 'the frame must never leave above the budget').toBeLessThanOrEqual(budget);
+    expect(outcome.degraded).toBe(true);
+    const body = outcome.payload as Record<string, unknown>;
+    expect(body['response_budget_exceeded']).toBe(true);
+    // The refusal keeps the identifying fields a caller needs to act, and names the way out.
+    expect(body['path']).toBe('x.ipynb');
+    const messages = (body['warnings'] as Array<Record<string, unknown>>).map((entry) => String(entry['message']));
+    expect(messages.join(' ')).toContain('cell_indexes');
   }, 30_000);
 });

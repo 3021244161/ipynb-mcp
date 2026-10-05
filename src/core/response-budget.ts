@@ -57,8 +57,48 @@ export const TRUNCATION_MARKER = '…[truncated to fit the response budget]';
  */
 const MAX_DEGRADATION_PASSES = 10_000;
 
+/**
+ * The cap actually used for one payload: enough for every element the payload could need shortening, never
+ * more than the constant. A payload legitimately made of thousands of large strings needs one pass each, and
+ * a cap that ignored the payload's size would refuse work that is perfectly bounded.
+ */
+function passBudgetFor(elementCount: number): number {
+  return Math.min(MAX_DEGRADATION_PASSES, Math.max(64, elementCount * 2));
+}
+
+/** How many containers the payload holds — the passes a full degradation could legitimately need. */
+function countStrings(root: unknown): number {
+  let count = 0;
+  const visit = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      count += 1;
+      for (const entry of node) {
+        visit(entry);
+      }
+      return;
+    }
+    if (typeof node === 'object' && node !== null) {
+      count += 1;
+      for (const entry of Object.values(node as Record<string, unknown>)) {
+        visit(entry);
+      }
+    }
+  };
+  visit(root);
+  return count;
+}
+
 /** The fields that carry user text, and so are the ones worth shortening when the frame is too big. */
 const TEXT_FIELDS = ['text', 'value', 'html'] as const;
+
+/**
+ * How large a string has to be before the budget will cut it whatever its field is called.
+ *
+ * 64 KiB: far above any scalar the payload carries for identification (paths, ids, hashes, media types) and
+ * far below anything that can dominate a response. Below this, cutting a field would be all cost and no
+ * benefit — the payload would lose meaning while the frame stayed the same size.
+ */
+const GENERIC_STRING_FLOOR_BYTES = 64 * 1024;
 
 export interface ResponseBudgetResult {
   /** The payload to serialize. Equal to the input when nothing had to be removed. */
@@ -150,9 +190,22 @@ function describeBudget(maxBytes: number): string {
   return mib >= 1 ? `${mib.toFixed(2)} MiB` : `${String(Math.round(maxBytes / 1024))} KiB`;
 }
 
-interface TextField {
+/**
+ * One place the budget can take bytes from.
+ *
+ * `scalar` is a string in a TEXT_FIELD; `lines` is an array of strings, which is what `source` and
+ * `source_preview` are — the shape that made the budget powerless (v15 V15-1). Both are ranked by the
+ * bytes they cost, so the largest holder of user text is shortened first whichever kind it is.
+ */
+interface ShrinkableField {
   readonly container: Record<string, JsonValue>;
-  readonly key: (typeof TEXT_FIELDS)[number];
+  readonly key: string;
+  /**
+   * `scalar` = a TEXT_FIELD string (marker appended), `text` = any other large string (same treatment,
+   * reported under the field's own name), `lines` = an array of strings.
+   */
+  readonly kind: 'scalar' | 'text' | 'lines';
+  /** Characters (scalar) or elements (lines) — only used to clamp the target below the current size. */
   readonly length: number;
   /** Bytes this field costs now, so a rewrite is measured rather than assumed. */
   readonly bytes: number;
@@ -166,8 +219,16 @@ interface TextField {
  * over: losing a whole item is worse for the model than losing part of one, but it is bounded, and a
  * response that never arrives is worse than both.
  */
-function findLargestTextField(root: Record<string, JsonValue>, skip: ReadonlySet<string>): TextField | null {
-  let best: TextField | null = null;
+function findLargestField(root: Record<string, JsonValue>, skip: ReadonlySet<string>): ShrinkableField | null {
+  let best: ShrinkableField | null = null;
+  const consider = (candidate: ShrinkableField): void => {
+    if (skip.has(fieldKey(candidate.container, candidate.key))) {
+      return;
+    }
+    if (best === null || candidate.bytes > best.bytes) {
+      best = candidate;
+    }
+  };
   const visit = (node: unknown): void => {
     if (Array.isArray(node)) {
       for (const entry of node) {
@@ -179,14 +240,37 @@ function findLargestTextField(root: Record<string, JsonValue>, skip: ReadonlySet
       return;
     }
     const record = node as Record<string, JsonValue>;
-    for (const key of TEXT_FIELDS) {
-      const value = record[key];
-      if (typeof value !== 'string' || skip.has(fieldKey(record, key))) {
+    for (const [key, value] of Object.entries(record)) {
+      // ANY large string, whatever the field is called. Restricting this to `TEXT_FIELDS` was the defect:
+      // `source` is a plain string of the whole cell in this path and is not in that list, so the 7 MiB
+      // that dominated the payload was unreachable and the response was refused instead of shortened
+      // (review v15 V15-1, found by dumping the payload shape at the moment of refusal). A name list has to
+      // be extended whenever a projection adds a field; "large string" does not.
+      if (
+        typeof value === 'string' &&
+        escapedByteLength(value) > GENERIC_STRING_FLOOR_BYTES &&
+        // Below the marker's own length there is nothing to give: `slice(0, target) + marker` would be
+        // LONGER than the value it replaces, so such a field is not a candidate at all.
+        value.length > TRUNCATION_MARKER.length + 1
+      ) {
+        consider({
+          container: record,
+          key,
+          kind: (TEXT_FIELDS as readonly string[]).includes(key) ? 'scalar' : 'text',
+          length: value.length,
+          bytes: escapedByteLength(value),
+        });
         continue;
       }
-      const bytes = escapedByteLength(value);
-      if (best === null || bytes > best.bytes) {
-        best = { container: record, key, length: value.length, bytes };
+      // An array of strings, whatever it is called: `source`, `source_preview`, a traceback, a cell's
+      // lines. Generic on purpose — a list of names would have to be extended every time a projection
+      // adds a string array, which is how this defect survived a round (v15 V15-1).
+      if (Array.isArray(value) && value.length > 0 && value.every((entry) => typeof entry === 'string')) {
+        let bytes = 2;
+        for (const entry of value as string[]) {
+          bytes += escapedByteLength(entry) + 1;
+        }
+        consider({ container: record, key, kind: 'lines', length: value.length, bytes });
       }
     }
     for (const entry of Object.values(record)) {
@@ -279,6 +363,8 @@ export function enforceResponseBudget(payload: JsonValue, maxBytes: number): Res
   const working = structuredClone(payload) as Record<string, JsonValue>;
   let size = initial;
 
+  // Enough passes for every element that could need shortening, capped by the constant above.
+  const passLimit = passBudgetFor(countStrings(working));
   const unshrinkable = new Set<string>();
   let truncatedFields = 0;
   let removedItems = 0;
@@ -286,7 +372,7 @@ export function enforceResponseBudget(payload: JsonValue, maxBytes: number): Res
 
   const guardPasses = (): void => {
     passes += 1;
-    if (passes > MAX_DEGRADATION_PASSES) {
+    if (passes > passLimit) {
       // Unreachable while every pass makes progress; a loud failure beats a silent spin.
       throw new Error(
         `response budget cannot be satisfied: ${String(MAX_DEGRADATION_PASSES)} passes and still ${String(size)} > ${String(maxBytes)}`,
@@ -294,37 +380,88 @@ export function enforceResponseBudget(payload: JsonValue, maxBytes: number): Res
     }
   };
 
-  // Phase 1: shorten the largest strings first. Largest-first is what makes the budget affordable — a run
-  // whose outputs are mostly small should lose the ONE enormous result rather than a hundred previews.
+  // Phase 1: shorten the largest holder of user text first — a scalar string or an array of lines.
+  // Largest-first is what makes the budget affordable: a run whose outputs are mostly small should lose
+  // the ONE enormous result rather than a hundred previews.
+  // Keyed by field name: the warning has to say WHICH field it shortened, or the model cannot act on it
+  // (v15 V15-2 — the array path already named its field and the scalar path did not).
+  const shortenedScalars: string[] = [];
+  const shortenedArrays: Array<{ key: string; owner: Record<string, JsonValue>; omitted: number }> = [];
   for (;;) {
     if (size <= maxBytes) {
       break;
     }
     guardPasses();
-    const biggest = findLargestTextField(working, unshrinkable);
+    const biggest = findLargestField(working, unshrinkable);
     if (biggest === null) {
       break;
     }
-    const { container, key, length, bytes } = biggest;
+    const { container, key, kind, length, bytes } = biggest;
     const overshoot = size - maxBytes;
-    // PROGRESS IS REQUIRED: the target is clamped strictly below the current length, because `Math.max` used
+    // PROGRESS IS REQUIRED: the target is clamped strictly below the current size, because `Math.max` used
     // to win whenever the arithmetic went negative and the "truncated" value was then the ORIGINAL plus a
     // marker — longer than what it replaced (v14 V14-11).
-    const target = Math.min(length - 1, Math.max(200, length - overshoot - 512));
-    const replacement =
-      target <= 0
-        ? ''
-        : `${(container[key] as string).slice(0, target)}${TRUNCATION_MARKER}`;
-    const nowBytes = escapedByteLength(replacement);
-    if (nowBytes >= bytes) {
-      // No net progress even at the floor. Leave the value EXACTLY as the caller wrote it and stop
-      // considering this field, rather than growing it.
-      unshrinkable.add(fieldKey(container, key));
-      continue;
+    const target = Math.min(length - 1, Math.max(kind === 'lines' ? 1 : 200, length - overshoot - 512));
+
+    if (kind === 'lines') {
+      const lines = container[key] as string[];
+      if (lines.length > 1) {
+        // Dropping whole elements first: it keeps the value's shape and is the cheapest change.
+        const keep = Math.max(1, Math.min(lines.length - 1, target));
+        const dropped = lines.slice(keep);
+        let droppedBytes = 0;
+        for (const entry of dropped) {
+          droppedBytes += escapedByteLength(entry) + 1;
+        }
+        const remainingBytes = bytes - droppedBytes;
+        if (remainingBytes >= bytes) {
+          unshrinkable.add(fieldKey(container, key));
+          continue;
+        }
+        container[key] = lines.slice(0, keep);
+        size += remainingBytes - bytes;
+        shortenedArrays.push({ key, owner: container, omitted: dropped.length });
+      } else {
+        // ONE element and it is too big: there is no element to drop, so the ELEMENT is cut. A notebook
+        // written by a machine usually holds one joined string per cell rather than a line per element, and
+        // without this branch the array lever had nothing to do — the payload fell through to the refusal
+        // even when slicing one string would have fitted it (measured: 8.97 MiB refused at an 8 MiB budget).
+        //
+        // The bound is the ELEMENT's length, not the array's: `length` is 1 here, so an array-sized target
+        // asks for a one-character string and the slice cannot make progress.
+        const only = lines[0] ?? '';
+        // `Math.min` with the value's own length minus the marker and one character: the marker is appended
+        // AFTER the slice, so a slice that leaves no room for it produces a LONGER value, and a longer value
+        // grows the payload (measured: a 5-character value became 40 and the loop never ended).
+        const keepChars = Math.max(
+          1,
+          Math.min(only.length - TRUNCATION_MARKER.length - 1, only.length - overshoot - 512),
+        );
+        const sliced = `${only.slice(0, keepChars)}${TRUNCATION_MARKER}`;
+        const slicedBytes = escapedByteLength(sliced) + 2; // the array's own brackets
+        if (slicedBytes >= bytes) {
+          // No net progress: leave the value exactly as it was and stop considering this field.
+          unshrinkable.add(fieldKey(container, key));
+          continue;
+        }
+        container[key] = [sliced];
+        size += slicedBytes - bytes;
+      }
+    } else {
+      // A scalar string. `text` (any other large string) is treated exactly like a TEXT_FIELD: the marker
+      // says "this was cut" in the value itself, which needs no new field in any schema.
+      const replacement = target <= 0 ? '' : `${(container[key] as string).slice(0, target)}${TRUNCATION_MARKER}`;
+      const nowBytes = escapedByteLength(replacement);
+      if (nowBytes >= bytes) {
+        unshrinkable.add(fieldKey(container, key));
+        continue;
+      }
+      container[key] = replacement;
+      shortenedScalars.push(key);
+      size += nowBytes - bytes;
     }
-    container[key] = replacement;
-    size += nowBytes - bytes;
     truncatedFields += 1;
+    // `continue` is implicit: every branch above either made progress or skipped the field.
   }
 
   // Phase 2: still too big with every text field shortened, so whole OUTPUT items go.
@@ -352,8 +489,18 @@ export function enforceResponseBudget(payload: JsonValue, maxBytes: number): Res
   const warnings: JsonValue[] = [];
   if (truncatedFields > 0 || removedItems > 0) {
     const parts: string[] = [];
-    if (truncatedFields > 0) {
-      parts.push(`${String(truncatedFields)} text value(s) shortened (marked \`${TRUNCATION_MARKER}\`)`);
+    if (shortenedScalars.length > 0) {
+      // Named, deduplicated, and bounded: a payload can hold thousands of shortened fields, and the warning
+      // must not become a response-size lever of its own (the V11-7 lesson about message length).
+      const names = [...new Set(shortenedScalars)].filter((name) => name.length <= 64).slice(0, 8);
+      parts.push(
+        `${String(shortenedScalars.length)} value(s) in ${names.map((name) => `\`${name}\``).join(', ')} shortened (marked \`${TRUNCATION_MARKER}\`)`,
+      );
+    }
+    for (const entry of shortenedArrays) {
+      // "which field, how much" — the two facts a model needs to know what it is missing. The field NAMES
+      // are the payload's own (`source`, `source_preview`), so the reader can map them back.
+      parts.push(`${String(entry.omitted)} item(s) omitted from \`${entry.key}\``);
     }
     if (removedItems > 0) {
       parts.push(`${String(removedItems)} output item(s) omitted`);
@@ -374,7 +521,61 @@ export function enforceResponseBudget(payload: JsonValue, maxBytes: number): Res
     size = estimatedJsonBytes(working);
   }
 
+  // THE LAST RESORT: the frame must never leave here above the budget.
+  //
+  // Everything above tries to keep the payload ANSWER-SHAPED while fitting — shorten the biggest text,
+  // shorten arrays, drop outputs. That covers the shapes a projection produces today, but a future field
+  // can always hold the bulk of a response in a place none of those reach, and the consequence is not a
+  // degraded answer: it is `McpError -32000 Connection closed`, no error code, and every kernel on that
+  // server dying with the session (the V13-1 shape). So when the payload still does not fit, the answer
+  // stops pretending to be the document and becomes an explicit refusal carrying the reason and the way
+  // out. Refusing is worse than answering and better than killing the session — and "better than both" is
+  // not available, because a payload that cannot be shortened is by definition already all substance.
+  //
+  // Measured: `include_source='full'` on a 5 MiB source produced a >10 MiB frame here before the array
+  // lever existed (review v15 V15-1), and the fix for that is the `lines` handling above. This branch is
+  // what makes the guarantee unconditional rather than dependent on knowing every field in advance.
+  if (size > maxBytes) {
+    const refusal = refusalPayload(payload, maxBytes, size);
+    return {
+      payload: refusal,
+      warnings: [...warnings],
+      estimatedBytes: estimatedJsonBytes(refusal),
+      degraded: true,
+    };
+  }
+
   return { payload: working, warnings, estimatedBytes: size, degraded: warnings.length > 0 };
+}
+
+/**
+ * A small, honest response for a payload that could not be brought inside the budget.
+ *
+ * It keeps the identifying fields a caller needs to act (`path`, `run_id`, whatever is small) and states
+ * what happened, rather than dropping content and hoping the model does not notice. `notebook_read`'s
+ * `cell_indexes` and the `include_*` switches are the real remedy, so they are named.
+ */
+function refusalPayload(original: JsonValue, maxBytes: number, size: number): JsonValue {
+  const identity: Record<string, JsonValue> = {};
+  if (typeof original === 'object' && original !== null && !Array.isArray(original)) {
+    for (const [key, value] of Object.entries(original as Record<string, JsonValue>)) {
+      // Only scalars, and only small ones: the point is a payload that certainly fits.
+      if (typeof value === 'string' && value.length <= 300) {
+        identity[key] = value;
+      } else if (typeof value === 'number' || typeof value === 'boolean') {
+        identity[key] = value;
+      }
+    }
+  }
+  return {
+    ...identity,
+    response_budget_exceeded: true,
+    warnings: [
+      warning(
+        `this response is about ${describeBudget(size)} and could not be reduced below the ${describeBudget(maxBytes)} budget. Nothing was sent, so no value is half-delivered: read the notebook in parts with \`cell_indexes\`, use \`include_source='none'\` or \`include_outputs='summary'\` for an overview, or raise \`--max-response-bytes\` if your client's limit allows`,
+      ),
+    ],
+  };
 }
 
 function warning(message: string): JsonValue {

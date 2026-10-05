@@ -75,7 +75,13 @@ export async function renderReadResult(input: RenderReadInput): Promise<RenderRe
       // `9007199254740993` is held as an exact-number marker internally, and handing the
       // marker to the model publishes a structure that exists nowhere (review v11 V11-6).
       execution_count: cell.cell_type === 'code' ? executionCountForDisplay(cell) : null,
-      source_preview: lines.slice(0, sourcePreviewCount),
+      // WHEN `source` IS THE WHOLE THING, THE PREVIEW IS NOT EMITTED. `include_source='full'` used to
+      // send every line twice — once as `source_preview` (all of them) and once as `source` — so the
+      // response was about 2x the notebook's source, and a 5 MiB source produced a >10 MiB frame that
+      // killed the client's connection (review v15 V15-1). An empty preview is not a loss of
+      // information: `source` holds every line, and `source_line_count` states how many
+      // (review v15 V15-1③).
+      source_preview: input.includeSource === 'full' ? [] : lines.slice(0, sourcePreviewCount),
       source_line_count: lines.length,
       source_truncated: sourceTruncated,
       source: input.includeSource === 'full' ? source : null,

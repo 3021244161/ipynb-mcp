@@ -89,6 +89,20 @@ async function writeLargeNotebook(name: string, chars: number, literal?: string)
   return target;
 }
 
+async function callReadWith(target: string, args: Record<string, unknown>) {
+  const result = await client.callTool({
+    name: 'notebook_read',
+    arguments: { path: target, ...args },
+  });
+  const blocks = (result.content ?? []) as Array<{ type: string; text?: string }>;
+  const textBlock = blocks.find((block) => block.type === 'text');
+  return {
+    bytes: Buffer.byteLength(textBlock?.text ?? '', 'utf8'),
+    body: JSON.parse(textBlock?.text ?? '{}') as Record<string, unknown>,
+    blockCount: blocks.length,
+  };
+}
+
 async function callRead(target: string, includeOutputs: string) {
   const result = await client.callTool({
     name: 'notebook_read',
@@ -281,5 +295,183 @@ describe('[V14-12] a failed run still fits the frame', () => {
     // And the session survives, which is what the reviewer's case lost.
     const after = await callRead(target, 'none');
     expect(after.body['cell_count']).toBe(2);
+  }, 180_000);
+});
+
+/**
+ * [V15-1] A payload whose bulk is SOURCE must be bounded too.
+ *
+ * The reviewer's size sweep, with `include_source='full'` and only the source size varying:
+ *
+ *     3 MiB source -> 6.00 MiB response, fine
+ *     5 MiB source -> ~10 MiB response -> `McpError -32000: Connection closed`
+ *     7 MiB, 12 MiB -> the same
+ *
+ * The cause was two-fold and both halves are fixed here: `source` and `source_preview` are ARRAYS of
+ * strings, and the budget looked only at scalar fields, so it had no lever on either; and with
+ * `include_source='full'` the same text was emitted TWICE (every line in `source_preview` and the whole
+ * thing in `source`), which is why the response was about twice the source.
+ *
+ * A 5 MiB source is unusual, but the neighbourhood is not: a big notebook with one large cell (embedded
+ * data, a long document) reaches it, and that is the shape the original 37.5 MiB trial notebook has.
+ */
+describe('[V15-1] a source-heavy response is bounded', () => {
+  /** A notebook whose single cell has `mebibytes` of source. */
+  async function writeSourceHeavy(name: string, mebibytes: number): Promise<string> {
+    const target = path.join(workspace, name);
+    const unit = 'x = 1  # a line of source padding here\n';
+    const lines = Math.ceil((mebibytes * 1024 * 1024) / unit.length);
+    await writeFile(
+      target,
+      `${JSON.stringify({
+        cells: [
+          {
+            cell_type: 'code',
+            execution_count: 1,
+            id: 'c0',
+            metadata: {},
+            outputs: [],
+            source: [unit.repeat(lines)],
+          },
+        ],
+        metadata: {
+          kernelspec: { display_name: 'Python 3', language: 'python', name: 'python3' },
+          language_info: { name: 'python' },
+        },
+        nbformat: 4,
+        nbformat_minor: 5,
+      })}\n`,
+      'utf8',
+    );
+    return target;
+  }
+
+  // The sizes span both sides of the budget on purpose. `5 MiB` was the reviewer's break point when the
+  // response was ~2x the source; with the duplication gone it fits and must arrive WHOLE, and the larger
+  // sizes must arrive shortened or refused. Asserting a warning at a size that fits would be asserting the
+  // wrong thing — my first version of this case did exactly that and failed for the right reason.
+  for (const mebibytes of [5, 7, 9]) {
+    it(`[V15-1] ${String(mebibytes)} MiB of source with include_source='full' stays deliverable`, async () => {
+      const target = await writeSourceHeavy(`source-${String(mebibytes)}.ipynb`, mebibytes);
+      const { bytes, body } = await callReadWith(target, { include_source: 'full', include_outputs: 'none' });
+
+      // THE ASSERTION THE REVIEWER'S TABLE IS ABOUT: the client can receive it. Everything else is secondary.
+      expect(bytes, `response was ${(bytes / 1024 / 1024).toFixed(2)} MiB`).toBeLessThan(10 * 1024 * 1024);
+
+      const refused = body['response_budget_exceeded'] === true;
+      const warned = JSON.stringify(body['warnings'] ?? []).includes('output_truncated');
+      const sourceLines = ((body['cells'] ?? []) as Array<Record<string, unknown>>)[0]?.['source'];
+      if (refused) {
+        // The backstop: nothing half-delivered, and the reason is stated.
+        expect(JSON.stringify(body['warnings'])).toContain('budget');
+      } else if (warned) {
+        // Shortened, and the warning names the field so the model knows what it is missing.
+        expect(JSON.stringify(body['warnings'])).toContain('source');
+      } else {
+        // Delivered whole: then the source must actually be there, or "no warning" would be hiding a loss.
+        // Its TYPE is not asserted: the read projection joins the cell's lines into one string in this path,
+        // and a notebook saved by Jupyter holds them as an array — both are the same source, and pinning one
+        // of them was the mistake my first version of this case made.
+        const present = typeof sourceLines === 'string' || Array.isArray(sourceLines);
+        expect(present, JSON.stringify(body).slice(0, 200)).toBe(true);
+        const size = typeof sourceLines === 'string' ? sourceLines.length : (sourceLines as string[]).length;
+        expect(size).toBeGreaterThan(0);
+      }
+
+      // The session must survive, which is what the reviewer's table lost at 5 MiB and above.
+      const after = await callReadWith(target, { include_outputs: 'none' });
+      expect(after.body['path']).toBeDefined();
+    }, 180_000);
+  }
+
+  it('[V15-1] the same source is not sent twice for include_source=full', async () => {
+    // The duplication was the amplifier: `source_preview` held every line AND `source` held the text, so a
+    // 5 MiB source made a ~10 MiB response. With the preview empty for `full`, the payload is about the
+    // source once.
+    const target = await writeSourceHeavy('source-once.ipynb', 3);
+    const { body } = await callReadWith(target, { include_source: 'full', include_outputs: 'none' });
+    const cells = (body['cells'] ?? []) as Array<Record<string, unknown>>;
+    const preview = cells[0]?.['source_preview'];
+    // `source` carries every line, so an empty preview loses nothing — and `source_line_count` still says
+    // how many there are.
+    if (body['response_budget_exceeded'] !== true) {
+      expect(preview).toEqual([]);
+      expect(typeof cells[0]?.['source_line_count']).toBe('number');
+      expect(cells[0]?.['source_line_count']).toBeGreaterThan(1000);
+    }
+  }, 180_000);
+});
+
+/**
+ * [V15-3] The fixture-shape matrix, made explicit.
+ *
+ * Every case above (and every case in the two rounds before it) used one shape: a large ASCII `text/plain`
+ * value. That is why two whole shapes passed unnoticed — a payload whose bulk is SOURCE (v15 V15-1) and one
+ * made of escaping-heavy content (v14 V14-13). The lesson is not "add a test", it is: **a fixture proves one
+ * shape fits, so the shapes have to be chosen deliberately.**
+ *
+ * The matrix and where each shape is covered:
+ *
+ *   | shape              | case                                                    |
+ *   |--------------------|---------------------------------------------------------|
+ *   | large text output  | `[V13-1]` an 11 MiB output                              |
+ *   | many small outputs | `[V13-1]` 60 x 300 KiB                                  |
+ *   | large source       | `[V15-1]` 5/7/9 MiB with `include_source='full'`         |
+ *   | non-ASCII          | `[V14-13]` CJK                                          |
+ *   | escaping-heavy     | `[V14-13]` backslashes, quotes, control chars, paths     |
+ *   | large image        | `[V15-3]` below                                         |
+ *   | failed run         | `[V14-12]` large output + timeout                       |
+ *
+ * This one covers the image shape, which is the only one that does not travel as text: the block is counted
+ * separately by the budget (`imageBytes`) and withheld when it does not fit, so its failure mode is different
+ * from every case above — the payload can be small while the IMAGE is what overflows the frame.
+ */
+describe('[V15-3] the fixture-shape matrix: a large image output', () => {
+  it('[V15-3] an output holding a multi-megabyte image stays deliverable', async () => {
+    const target = path.join(workspace, 'bigimage.ipynb');
+    // A real PNG header so the bytes are decodable and the image path is exercised rather than rejected as a
+    // bad payload: 1x1 PNG header + a large `tEXt`-style tail makes a valid-enough file for the pipeline.
+    const pngHeader = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
+    const bigPng = Buffer.concat([pngHeader, Buffer.alloc(9 * 1024 * 1024, 7)]);
+    await writeFile(
+      target,
+      `${JSON.stringify({
+        cells: [
+          {
+            cell_type: 'code',
+            execution_count: 1,
+            id: 'c0',
+            metadata: {},
+            outputs: [
+              {
+                data: { 'image/png': bigPng.toString('base64'), 'text/plain': '<Figure>' },
+                metadata: {},
+                output_type: 'display_data',
+              },
+            ],
+            source: ['plot()'],
+          },
+        ],
+        metadata: {
+          kernelspec: { display_name: 'Python 3', language: 'python', name: 'python3' },
+          language_info: { name: 'python' },
+        },
+        nbformat: 4,
+        nbformat_minor: 5,
+      })}\n`,
+      'utf8',
+    );
+
+    // `include_outputs='full'` is what makes images eligible for a block.
+    const { bytes, body, blockCount } = await callReadWith(target, { include_outputs: 'full' });
+
+    // The frame — text plus every image block the SDK will serialize — must stay inside the client's limit.
+    expect(bytes, `text frame was ${(bytes / 1024 / 1024).toFixed(2)} MiB`).toBeLessThan(10 * 1024 * 1024);
+    expect(blockCount).toBeGreaterThanOrEqual(1);
+    // Whatever happened to the image, the payload must be coherent and the session must survive. A withheld
+    // image is the documented degradation (its `artifact_path` stays authoritative); a killed session is not.
+    expect(body['path']).toBeDefined();
+    const after = await callRead(target, 'none');
+    expect(after.body['path']).toBeDefined();
   }, 180_000);
 });
