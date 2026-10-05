@@ -1,11 +1,11 @@
 {
-  "name": "ipynb-mcp",
+  "name": "ipynb-mcp-server",
   "version": "0.1.0",
   "description": "MCP server (stdio) for AI agents to safely read, edit and run local Jupyter notebooks \u2014 zero service, CAS-guarded edits, resumable execution.",
   "license": "MIT",
   "type": "module",
   "bin": {
-    "ipynb-mcp": "./lib/bin.js"
+    "ipynb-mcp-server": "./lib/bin.js"
   },
   "engines": {
     "node": ">=22"
@@ -16,6 +16,28 @@
     "README.md",
     "LICENSE"
   ],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "mcp-server",
+    "jupyter",
+    "jupyter-notebook",
+    "notebook",
+    "ipynb",
+    "ai-agent",
+    "llm-tools",
+    "claude",
+    "cursor",
+    "data-science"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/3021244161/ipynb-mcp.git"
+  },
+  "homepage": "https://github.com/3021244161/ipynb-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/3021244161/ipynb-mcp/issues"
+  },
   "packageManager": "pnpm@11.7.0",
   "scripts": {
     "build": "tsc -p tsconfig.json",

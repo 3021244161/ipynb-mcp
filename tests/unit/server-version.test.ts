@@ -48,6 +48,6 @@ describe('[DEP-2] the server version comes from package.json', () => {
     // The SDK keeps the client-facing identity on the underlying Server.
     const identity = (server.server as unknown as { _serverInfo?: { version?: string; name?: string } })._serverInfo;
     expect(identity?.version).toBe(manifest.version);
-    expect(identity?.name).toBe('ipynb-mcp');
+    expect(identity?.name).toBe('ipynb-mcp-server');
   });
 });

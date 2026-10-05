@@ -1,7 +1,7 @@
 {
   "name": "dsh-ipynb-mcp",
   "version": "0.1.0",
-  "description": "dsh bundle: connect the ipynb-mcp stdio server (read/edit/run local Jupyter notebooks) to dsh.",
+  "description": "dsh bundle: connect the ipynb-mcp-server stdio server (read/edit/run local Jupyter notebooks) to dsh.",
   "license": "MIT",
   "type": "module",
   "peerDependencies": {

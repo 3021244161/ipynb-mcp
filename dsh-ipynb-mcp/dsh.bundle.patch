@@ -14,4 +14,4 @@
 +      command: npx
 +      args:
 +        - "-y"
-+        - "ipynb-mcp"
++        - "ipynb-mcp-server"

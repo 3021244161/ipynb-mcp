@@ -1,18 +1,41 @@
-# ipynb-mcp
+# ipynb-mcp-server
+
+[![npm version](https://img.shields.io/npm/v/ipynb-mcp-server.svg)](https://www.npmjs.com/package/ipynb-mcp-server)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[![node: >=22](https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg)](https://nodejs.org)
+[![CI](https://github.com/3021244161/ipynb-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/3021244161/ipynb-mcp/actions/workflows/ci.yml)
 
 An [MCP](https://modelcontextprotocol.io) server that lets any AI agent **read, edit and run local Jupyter notebooks** — safely, with zero setup.
 
+## The three things that go wrong without it
+
+| What happens today | What this server does instead |
+|---|---|
+| You let an agent edit your notebook while it is also open in JupyterLab, and it **overwrites a cell you changed** — you find out when the file is already broken. | Every source edit carries a **compare-and-swap anchor** (`expected_source_hash` or `expected_text`). If the file changed since the agent last read it, the edit **fails without writing** — and the error already contains the current hash, so one retry succeeds. Writes are atomic and always preceded by a rolling backup. |
+| "Run cell 87" **re-runs the 40-minute training cell at the top**, or the `!wget` that pulls 2 GB. | `mode='resume'` runs only the target cells in the live kernel. No kernel alive? `mode='replay'` silently rebuilds state from cell 0, then runs just the target — and `replayed_cell_indexes` tells you exactly what was re-executed. `notebook_kernel(start)` + `resume` runs one cell with **zero** replay. |
+| To use an agent at all you must first stand up JupyterLab, copy a URL, manage a token and keep it running. | **Nothing to start.** stdio, one line of config, no port, no token. The server talks to a Jupyter kernel directly and dies with your client. |
+
+## 60 seconds
+
 ```bash
-npx -y ipynb-mcp
+# 1. it is a plain stdio server — nothing to install, nothing to start
+npx -y ipynb-mcp-server --root /path/to/your/notebooks
+# 2. now put the one-line config below into your client and restart it
 ```
 
-## Why this one
+No `pip install`, no JupyterLab, no port, no token.
 
-| Promise | What it means |
-|---|---|
-| **Zero service** | No JupyterLab to start, no tokens to manage. One line of config and the agent can open your `.ipynb`. |
-| **Cannot silently corrupt your file** | Every source edit carries a compare-and-swap anchor (`expected_source_hash` or `expected_text`). If the notebook changed since the agent last read it, the edit **fails without writing** — and the error already contains the current hash so one retry succeeds. Writes are atomic, always preceded by a rolling backup. |
-| **Never re-runs your long jobs** | `mode='resume'` runs only the target cells in the live kernel. No kernel alive? `mode='replay'` silently rebuilds state from cell 0, then runs just the target. A 40-minute training cell in cell 2 will not re-execute because you edited cell 5. |
+## How it compares
+
+| | Getting started | Edits that cannot silently corrupt your file | Long jobs | Maintenance |
+|---|---|---|---|---|
+| **ipynb-mcp-server** (this project) | one `npx` line, **no service** | CAS anchor + atomic write + rolling backup on every edit | `resume` / `replay` / one-cell `resume`, plus stale-cell analysis | active (2026-10) |
+| [datalayer/jupyter-mcp-server](https://github.com/datalayer/jupyter-mcp-server) (~1.3k★) | needs a **running Jupyter Server** + `SERVER_URL` + `TOKEN` (or Docker) | — | — | active (company-maintained) |
+| [jupyter-ai-contrib/jupyter-server-mcp](https://github.com/jupyter-ai-contrib/jupyter-server-mcp) | Jupyter Server **extension**: installed into a running server | — | — | active |
+| [jbeno/cursor-notebook-mcp](https://github.com/jbeno/cursor-notebook-mcp) (~160★) | install from PyPI/npx, operates on the file | — | — | **unmaintained since 2025-11** |
+| [jjsantos01/jupyter-notebook-mcp](https://github.com/jjsantos01/jupyter-notebook-mcp) (~130★) | bridges a **running** Jupyter over WebSocket | — | — | **unmaintained since 2025-04** |
+
+> `—` means "not promised in that project's own documentation". Every cell above states only what each project's documentation and repository show (star counts and last-push dates read from the GitHub API on 2026-10-06); this table deliberately makes no claim about what the others do *not* do.
 
 Extras: stale-cell analysis (which outputs are now invalid because their inputs changed), image outputs as native MCP image blocks, background execution with polling for long runs, per-notebook kernel lifecycle management.
 
@@ -24,7 +47,7 @@ Extras: stale-cell analysis (which outputs are now invalid because their inputs 
   "mcpServers": {
     "ipynb": {
       "command": "npx",
-      "args": ["-y", "ipynb-mcp"],
+      "args": ["-y", "ipynb-mcp-server"],
       "env": { "IPYNB_ROOT": "/absolute/path/to/your/notebooks" }
     }
   }

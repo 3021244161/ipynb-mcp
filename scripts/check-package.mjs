@@ -165,7 +165,7 @@ function inspect({ packaged, binaries, builtModules, repoPython, rootFiles = [] 
     }
   }
 
-  // The entry point `npx ipynb-mcp` runs. npm packs whatever `bin` names without
+  // The entry point `npx ipynb-mcp-server` runs. npm packs whatever `bin` names without
   // asking `files`, so the assertion that can fail is "the path `bin` names is one the
   // build actually produces": repoint `bin` at a path `tsc` does not emit and the
   // tarball silently loses its entry point.

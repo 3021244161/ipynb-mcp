@@ -13,12 +13,12 @@ node <repo>/lib/bin.js --root <你的 notebook 目录>
 
 ```bash
 cd <repo> && pnpm build && npm pack
-npx -y file:./ipynb-mcp-0.1.0.tgz --root <你的 notebook 目录>
+npx -y file:./ipynb-mcp-server-0.1.0.tgz --root <你的 notebook 目录>
 ```
 
 | # | 步骤 | 通过标准 | 证据（截图/日志路径） |
 |---|---|---|---|
-| E1 | 干净机器：`npx -y ipynb-mcp` + 一行客户端配置 → 让 agent 跑通一个 cell | 从零到跑通 ≤ 60 秒，中途无需 `pip install` 任何东西 | |
+| E1 | 干净机器：`npx -y ipynb-mcp-server` + 一行客户端配置 → 让 agent 跑通一个 cell | 从零到跑通 ≤ 60 秒，中途无需 `pip install` 任何东西 | |
 | E2 | 读一个带绘图的真实 notebook | 图确实出现在客户端对话中（`--images=auto` 且 `include_outputs='full'`） | |
 | E3 | 用过期的行号让 agent 改代码 | 工具失败并回传 `current_source_hash`；agent **一次**重试成功 | |
 | E4 | 跑 cell 0..4（cell 2 耗时 ≥ 60s），再改 cell 5 并重跑 | cell 2 未被重新执行；返回体含 stale 分析 | |

@@ -13,7 +13,7 @@
 一句话：**让任何 AI agent 安全地读取、编辑、执行本地 Jupyter Notebook，不需要预先启动任何服务。**
 
 三个不可退让的卖点（违反即实现错误）：
-1. **零服务**：`npx -y ipynb-mcp` + 一行客户端配置即可用，不要求用户启动 JupyterLab、不管 token。
+1. **零服务**：`npx -y ipynb-mcp-server` + 一行客户端配置即可用，不要求用户启动 JupyterLab、不管 token。
 2. **不会静默改坏**：任何源码改动都必须携带 CAS 锚，不匹配就失败，绝不写入。
 3. **不会重跑你的长任务**：改一个 cell 只跑那一个（`resume`），或在没有 kernel 时静默重建状态（`replay`）。
 
@@ -58,13 +58,13 @@
 
 ### D1 交付形态 = MCP server（stdio）
 
-- **选定**：发布为 npm 包 `ipynb-mcp`，作为 stdio MCP server 运行；另发一个纯配置 dsh bundle 作为可选接入层。
+- **选定**：发布为 npm 包 `ipynb-mcp-server`，作为 stdio MCP server 运行；另发一个纯配置 dsh bundle 作为可选接入层。
 - **理由**：一份代码同时服务所有 MCP 客户端（Claude Code、Cursor、VS Code、dsh……），且 dsh 本身是 MCP 客户端，可用纯配置 bundle 接入；受众最大化是开源目标的前提。
 - **否决**：dsh 原生插件（受众仅限 dsh 用户）；HTTP/SSE 传输（增加部署面，stdio 才是 `npx` 即插即用的形态）。
 
 ### D2 单一 npm 包，不拆 monorepo `[v1 变更]`
 
-- **选定**：一个仓库、**一个**发布包 `ipynb-mcp`，内部按 `src/core`、`src/fs`、`src/kernel`、`src/mcp` 分目录；`python/ipynb_sidecar.py` 随包发布。
+- **选定**：一个仓库、**一个**发布包 `ipynb-mcp-server`，内部按 `src/core`、`src/fs`、`src/kernel`、`src/mcp` 分目录；`python/ipynb_sidecar.py` 随包发布。
 - **理由**：`npx` 只解析一个包；多包会引入版本偏斜与 peer 解析失败，对即插即用是净损失。内部目录已提供同样的边界纪律。
 - **否决**：pnpm workspace 多包（v2 曾这样设计；除非将来要单独发布 `@ipynb-mcp/core`，否则只有成本没有收益）。
 
@@ -903,8 +903,8 @@ export interface MarkdownIssue { severity: 'error' | 'warning', rule: string, li
 
 ```
 ipynb-mcp/
-├── package.json          # name: ipynb-mcp · version 0.1.0 · license MIT · type module
-│                         # bin: { "ipynb-mcp": "./lib/bin.js" } · engines.node ">=22"
+├── package.json          # name: ipynb-mcp-server · version 0.1.0 · license MIT · type module
+│                         # bin: { "ipynb-mcp-server": "./lib/bin.js" } · engines.node ">=22"
 │                         # files: ["lib", "python", "README.md", "LICENSE"]
 │                         # dependencies: @modelcontextprotocol/sdk 1.31.x（唯一运行时依赖）
 ├── tsconfig.json · vitest.config.ts
@@ -926,7 +926,7 @@ ipynb-mcp/
 3. `python/` 必须列入 `files`。
 4. 版本遵循 D22 的兼容承诺；`CHANGELOG.md` 逐版本列出接口变化。
 5. `docs/COMPATIBILITY.md` 记录实测过的客户端与版本（Claude Code / Cursor / VS Code / dsh）与 Node/Python 版本矩阵。
-6. dsh 接入包单独发布为 `dsh-ipynb-mcp`：纯配置 bundle（`dsh.bundle.patch` + 一段 YAML 插入 `@deepseek-ai/dsh-mcp-client`，`transport: stdio`、`command: npx`、`args: ["-y","ipynb-mcp"]`），并包含 `meta.title`/`meta.description`（`locale/en.json`、`locale/zh.json`）、顶层 `icon`、`exports` 含 `./package.json` 与 `./locale/*.json`、`files` 数组。**peer 依赖写实测范围（如 `>=0.2.0-rc.2 <0.3.0`）而非精确版本**——dsh 的版本门禁会因 peer 范围不匹配而静默拒绝加载整个 bundle。
+6. dsh 接入包单独发布为 `dsh-ipynb-mcp`：纯配置 bundle（`dsh.bundle.patch` + 一段 YAML 插入 `@deepseek-ai/dsh-mcp-client`，`transport: stdio`、`command: npx`、`args: ["-y","ipynb-mcp-server"]`），并包含 `meta.title`/`meta.description`（`locale/en.json`、`locale/zh.json`）、顶层 `icon`、`exports` 含 `./package.json` 与 `./locale/*.json`、`files` 数组。**peer 依赖写实测范围（如 `>=0.2.0-rc.2 <0.3.0`）而非精确版本**——dsh 的版本门禁会因 peer 范围不匹配而静默拒绝加载整个 bundle。
 
 ---
 
@@ -1012,7 +1012,7 @@ ipynb-mcp/
 
 | # | 步骤 | 通过标准 |
 |---|---|---|
-| E1 | 干净机器：`npx -y ipynb-mcp` + 一行配置 → 让 agent 跑通一个 cell | **从零到跑通 ≤ 60 秒**，中途无需 `pip install` 任何东西 |
+| E1 | 干净机器：`npx -y ipynb-mcp-server` + 一行配置 → 让 agent 跑通一个 cell | **从零到跑通 ≤ 60 秒**，中途无需 `pip install` 任何东西 |
 | E2 | 读一个带绘图的真实 notebook | 图确实出现在客户端对话中（`--images=auto` 且 `include_outputs='full'`） |
 | E3 | 用过期的行号让 agent 改代码 | 工具失败并回传 `current_source_hash`；agent **一次**重试成功 |
 | E4 | 跑 cell 0..4（cell 2 耗时 ≥ 60s），再改 cell 5 并重跑 | **cell 2 未被重新执行**；返回体含 stale 分析 |
@@ -1060,7 +1060,7 @@ ipynb-mcp/
 | Q2 | `kernel_idle_seconds` 默认 3600 是否合适（长任务中途接续） | 保持 3600 |
 | Q3 | 是否提供"attach 到已存在的 Jupyter kernel"（连接用户自己 JupyterLab 里正在运行的 kernel，以同时获得人机共享会话） | 不实现，等需求验证 |
 | Q4 | 是否支持在 notebook 中创建新 cell 之外的"新建 notebook" | 不实现（D19） |
-| Q5 | npm 组织/仓库归属与最终包名 | 按 `ipynb-mcp` 开发；发布前由人类确认 |
+| Q5 | npm 组织/仓库归属与最终包名 | 已由人类确认：发布为 `ipynb-mcp-server`（`ipynb-mcp` 0.1.0 已发布，保留并标记废弃） |
 | Q6 | 是否发布 `dsh-ipynb-mcp` bundle 到 npm | 先本地开发，发布前确认 |
 | Q7 | 纯 Node transport（去 sidecar）是否立项 | 不立项；保留 `KernelTransport` 接口 |
 

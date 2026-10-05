@@ -27,7 +27,7 @@
 
 **让任何 AI agent 安全地读取、编辑、执行本地 Jupyter Notebook，不需要预先启动任何服务。**
 
-- 形态：一个 npm 包 `ipynb-mcp`，作为 **stdio MCP server** 运行（`npx -y ipynb-mcp`）。
+- 形态：一个 npm 包 `ipynb-mcp-server`，作为 **stdio MCP server** 运行（`npx -y ipynb-mcp-server`）。
 - 消费者是**模型**，不是程序 —— 所有返回值必须让模型能用。
 - 运行时只有一个 Node 依赖：`@modelcontextprotocol/sdk`。执行侧用用户 notebook 自己的 Python 环境，**不装任何 Python 包**。
 
@@ -289,7 +289,7 @@ tests/{unit,integration}
 
 ## 11. 需要人类决定的事
 
-**照 SPEC §12 的默认行为做，不要停下来问**：`max_images_per_call=20`、`kernel_idle_seconds=3600`、不做 attach 模式、不做"新建 notebook"、包名 `ipynb-mcp`、`dsh-ipynb-mcp` bundle 暂不发布、纯 Node transport 不立项。
+**照 SPEC §12 的默认行为做，不要停下来问**：`max_images_per_call=20`、`kernel_idle_seconds=3600`、不做 attach 模式、不做"新建 notebook"、包名 `ipynb-mcp-server`、`dsh-ipynb-mcp` bundle 暂不发布、纯 Node transport 不立项。
 
 **必须先问人类**：
 
@@ -307,5 +307,5 @@ tests/{unit,integration}
 
 1. `SPEC.md` 已在仓库根，`docs/{archive,DEVIATIONS.md,OPEN_QUESTIONS.md,COMPATIBILITY.md}`、`CHANGELOG.md`、`LICENSE`(MIT) 已建立。
 2. `docs/OPEN_QUESTIONS.md` 已原样抄录 SPEC §12。
-3. `package.json` 满足 SPEC §8：`name: ipynb-mcp`、`license: MIT`、`type: module`、`bin`、`engines.node >= 22`、`files` 含 `lib` 与 `python`、**无 `prepare`/`postinstall` 构建脚本**（R15）、运行期依赖只有 `@modelcontextprotocol/sdk` 1.31.x。
+3. `package.json` 满足 SPEC §8：`name: ipynb-mcp-server`、`license: MIT`、`type: module`、`bin`、`engines.node >= 22`、`files` 含 `lib` 与 `python`、**无 `prepare`/`postinstall` 构建脚本**（R15）、运行期依赖只有 `@modelcontextprotocol/sdk` 1.31.x。
 4. 读一遍 SPEC §0、§4.1、§6、§7、§11 —— 这五节决定了后面所有代码的形状。

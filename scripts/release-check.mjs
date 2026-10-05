@@ -53,13 +53,13 @@ function step(command, args, options = {}) {
 const NPM = 'npm';
 const version = JSON.parse(readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf8')).version;
 
-process.stdout.write(`packing ipynb-mcp@${String(version)} into ${SANDBOX}\n`);
+process.stdout.write(`packing ipynb-mcp-server@${String(version)} into ${SANDBOX}\n`);
 step(NPM, ['pack', '--pack-destination', SANDBOX]);
-const tarball = path.join(SANDBOX, `ipynb-mcp-${String(version)}.tgz`);
+const tarball = path.join(SANDBOX, `ipynb-mcp-server-${String(version)}.tgz`);
 step(NPM, ['init', '-y'], { cwd: SANDBOX });
 step(NPM, ['install', tarball, '--no-audit', '--no-fund'], { cwd: SANDBOX });
 
-const BIN = path.join(SANDBOX, 'node_modules', 'ipynb-mcp', 'lib', 'bin.js');
+const BIN = path.join(SANDBOX, 'node_modules', 'ipynb-mcp-server', 'lib', 'bin.js');
 const workspace = mkdtempSync(path.join(tmpdir(), 'ipynb-mcp-release-ws-'));
 mkdirSync(workspace, { recursive: true });
 const notebook = path.join(workspace, 'release-check.ipynb');
@@ -151,7 +151,7 @@ try {
     capabilities: {},
     clientInfo: { name: 'release-check', version: '1.0.0' },
   });
-  check('initialize handshake', init.result?.serverInfo?.name === 'ipynb-mcp', JSON.stringify(init.result?.serverInfo));
+  check('initialize handshake', init.result?.serverInfo?.name === 'ipynb-mcp-server', JSON.stringify(init.result?.serverInfo));
   notify('notifications/initialized', {});
 
   const tools = await request('tools/list', {});

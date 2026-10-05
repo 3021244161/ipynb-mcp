@@ -66,7 +66,7 @@ function packageVersion(): string {
 }
 
 export function createServer(ctx: ToolContext): McpServer {
-  const server = new McpServer({ name: 'ipynb-mcp', version: packageVersion() });
+  const server = new McpServer({ name: 'ipynb-mcp-server', version: packageVersion() });
 
   const wrap = (action: (args: Record<string, unknown>, extra: Extra) => Promise<ToolOutcome>) => {
     return async (rawArgs: Record<string, unknown>, extra: Extra): Promise<CallToolResult> => {
