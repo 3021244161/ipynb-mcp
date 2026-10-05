@@ -2,6 +2,43 @@
 
 本项目的接口变更遵循 D22 兼容承诺（工具名与参数名在 1.x 内不删不改；新增参数一律可选带默认值；返回字段只增不删）。
 
+## [Unreleased] 0.1.0 — 第十三轮代码复核整改（发布前最后一轮）
+
+> 来源：`docs/review/ipynb-mcp-code-review-v13.md`（评级 **C**：3 条 🔴 + 4 条 🟡）。
+> **无工具名/参数名变更**；新增一个**可选**的 CLI/环境变量开关 `--max-response-bytes`（含默认值）；返回字段只增不减。
+
+### Fixed — 单帧响应超过 10 MiB 会被客户端断连（🔴 V13-1）
+
+每个工具结果走一行 NDJSON 帧，而 MCP SDK 的 `ReadBuffer` 对超过 `STDIO_DEFAULT_MAX_BUFFER_SIZE`（10 MiB）的帧**抛错断连** —— 客户端只看到 `McpError -32000: Connection closed`，之后每次调用都是 `Not connected`：丢的是**整条会话**，不是这次响应。服务端此前没有任何总响应预算：唯一的限额 `inline_text_chars` **只作用于 `stream` 项**，`text/plain`、`text/html`、`application/json` 与图片可以无限大。主审用真 SDK 客户端实测：9.9 MiB 静默通过、10.2 MiB 必死、60 个小区块累计 17.6 MiB 同样必死（悬崖在**整帧**上）。最坏的形态是 `notebook_run`：**文件已成功写回，而模型永远不知道跑过**。
+
+新增 `src/core/response-budget.ts`：对组装后的载荷施加字节预算（默认 **8 MiB**，刻意低于 10 MiB 悬崖），先截断最大的文本字段、必要时丢弃整项输出，图片装不下就不返回块（走 SPEC §4.3 现成的 `artifact_path` 降级），**每一次删除都有 `output_truncated` 警告**。预算施加在六个工具共用的唯一出口，工具无法忘记它。见 D-065。
+
+### Fixed — 转义密集的大 notebook 把读取拖成 O(n²)（🔴 V13-7，第十二轮修复引入的回归）
+
+上一轮修 OOM 时把逐字符拼接换成"两次 `indexOf`"（找引号、找反斜杠各自从当前位置扫到文本结尾），于是**每个转义都要重扫剩余全文**。`\n` 就是转义，所以任何带换行的 cell 源码都中招：实测 0.5/1/2 MiB = 413/1611/6362 ms（翻倍即四倍），6.3 MiB 时一次 read 从 335 ms 变成 **56.5 s**，期间 server 完全无响应。
+
+改为**单次前向 token 扫描**（`[^"\\]+|["\\]` + `String.matchAll`）：同一份数据 1 MiB **17 ms**、2 MiB **34 ms**，而上一轮的内存修复仍然有效（真实 37.5 MiB notebook 峰值 911.8 MiB、`notebook_run` 完整跑完）。见 D-063。
+
+### Fixed — 后台 run 的内核异常死亡被报成"客户端取消"（🔴 V13-8）
+
+cell 内 `os._exit()` 或 sidecar 被杀时，**同步**路径报 `kernel_died`、**后台**路径报 `state: cancelled` + `error.code: cancelled` —— 而没有任何人取消过这次运行。客户端因此无法区分"我取消的"（可重试/放弃）与"它崩了"（状态已丢、需要 `replay`）。修法：记录**实际先触发**的那一个（先触发者胜出，写回期间才到达的取消不会改写内核死亡），`abort.reason` 改为 getter，调用方不再预设 `'cancelled'`。见 D-064。
+
+### Fixed / Changed — 文案、失去判别力的守卫与门禁作用域（🟡 V13-2/3/4/6）
+
+- **`(interrupt did not land)` 是无法成立的断言**（V13-6）：它在 interrupt 生效的平台上是假事实，而两个平台都报 `exec_timeout`。文案改为只陈述本层知道的事实（deadline 已过）。
+- **两条守卫此前不可能失败**（V13-6）：`v9-regressions` 曾同时接受 `internal` 与 `exec_timeout`（把错误分类的**症状**当成了通过条件）；`kernel.test.ts` 的 `KeyboardInterrupt` 断言在超时恒为 `timeout` 之后**不可达**（删掉 sidecar 的 interrupt 逻辑它照样绿）—— 现在拆成两条确定性用例（运行中显式 interrupt → `error` + `KeyboardInterrupt`，且**不**关闭内核；超时 → `timeout` 且关闭内核）。`v12-timeout-status` 的超时用例补了非真空断言（Windows 上那个循环迭代零次，"什么都没断言"与"没发现问题"长得一样）。
+- **`scripts/` 在 lint 门禁之外**（V13-2）：`oxlint src tests` 留下了 8 个 error 与 4 个 warning，而 `scripts/` 里有诚实度门禁**自己**的实现。**修好而不是豁免**：输出改用 `process.stdout.write`，四处 warning 是死代码与一处 `startsWith`；门禁扩为 `oxlint src tests scripts`。
+- **`check:release` 不在任何自动化路径**（V13-4）：它是唯一"装进空目录、驱动装好的二进制"的门禁，现在进 CI（ubuntu/py3.12）与 `prepublishOnly`。
+- **试用脚本可能直接改写真实 notebook**（V13-3）：头部加横幅、拒绝已知原件目录（解析后大小写折叠比较）、路径改由 `IPYNB_TRIAL_DIR` 提供、"必须被拒"的围栏用例改用 root 的兄弟路径（此前在没有那个目录的机器上会因为"文件不存在"而**假绿**）；两个内存探针不再吞掉 `spawnSync` 失败（它曾把探针坏掉打印成看起来正常的 `ratio=0.0`）。
+- **滞后数字**（V13-5）：状态表与兼容矩阵更新到本轮数字，`measure-real-notebook.mjs` 不再指错脚本名。
+
+### Tests
+
+- 新增 `tests/integration/v13-response-budget.test.ts`（**真 SDK 客户端 + 真 stdio**，2 例）：11 MiB 输出必须返回在预算内、带警告，且**同一条连接的下一次调用仍成功**；以及"60 个小输出累计超限"形态。变异验证：预算换成直通后两条都红，报出 `-32000: Connection closed` 与 `Not connected`。夹具刻意用 `display_data`+`text/plain`（stream 会被 `inline_text_chars` 先截断，第一版夹具正是如此，对着坏代码也全绿）。
+- 新增 `tests/unit/json-reader-scaling.test.ts`（3 例）：1↔2 MiB 的耗时比 + 绝对上界，带"夹具确实转义密集"的探针断言；16 个转义形状（先与 `JSON.parse` 对照再断言）；4 个嵌套文档（裸字符串用例漏掉了"字符串吃掉自己的结束引号"这一让**所有文档**失败的形态）。
+- `tests/integration/kernel.test.ts` 拆成"interrupt 落地"与"超时关闭内核"两条；`server.test.ts` 新增后台 `os._exit(7)` 用例；`v9-regressions` 收紧为只接受 `exec_timeout`。
+- 单测 **600**（31 文件）；集成 **78**（13 文件）；`check:package` **144 文件 / 22 变异**。
+
 ## [Unreleased] 0.1.0 — 真实使用实测整改（发布前）
 
 > 来源：`docs/review/ipynb-mcp-changejob-real-usage-trial.md`（5 个真实 ChangeJob notebook 端到端实测）。

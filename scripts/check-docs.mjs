@@ -481,9 +481,24 @@ function selftest() {
     },
     {
       name: 'a row was spliced onto the pasted copy (the v9 symptom, at row scale)',
-      // Derived: turn the last cell separator into a bare pipe, so the row loses a cell
-      // however its final column happens to be worded.
-      text: lastRow === null ? null : editLine(original, `| ${lastRow} |`, (line) => line.replace(/ \| ([^|]*) \|$/, ' |$1|')),
+      // Derived: turn the last cell separator into a bare pipe, so the row loses a cell however its
+      // final column happens to be worded.
+      //
+      // The line ending is split off FIRST, and that is not cosmetic: a `$`-anchored replacement does
+      // not match a line ending in `\r`, so on a checkout with CRLF endings this mutation silently
+      // became a no-op and `--selftest` failed claiming the guard had no discrimination — reporting
+      // "the row is fine" about a row it never edited. A mutation that cannot be applied must be
+      // SKIPPED with a notice, never quietly skipped (the rule the tolerance counter below exists for).
+      text:
+        lastRow === null
+          ? null
+          : editLine(original, `| ${lastRow} |`, (line) => {
+              const ending = line.endsWith('\r') ? '\r' : '';
+              const body = ending === '' ? line : line.slice(0, -1);
+              const spliced = body.replace(/ \| ([^|]*) \|$/, ' |$1|');
+              // Applied or not, say so: a mutation that changed nothing is not evidence.
+              return spliced === body ? null : `${spliced}${ending}`;
+            }),
       expect: 'cells, the table declares',
     },
     {

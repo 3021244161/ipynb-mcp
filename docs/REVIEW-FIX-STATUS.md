@@ -21,10 +21,46 @@
 > 这正是 P0-a 要的结果：在唯一会自动运行的环境里，产物合法性**确实被外部权威检查过**（此前 `nbformat` 不在依赖闭包里，三条断言被 `if` 静默跳过而套件仍全绿）。
 > 集成用到的解释器与三平台默认根见 `COMPATIBILITY.md`。
 >
-> **上面这段门禁数字是第六轮当时的快照**（不随轮次改动）。**当前数字见第十二轮段的开篇**。
+> **上面这段门禁数字是第六轮当时的快照**（不随轮次改动）。**当前数字见第十三轮段的开篇**。
 ---
 
-## 〇、第十二轮（`ipynb-mcp-code-review-v12.md`，发布前最后一轮）
+## 〇、第十三轮（`ipynb-mcp-code-review-v13.md`，发布前）
+
+> 本轮的性质与前几轮不同：**两个 P0 级修复都是真的**（OOM 从 33.9→203.5 MiB 四档全通过、sidecar 编码致死
+> 正反对照都验过），而三条 🔴 里有**两条是那些修复的副作用**——"把风险从服务端搬到了别处"。
+>
+> **门禁实测（第十三轮整改后，亲跑）**：`pnpm typecheck` exit 0 ｜ `pnpm lint` **0 警 0 错**（现在覆盖
+> **15 个文件**，含 `scripts/`）+ `format check: ok` + `structural indent check: ok (28 samples)` +
+> `documentation self-test: ok (17 mutation(s), 0 skipped, control clean)` + `documentation check: ok` ｜
+> 单测 **600 passed / 31 文件** ｜ 集成 **78 passed / 13 文件** ｜ `pnpm smoke` **26/26** ｜
+> `pnpm check:package` **ok（144 文件，22 变异）** ｜ `pnpm check:release` **12/12** ｜
+> `python scripts/check-connection-sweep.py` **PASS** ｜ `pnpm build` exit 0。
+
+### 13.1 本轮条目
+
+| 条目 | 状态 | 处置与证据 |
+|---|---|---|
+| **V13-1** 🔴 响应超过 10 MiB 时 MCP 客户端整条会话死掉 | ✅ | 新增 `src/core/response-budget.ts`：对组装后的载荷施加字节预算（`--max-response-bytes`，默认 **8 MiB**），先截断最大的文本字段、必要时丢弃整项输出，图片装不下就不返回块（走 §4.3 现成的 `artifact_path` 降级），**每一次删除都有 `output_truncated` 警告**；施加在六个工具共用的唯一出口。按 AGENTS §0 先登记偏离（**D-065**：SPEC §5.4/§7 只规定 stream 阈值，对总响应大小没有条款）。证据：新增集成用例（**真 SDK 客户端 + 真 stdio**，11 MiB 输出 → 返回在预算内 + 警告 + **下一次调用仍成功**；以及 60×300 KiB 累计超限）。**变异验证**：预算换成直通 → 两条都红，报出 `-32000: Connection closed` 与 `Not connected` |
+| **V13-7** 🔴 `readString` 的 `indexOf('"')` 未按 `\` 截断 → O(n²)（**第十二轮修复引入的回归**） | ✅ | 改为**单次前向 token 扫描**（`/[^"\\]+|["\\]/g` + `String.matchAll`），普通段仍一次 `slice`，转义按"反斜杠+一个字符"整段消费。证据：1 MiB **17 ms** / 2 MiB **34 ms**（原 2328/9585 ms，翻倍即四倍），真实 37.5 MiB notebook 峰值 911.8 MiB 且 `notebook_run` 完整跑完。用例 `json-reader-scaling.test.ts`：耗时比 + 绝对上界 + 探针断言、16 个转义形状、4 个嵌套文档。登记 **D-063**。**过程中两次改错都被用例当场抓住**：`\\` 配对消费错导致 `"a\\\\b"` 读成三个反斜杠；`\"` 当成字符串结尾导致 `{"source": ["x = 1\n"]}` 报 "Expected ':'" |
+| **V13-8** 🔴 后台 run 的内核异常死亡被报成 `cancelled` | ✅ | 按**实际先触发的那个**分类（`firstAbort.reason ??= …`），`abort.reason` 改为 getter，`RunRequest.abort.reason` 变可选，`notebook_run` 不再预设 `'cancelled'`。用例：真 MCP 客户端 + 后台 run + cell 内 `os._exit(7)` → `state==='failed'`、`error.code==='kernel_died'`、`facts_pending===false`、已完成 cell 仍被报告并写回。**变异验证**：撤掉修复 → 该用例红并打印 `{"state":"cancelled",…}`，同文件其余 5 条全绿；**只撤调用方的默认值仍通过** —— 这帮助定位到 getter 才是分类真正生效的那一半。登记 **D-064** |
+| **V13-6** 🟡 `(interrupt did not land)` 是假事实 + 两条守卫不可能失败 | ✅ | ① 文案改为只陈述本层知道的事实；② `v9-regressions` 收紧为只接受 `exec_timeout`（此前把错误分类的**症状**当通过条件）；③ `kernel.test.ts` 拆成两条确定性用例：运行中显式 `registry.interrupt()` → `error` + `KeyboardInterrupt` 且**不**关闭内核，超时 → `timeout` 且关闭内核（旧的 `KeyboardInterrupt` 断言在超时恒为 `timeout` 后**不可达**）；④ `v12-timeout-status` 补非真空断言（Windows 上循环迭代零次） |
+| **V13-2** 🟡 `scripts/` 在 lint 门禁之外（8 error / 4 warning） | ✅ | **修好而不是豁免**：输出改 `process.stdout.write`（这才是这些工具的本意，也是仓库其它地方的写法）；四处 warning 是死代码（一个未被调用的 `exists()`、未用的 `spawn` 导入、未用的 catch 绑定）与一处 `startsWith`；门禁扩为 `oxlint src tests scripts` |
+| **V13-4** 🟡 `check:release` 不在 CI / `prepublishOnly` | ✅ | CI 的 integration job（ubuntu/py3.12）新增一步；`prepublishOnly` 追加 `&& npm run build && npm run check:release`。**订正评审上一稿的一半**：`prepack: tsc` 一直存在，所以"会发出旧代码"不成立；缺口只是这道门禁没进自动化 |
+| **V13-3** 🟡 试用脚本会就地改写真实 notebook、非 Windows 假绿 | ✅ | 头部横幅警告"它写进 `--root`"；拒绝已知原件目录（解析后大小写折叠比较）；路径由 `IPYNB_TRIAL_DIR` 提供；"必须被拒"的围栏用例改用 root 的**兄弟路径**（此前在没有 `E:\ChangeJob` 的机器上会因"文件不存在"而假绿）；两个内存探针不再吞掉 `spawnSync` 失败（曾把探针坏掉打印成 `ratio=0.0`） |
+| **V13-5** 🟢 状态表 / 矩阵数字滞后 + 头注释指错脚本 | ✅ | 更新为 600·31 / 78·13；`measure-real-notebook.mjs` 的头注释改正 |
+
+### 13.2 V13-6 的"待澄清分歧"（cancel 终态语义）
+
+评审记录了两方实测结论不同（子代理见 `status: "timeout"`，主审见 `status: "error"` + `error.code=cancelled`）。实现方结论：**两者都不算错，因为它们测的是不同时刻**——`notebook_run_cancel` 落在**在途 cell 内**时，该 cell 的结局取决于 interrupt 是否落地（落地 → `error`，未落地 → grace 截止 → `timeout`），而 `facts_pending` 归零后读到的是最终事实。本轮**不**把 cancel 与 timeout 在 `error.code` 上强制分开：两者都已是 `cancelled`（客户端请求的）与 `exec_timeout`（cell 超时），语义可分；需要区分的是**内核死亡**，那正是 V13-8 修掉的。若后续仍要一个显式信号，属新增返回字段，按 AGENTS §11 需人类批准。
+
+### 13.3 未做与残留
+
+- **E1–E9 真实第三方客户端矩阵**：仍 **0/9**。本轮三条 🔴 里最重的两条（10 MiB 帧上限、O(n²) 卡顿）**都只能由"真客户端 + 真 notebook"暴露**——`smoke`/`check:release` 虽然用了真 SDK，但用的是小 notebook 与无转义载荷。评审的建议照办：把试用脚本接到 E1–E9 并记进 `COMPATIBILITY.md`，这是发布前唯一剩下的非代码门。
+- **macOS / arm64**：未在 macOS 复跑任何东西（SPEC §9 的既定分层）。
+- **大 notebook 的成本上界**：`read` 2.7→11.2 s、`edit` 14.9→85.6 s、`run` 63→216 s（33.9→203.5 MiB），随体积近似线性但常数很大且无上限。本轮按 D-054/D-062 的方式在 README 登记为"已知行为 + 数字"，未加守卫。
+- **`README` 的 `process.env` 安全声明**（v8 起挂着，🟢）：仍未写。
+
+## 〇-0、第十二轮（`ipynb-mcp-code-review-v12.md`）
 
 > 本轮的 🔴 是**第十一轮自己引入的回归**：把数值判据改成"按值"是对的方向，但零那一格被单独早退成
 > `if (value === 0) return isNegativeZero(literal)`——**上溢被照顾到了，下溢落进了缝里**。
@@ -65,7 +101,7 @@
 - **"静默保留原文"这一取向**：V12-6 提出的可选方案（打 marker 但不发警告）会同时满足字节保真与"不误报"，但会让未修改区域出现更多整文件 diff；本轮**不改行为**，留给 SPEC v3.1 决定。
 - **`"inf"`/`"NaN"` 字符串与 `['a','b']` 的 join**：按已知行为登记（D-054），不加魔数检查。
 
-## 〇-0、第十一轮（`ipynb-mcp-code-review-v11.md`）
+## 〇-1、第十一轮（`ipynb-mcp-code-review-v11.md`）
 
 > 本轮的三条 🟠 有一个共同点：**都在 v10 的"已修"里**。V10-3 的修复（保护数值不被改写）把判据定成了"写法"，
 > 于是**对模型陈述假事实**；V10-7 的修复（装配 warnings）解决了"装配"没解决"**送达**"；V10-1 的修复（递归投射）
@@ -108,7 +144,7 @@
 - **`--images=never` 与超限时 artifact 已写**：v10 登记的固有序（先物化后组装）未动。
 - **`facts_pending` 的 spec 缺口**：SPEC §4.8 的 status 载荷与 cancel 载荷都没有这个字段，属于**新增返回字段**（D22 允许只增不改），已按 AGENTS §0 登记为 **D-055**。
 
-## 〇-1、第十轮（`ipynb-mcp-code-review-v10.md`）
+## 〇-2、第十轮（`ipynb-mcp-code-review-v10.md`）
 
 > 本轮的两条 🔴 有一条是**新引入的回归**，而且它比被修的那条更重：为 V9-5 换上自研 JSON parser 之后，
 > 对象键用 `result[key] = value` 承接，`__proto__` 命中的是 `Object.prototype` 的 **setter** —— 该键既不进对象也不进响应，
@@ -150,7 +186,7 @@
 - **两处仍值得将来处理的形状**（本轮未做，非阻塞）：① `--images=never` 与超限时，若某 cell 的块被 `result.ts` 丢弃，其 `artifact_path` 可能已指向刚写的文件——"先物化后组装"的固有序；② `run.test.ts` 的权威解释器用例依赖 `resolvedTestInterpreter()`，在没有 venv 的裸机上仍会走 base 解释器（这是设计，但值得在 CI 里断言它确实用了 venv）。
 
 
-## 〇-2、第九轮（`ipynb-mcp-code-review-v9.md`）
+## 〇-3、第九轮（`ipynb-mcp-code-review-v9.md`）
 
 > 本轮的两条 🔴 是**同一个错误的第四次与第五次形态**。v8 为修"data-URL 图片看得见读不出"只改了**解码/物化**那一层，
 > 断言停在内部 `OutputItem`（`bytes > 0`、`__decodeFailed === false`），而**内容块**那一层仍把文档里的 `data:` 原值交给 SDK
@@ -216,7 +252,7 @@ V9-3/D-047 则把"组装结果"这一层也纳入了闸门——**不能假定�
   （`git show HEAD:.github/workflows/ci.yml` → 第 90 行 `- run: pnpm smoke`，第 86 行 `- run: pnpm check:package`），所以"19/19 目前只是本机"这条不成立。
   本轮 smoke 的唯一缺口是**本轮尚未在 CI 上跑过**（本机 26/26，CI 结果看下一次运行）。
 
-## 〇-3、第八轮（`ipynb-mcp-code-review-v8.md`）
+## 〇-4、第八轮（`ipynb-mcp-code-review-v8.md`）
 
 > 第八轮的两条 TOP 都指向同一件事：**v7 的修复只覆盖了等价类的一半，而 v7 的复验也只跑了上一轮点名的那一格**。
 > 因此本轮把"修数据形状缺陷 = 补该字段全部合法类型的矩阵 + 逐项先红后绿"写进 `AGENTS.md` §9（见"新增硬规则"一节），
@@ -274,7 +310,7 @@ V9-3/D-047 则把"组装结果"这一层也纳入了闸门——**不能假定�
 > `fileParallelism: false` 加 `tests/unit/test-venv-ownership.test.ts` 的所有权用例（理由与证据见第九轮段对应两行）。
 
 
-## 〇-4、第七轮（`ipynb-mcp-code-review-v7.md`）
+## 〇-5、第七轮（`ipynb-mcp-code-review-v7.md`）
 
 > 第七轮的核查对象是**读方向**、**守卫之间的一致性**，以及**文档与代码是否相符**。
 > 它给出的三条 TOP：V7-1（读方向把合法的 `application/json` 静默改写/丢弃）、P0-a（唯一的外部权威在唯一的自动化环境里恒缺席）、
@@ -320,7 +356,7 @@ V9-3/D-047 则把"组装结果"这一层也纳入了闸门——**不能假定�
   于是"实现明明已修"却始终为红。改用每条用例一个空缓存后立刻转绿；这条经验（被测世界与缓存必须同生命周期）写进了注释。
 - 本轮**没有**再出现"声称已修但代码里没有"：三条第六轮虚报逐条订正为真实状态，其中两条在本轮真正做完，一条如实标 ⚠️。
 
-## 〇-5、第六轮（`ipynb-mcp-code-review-v6.md`）
+## 〇-6、第六轮（`ipynb-mcp-code-review-v6.md`）
 
 > 本轮的核查对象是**仓库自己的测试与脚本**（把守卫当被测对象做变异），加上 **CI 首次真跑**的失败
 > （GitHub issue #1）。结论：v5 的修复是真的，但新加的写前闸门、缩进检查器与几处测试本身有缺陷，
