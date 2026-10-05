@@ -162,9 +162,44 @@ describe('[I-smoke] sidecar transport with a real kernel', () => {
     expect(silent.session.executionCount).toBe(before);
   });
 
-  it('interrupts a long-running cell (I5 path: interrupt -> error with KeyboardInterrupt)', async () => {
-    // Own kernel, explicitly: this case can END the session (see below), so it must not inherit one
-    // from a previous case and must not leave that expectation behind.
+  it('an interrupt that LANDS reaches the cell as KeyboardInterrupt', async () => {
+    // This is the assertion the old version of this case carried and could no longer reach: it sent the
+    // cell through `execCell`, which now always reports `timeout` for a cell that passed its deadline
+    // (D-060), so `status === 'error'` became unreachable and the `KeyboardInterrupt` check turned into
+    // dead code that would stay green with the sidecar's interrupt logic deleted (review v13 V13-6).
+    //
+    // So the interrupt is requested EXPLICITLY, while the cell is running and well inside its own
+    // budget, which makes the path deterministic instead of a race against the grace period: the cell
+    // gets the signal, raises, and the run reports `error` + `KeyboardInterrupt` — no timeout involved.
+    await registry.getOrCreate({
+      notebookPath,
+      interpreterPath: interpreter,
+      kernelSpecName: 'python3',
+      language: 'python',
+    });
+    // A sleep long enough to be interrupted, short enough that the test does not wait it out even if
+    // the interrupt were lost (it would then end as `ok` and the assertion below would fail loudly).
+    const running = registry.execCell(notebookPath, {
+      code: 'import time\ntime.sleep(8)\nprint("interrupt was lost")',
+      silent: false,
+      storeOutputs: true,
+      timeoutMs: 60_000,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    await registry.interrupt(notebookPath);
+
+    const result = await running;
+    expect(result.result.status, JSON.stringify(result.result.rawOutputs).slice(0, 200)).toBe('error');
+    expect(result.result.rawOutputs[0]).toMatchObject({ outputType: 'error', ename: 'KeyboardInterrupt' });
+    // The kernel is still usable: an interrupt is not a timeout, so §4.7 rule 6 does NOT close it.
+    const after = await registry.findByNotebook(notebookPath);
+    expect(after, 'an interrupt must not be reported as a timeout that killed the kernel').not.toBeNull();
+  }, 120_000);
+
+  it('a cell that passes its deadline reports timeout and closes the kernel', async () => {
+    // The other half, kept separate because it is a different rule: §4.7 rule 6 says a timeout marks the
+    // kernel dead, so the session must be gone afterwards. Both platforms agree on the status now
+    // (D-060), which is what makes this assertable without a platform branch.
     await registry.getOrCreate({
       notebookPath,
       interpreterPath: interpreter,
@@ -177,27 +212,9 @@ describe('[I-smoke] sidecar transport with a real kernel', () => {
       storeOutputs: true,
       timeoutMs: 2_500,
     });
-    // Either the interrupt lands (status error, KeyboardInterrupt) or the kernel cannot be
-    // interrupted (status timeout) — both are acceptable per SPEC §5.8; a hang would fail the test
-    // timeout.
-    expect(['error', 'timeout']).toContain(result.result.status);
-    if (result.result.status === 'error') {
-      expect(result.result.rawOutputs[0]).toMatchObject({ ename: 'KeyboardInterrupt' });
-    }
-
-    // SPEC §4.7 rule 6: "出现 timeout → 该 kernel 标记死亡并关闭". So after a cell that timed out the
-    // session is GONE, on every platform — and that is a behaviour worth asserting rather than a
-    // detail to work around, because the whole point of the rule is that a kernel which ignored an
-    // interrupt cannot be trusted to keep running the user's work.
-    //
-    // The suite used to depend on the opposite — the following case read the session left behind
-    // here — which passed only where the interrupt LANDS (Linux, status `error`, no shutdown) and
-    // broke on Windows, where the sidecar reports `timeout` and the registry closes the kernel. That
-    // is why the next case now starts its own kernel and this one says what it expects.
-    if (result.result.status === 'timeout') {
-      const after = await registry.findByNotebook(notebookPath);
-      expect(after, 'a timed-out cell must not leave a live session behind').toBeNull();
-    }
+    expect(result.result.status).toBe('timeout');
+    const after = await registry.findByNotebook(notebookPath);
+    expect(after, 'a timed-out cell must not leave a live session behind').toBeNull();
   }, 120_000);
 
   it('kernel status reports aliveness (I9 prerequisite)', async () => {

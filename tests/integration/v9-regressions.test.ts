@@ -284,14 +284,16 @@ describe("[V9-7] a timed-out run still reports what its completed cells lost", (
       failure = cause as IpynbError;
     }
 
-    // Where the interrupt lands, the cell ends as an `error` instead of a timeout
-    // (Linux); this case is about the timeout exit, which is what Windows produces and
-    // what the sidecar-side grace period reports everywhere.
-    if (failure === null || failure.code !== 'exec_timeout') {
-      expect(['exec_timeout', 'internal']).toContain(failure?.code ?? 'none');
-      return;
-    }
-    const detail = failure.detail as Record<string, unknown>;
+    // THE CODE IS NOW THE SAME ON EVERY PLATFORM. This used to tolerate `internal` here, because the
+    // interrupt landing (Linux) made the sidecar report `error` instead of `timeout` and the run then
+    // reported the catch-all code for a bug inside the tool. Tolerating it is what let that stand: the
+    // assertion accepted the very symptom of the misclassification, so a wrong answer and a right one
+    // both passed. The sidecar keys the timeout on having SENT the interrupt rather than on how the
+    // cell ended, so a timed-out cell is `exec_timeout` whether or not the interrupt lands
+    // (review v13 V13-6, D-060).
+    expect(failure).not.toBeNull();
+    expect(failure!.code, JSON.stringify(failure?.detail ?? null).slice(0, 200)).toBe('exec_timeout');
+    const detail = (failure as IpynbError).detail as Record<string, unknown>;
     const warnings = detail['warnings'] as Array<{ code: string; message: string }>;
     expect(Array.isArray(warnings)).toBe(true);
     // v8 shipped `warnings: []` here: the assembly ran after the loop, so the one

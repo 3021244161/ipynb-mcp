@@ -15,7 +15,7 @@
 // Usage: node scripts/e2e-smoke.mjs [--python <interpreter>] [--keep]
 // Requires a build (`npm run build`) and an interpreter with ipykernel.
 
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';

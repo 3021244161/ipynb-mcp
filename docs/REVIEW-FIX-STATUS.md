@@ -34,7 +34,7 @@
 > **门禁实测（第十二轮整改后，亲跑）**：`pnpm typecheck` exit 0 ｜ `pnpm lint` **0 警 0 错** +
 > `format check: ok` + `structural indent check: ok (28 self-test samples)` +
 > `documentation self-test: ok (17 mutation(s) detected, 0 skipped, control clean)` +
-> `documentation check: ok` ｜ 单测 **596 passed / 30 文件** ｜ 集成 **73 passed / 11 文件** ｜
+> `documentation check: ok` ｜ 单测 **600 passed / 31 文件** ｜ 集成 **77 passed / 13 文件** ｜
 > `pnpm smoke` **26/26** ｜ `pnpm check:package` **ok（140 文件，22 变异）** ｜
 > `python scripts/check-connection-sweep.py` **PASS** ｜ `pnpm build` exit 0 ｜ 工作树干净。
 

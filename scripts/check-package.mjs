@@ -138,7 +138,7 @@ function inspect({ packaged, binaries, builtModules, repoPython }) {
     }
     // An absent first line is not evidence of an absent shebang: `head` is only ever
     // undefined because the file is not on disk, which the check above already reports.
-    if (head !== undefined && !/^#!\/usr\/bin\/env node/.test(head)) {
+    if (head !== undefined && !head.startsWith('#!/usr/bin/env node')) {
       problems.push(`${target} does not start with the #!/usr/bin/env node shebang`);
     }
   }

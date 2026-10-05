@@ -662,7 +662,13 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
         pushCallWarnings(warnings, executed, droppedMimes);
         const timeoutWriteBack = await writeBackCompleted(notebook, effectiveReq, deps, platform, executedCellsSet, warnings);
         const timeoutCell = executed[executed.length - 1];
-        throw new IpynbError('exec_timeout', `cell execution timed out after ${req.timeoutSeconds}s (interrupt did not land)`, {
+        // The message states the ONE fact this layer knows: the deadline passed. It used to add
+        // "(interrupt did not land)", which is true where the interrupt is ignored (Windows) and FALSE
+        // where it lands — yet the same run reports `exec_timeout` on both platforms, so a client reading
+        // that sentence on Linux was told something untrue about its own run (review v13 V13-6; the same
+        // family as V11-12①, "a message must describe the payload actually delivered"). Whether the
+        // interrupt landed is the sidecar's business, and it shows up in the cell's `status`.
+        throw new IpynbError('exec_timeout', `cell execution timed out after ${req.timeoutSeconds}s`, {
             cell_index: timeoutCell?.cell_index ?? null,
             completed_cells: executed.length - 1,
             // ExecutedCell is structurally JSON-safe; the cast bridges it to the

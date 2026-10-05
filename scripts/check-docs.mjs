@@ -127,28 +127,18 @@ function isDeclared(name, dir) {
   return grepTree(dir, pattern, true);
 }
 
-/** Whether a token from a status row can be found in the repository (path or symbol). */
-function exists(token) {
-  const [pathPart] = token.split(':');
-  // A PATH may point anywhere, docs included — the artifact is then the document itself.
-  if (existsSync(path.join(REPO_ROOT, pathPart))) {
-    return true;
-  }
-  // A bare symbol must be DECLARED in shipped code (see `isDeclared` and `SHIPPED_DIRS`).
-  if (pathPart.length < 4) {
-    return true;
-  }
-  return SHIPPED_DIRS.some((dir) => isDeclared(pathPart, path.join(REPO_ROOT, dir)));
-}
-
-/** Is this token a path in the tree at all? Used to tell "names no artefact" from "names one". */
+/**
+ * Is this token a path in the tree at all? Used to tell "names no artefact" from "names one".
+ *
+ * This is the surviving half of an earlier pair: the other one accepted any short token as "fine",
+ * which is how a ✅ row could name a symbol that existed nowhere and still pass.
+ */
 function namesAnArtefact(token) {
   const [pathPart] = token.split(':');
   return existsSync(path.join(REPO_ROOT, pathPart)) || SHIPPED_DIRS.some((dir) =>
     isDeclared(pathPart, path.join(REPO_ROOT, dir)));
 }
 
-/** Is `needle` present in any text file under `dir`? Depth-first, with the usual exclusions. */
 /**
  * Is `needle` present in any text file under `dir`?
  *

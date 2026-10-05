@@ -2,14 +2,23 @@
 //
 // Not part of the package (scripts/ is not in `files`). Drives the LOCAL build
 // (lib/bin.js) as a real stdio MCP client and exercises the six tools against
-// real notebooks copied out of E:\ChangeJob.
+// real notebooks.
 //
-//   node scripts/trial-changejob.mjs --root E:\tmp\ipynb-trial\nb --dump-tools
-//   node scripts/trial-changejob.mjs --root E:\tmp\ipynb-trial\nb --scan
-//   node scripts/trial-changejob.mjs --root E:\tmp\ipynb-trial\nb --scenario contract
-//   node scripts/trial-changejob.mjs --root E:\tmp\ipynb-trial\nb --scenario suite
+//   node scripts/trial-changejob.mjs --root <dir> --dump-tools
+//   node scripts/trial-changejob.mjs --root <dir> --scan
+//   node scripts/trial-changejob.mjs --root <dir> --scenario contract
+//   node scripts/trial-changejob.mjs --root <dir> --scenario suite
+//
+// ========================== IT WRITES INTO --root ==========================
+//
+// The `suite` scenario EDITS notebooks in place: it inserts cells, rewrites markdown, and leaves
+// `.bak` files behind. Point `--root` at a COPY, never at a directory you care about (review v13
+// V13-3). The guard below refuses the known originals directory, but it cannot know about yours, so
+// this warning is the real protection.
+// ===========================================================================
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { homedir } from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
@@ -24,10 +33,33 @@ const flag = (name, fallback = null) => {
 const has = (name) => argv.includes(name);
 
 const root = flag('--root');
-const python = flag('--python', 'E:\\tool\\anaconda\\ana\\python.exe');
+// This used to be one machine's Anaconda path. `--python` still wins when given; the fallback is the
+// PATH's interpreter, because an absolute Windows literal is treated as a RELATIVE path anywhere else —
+// every derived path was then wrong, and the `contract` scenario's "this must be refused" check passed
+// for the wrong reason (review v13 V13-3③).
+const python = flag('--python', process.env['IPYNB_TEST_PYTHON'] ?? 'python');
 if (!root) {
-  console.error('need --root');
+  process.stderr.write('need --root\n');
   process.exit(2);
+}
+
+/**
+ * Refuse the directory this harness must never modify.
+ *
+ * `scripts/trial-scenarios.mjs` names real notebooks from `E:\ChangeJob`, and running the suite against
+ * that directory inserts cells into the user's real files, rewrites their markdown and leaves backups.
+ * Resolved and case-folded first, because on Windows `E:\ChangeJob` and `e:\changejob\` are one place.
+ */
+const FORBIDDEN_ROOTS = ['E:\\ChangeJob', path.join(homedir(), 'ChangeJob')];
+const resolvedRoot = path.resolve(root);
+for (const forbidden of FORBIDDEN_ROOTS) {
+  if (path.resolve(forbidden).toLowerCase() === resolvedRoot.toLowerCase()) {
+    process.stderr.write(
+      `refusing to run against ${forbidden}: this harness EDITS notebooks in place. Copy them first, e.g.\n` +
+        `  robocopy "${forbidden}" "%TEMP%\\ipynb-trial\\nb" /E\n`,
+    );
+    process.exit(2);
+  }
 }
 
 const heap = flag('--heap');
@@ -61,11 +93,11 @@ const call = async (name, args) => {
   return { isError: result.isError === true, text, json, images, ms };
 };
 
-const note = (...a) => console.log(...a);
+const note = (...a) => process.stdout.write(`${a.join(' ')}\n`);
 
 if (has('--dump-tools')) {
   const { tools } = await client.listTools();
-  for (const t of tools) console.log(`${t.name}  ::  ${(t.description ?? '').split('\n')[0]}`);
+  for (const t of tools) process.stdout.write(`${t.name}  ::  ${(t.description ?? '').split('\n')[0]}\n`);
   await client.close();
   process.exit(0);
 }
@@ -74,9 +106,9 @@ if (has('--scan')) {
   const names = ['20py.ipynb', 'simple-baseline-aai3100.ipynb', '便捷性.ipynb', 'hw2_solved.ipynb', 'coursework_base.ipynb'];
   for (const nb of names) {
     const r = await call('notebook_read', { path: nb, include_source: 'full', include_outputs: 'none' });
-    console.log(`\n########## ${nb}  [${r.ms} ms] isError=${r.isError} cellKeys=${Object.keys(r.json?.cells?.[0] ?? {}).join(',')}`);
+    process.stdout.write(`\n########## ${nb}  [${r.ms} ms] isError=${r.isError} cellKeys=${Object.keys(r.json?.cells?.[0] ?? {}).join(',')}\n`);
     for (const [i, c] of (r.json?.cells ?? []).entries()) {
-      console.log(`  [${i}] ${c.cell_type} ${c.output_count ?? c.outputs_count ?? ''} (${String(c.source ?? '').length}ch) ${String(c.source ?? '').replace(/\n/g, ' | ').slice(0, 140)}`);
+      process.stdout.write(`  [${i}] ${c.cell_type} ${c.output_count ?? c.outputs_count ?? ''} (${String(c.source ?? '').length}ch) ${String(c.source ?? '').replace(/\n/g, ' | ').slice(0, 140)}\n`);
     }
   }
   await client.close();
@@ -88,7 +120,7 @@ if (scenario) {
   const scen = (await import('./trial-scenarios.mjs')).default;
   const fn = scen[scenario];
   if (!fn) {
-    console.error(`unknown scenario ${scenario}; have: ${Object.keys(scen).join(', ')}`);
+    process.stderr.write(`unknown scenario ${scenario}; have: ${Object.keys(scen).join(', ')}\n`);
     await client.close();
     process.exit(2);
   }
@@ -118,4 +150,4 @@ if (scenario) {
 }
 
 await client.close();
-console.log(stderrText.slice(0, 2000));
+process.stdout.write(stderrText.slice(0, 2000));

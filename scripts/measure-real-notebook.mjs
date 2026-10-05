@@ -1,6 +1,6 @@
 // Measure the server's peak memory on a REAL notebook the trial report used.
 //
-//   node scripts/measure-run-memory.mjs --file E:\tmp\ipynb-trial\nb\便捷性.ipynb
+//   node scripts/measure-real-notebook.mjs --file <notebook> [<notebook> ...]
 //
 // The sizes matter for the decision: a guard needs the amplification factor, and "re-exec with a
 // bigger heap" needs to know whether the default is close or far. Measured on the trial file, the
@@ -18,6 +18,7 @@ const mib = (bytes) => `${(bytes / 1024 / 1024).toFixed(1)}`;
 /** Peak working set of the child, in bytes, sampled until it exits. */
 function watchPeak(child, intervalMs = 100) {
   const state = { peak: 0, timer: null };
+  const sampleErrors = [];
   const sample = () => {
     if (child.exitCode !== null || child.pid === undefined) {
       return;
@@ -32,13 +33,17 @@ function watchPeak(child, intervalMs = 100) {
       if (Number.isFinite(value) && value > state.peak) {
         state.peak = value;
       }
-    } catch {
-      // a sample that cannot be taken is not a failure
+    } catch (cause) {
+      // A sample that cannot be taken is NOT silently fine: the child may have exited between the check
+      // and this call, but it may equally be that PowerShell is missing or refusing to run — and the
+      // symptom of the old silent catch was a report showing `ratio=0.0`, which reads like a real
+      // measurement rather than a broken probe (review v13 V13-3②).
+      sampleErrors.push(String(cause));
     }
   };
   sample();
   state.timer = setInterval(sample, intervalMs);
-  return state;
+  return { ...state, errors: sampleErrors };
 }
 
 /** One `tools/call` against a fresh server, reporting peak memory and the reply. */

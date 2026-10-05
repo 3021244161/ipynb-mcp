@@ -100,7 +100,8 @@ child.stdout.on('data', (chunk) => {
       let parsed;
       try {
         parsed = JSON.parse(line);
-      } catch (cause) {
+      } catch {
+        // The parser's message adds nothing here; the failing LINE is the diagnosis.
         process.stdout.write(`FAIL stdout line is not JSON: ${line.slice(0, 120)}\n`);
         process.exitCode = 1;
         continue;

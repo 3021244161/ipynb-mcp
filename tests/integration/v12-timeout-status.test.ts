@@ -69,6 +69,14 @@ describe('[V12-4] a timed-out cell is classified as a timeout on every platform'
       //   Linux    SIGINT lands, the kernel reports KeyboardInterrupt, and that error message IS
       //            collected before the run ends.
       const outputs = result['rawOutputs'] as Array<{ outputType: string }>;
+      // A NON-VACUOUS guard for the loop below. On Windows `outputs` is empty, so the loop asserts
+      // nothing at all — which is correct but silent, and "the loop was empty" is indistinguishable from
+      // "the loop found nothing wrong" (review v13 V13-6). Stating the invariant up front means the
+      // Windows branch still asserts something, and the macOS/Linux branch is checked item by item.
+      expect(
+        outputs.length === 0 || outputs.every((output) => output.outputType === 'error'),
+        JSON.stringify(outputs).slice(0, 200),
+      ).toBe(true);
       for (const output of outputs) {
         expect(output.outputType, JSON.stringify(output).slice(0, 200)).toBe('error');
       }

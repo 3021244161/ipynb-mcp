@@ -112,3 +112,14 @@ jobs:
           IPYNB_TEST_PYTHON: python
           IPYNB_TEST_REQUIRE_VENV: '1'
           IPYNB_REQUIRE_NBFORMAT: '1'
+      # V13-4: `check:release` packs the tarball, installs it into an empty directory and
+      # drives the INSTALLED binary over real stdio. It is the one gate that verifies what a
+      # user actually gets — a file missing from `files`, a `bin` path that does not survive
+      # packing, a dependency that is only a devDependency all pass every other check — and it
+      # sat in no automated path at all. It lives in this job because it needs Python with
+      # ipykernel, like the integration suite; SPEC §9's layering keeps it off macOS.
+      #
+      # Only on ubuntu/py3.12: the gate is platform-independent in what it asserts, and the
+      # other three combinations already re-run the same install-and-drive for the suites.
+      - if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
+        run: pnpm check:release

@@ -1,7 +1,7 @@
 {
   "name": "ipynb-mcp",
   "version": "0.1.0",
-  "description": "MCP server (stdio) for AI agents to safely read, edit and run local Jupyter notebooks — zero service, CAS-guarded edits, resumable execution.",
+  "description": "MCP server (stdio) for AI agents to safely read, edit and run local Jupyter notebooks \u2014 zero service, CAS-guarded edits, resumable execution.",
   "license": "MIT",
   "type": "module",
   "bin": {
@@ -20,14 +20,14 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.test.json",
-    "lint": "oxlint src tests && node scripts/check-format.mjs && node scripts/check-indent.mjs && node scripts/check-docs.mjs --selftest && node scripts/check-docs.mjs",
+    "lint": "oxlint src tests scripts && node scripts/check-format.mjs && node scripts/check-indent.mjs && node scripts/check-docs.mjs --selftest && node scripts/check-docs.mjs",
     "check:package": "node scripts/check-package.mjs",
     "test": "vitest run",
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "smoke": "node scripts/e2e-smoke.mjs",
     "check:release": "node scripts/release-check.mjs",
     "prepack": "tsc -p tsconfig.json",
-    "prepublishOnly": "npm run typecheck && npm run lint && npm test && npm run check:package"
+    "prepublishOnly": "npm run typecheck && npm run lint && npm test && npm run check:package && npm run build && npm run check:release"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "~1.31.0",

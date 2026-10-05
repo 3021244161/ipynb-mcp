@@ -1,7 +1,11 @@
 // Real-usage trial harness for ipynb-mcp — scenario scenarios.
 // See trial-changejob.mjs for the driver.
 
-const P = (name) => `E:\\tmp\\ipynb-trial\\nb\\${name}`;
+// The notebooks the harness acts on. Override with IPYNB_TRIAL_DIR; the default is the directory the
+// real-usage trial used, and the harness refuses to run unless `--root` matches it (see the guard in
+// trial-changejob.mjs), so a wrong value fails loudly instead of editing the wrong files.
+const TRIAL_DIR = process.env['IPYNB_TRIAL_DIR'] ?? 'E:\\tmp\\ipynb-trial\\nb';
+const P = (name) => `${TRIAL_DIR}\\${name}`;
 
 const PROBE_MD = '## MCP 试跑\n\n由 ipynb-mcp 试跑脚本插入（可删除）。\n';
 
@@ -92,7 +96,11 @@ export default {
   /** Global contract checks that need no notebook. */
   async contract({ call, note }) {
     note('--- fence: a path outside the root must be refused');
-    const outside = await call('notebook_read', { path: 'E:\\ChangeJob\\天竺街py（30+20）\\20py.ipynb' });
+    // OUTSIDE THE ROOT ON ANY HOST. This used to name one machine's directory: on a host without it the
+    // path simply did not exist, so `path_outside_root` was never the reason for the refusal and the
+    // check passed for the wrong reason (review v13 V13-3③). A sibling of the root is outside it
+    // everywhere, and this module deliberately has no imports — the driver owns path resolution.
+    const outside = await call('notebook_read', { path: `${TRIAL_DIR}\\..\\outside-root-probe.ipynb` });
     note(brief(outside, { code: (j) => j.error?.code ?? j.code, msg: (j) => String(j.error?.message ?? j.message ?? '').slice(0, 120) })
       || outside.text.slice(0, 200));
 

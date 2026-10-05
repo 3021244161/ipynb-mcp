@@ -142,7 +142,7 @@ function fixFile(file) {
   }
 
   writeFileSync(file, text);
-  console.log(`${file}: ${applied} lines re-indented`);
+  process.stdout.write(`${file}: ${applied} lines re-indented\n`);
 }
 
 for (const file of files) {
