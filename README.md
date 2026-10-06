@@ -1,5 +1,7 @@
 # ipynb-mcp-server
 
+**English** | [简体中文](./README.zh-CN.md)
+
 [![npm version](https://img.shields.io/npm/v/ipynb-mcp-server.svg)](https://www.npmjs.com/package/ipynb-mcp-server)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![node: >=22](https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg)](https://nodejs.org)
@@ -15,7 +17,19 @@ An [MCP](https://modelcontextprotocol.io) server that lets any AI agent **read, 
 | "Run cell 87" **re-runs the 40-minute training cell at the top**, or the `!wget` that pulls 2 GB. | `mode='resume'` runs only the target cells in the live kernel. No kernel alive? `mode='replay'` silently rebuilds state from cell 0, then runs just the target — and `replayed_cell_indexes` tells you exactly what was re-executed. `notebook_kernel(start)` + `resume` runs one cell with **zero** replay. |
 | To use an agent at all you must first stand up JupyterLab, copy a URL, manage a token and keep it running. | **Nothing to start.** stdio, one line of config, no port, no token. The server talks to a Jupyter kernel directly and dies with your client. |
 
-## 60 seconds
+## Install
+
+**Nothing to clone, nothing to build.** The server ships as a prebuilt npm package — pick one of these three:
+
+| How | Command | When to use it |
+|---|---|---|
+| **Run on demand — recommended** | `npx -y ipynb-mcp-server --root /path/to/your/notebooks` | You only need it inside an MCP client's config. Nothing is installed permanently; `npx` fetches the published package into its cache the first time. |
+| **Install globally** | `npm install -g ipynb-mcp-server` then `ipynb-mcp-server --root /path/to/your/notebooks` | You want the command on `PATH`, or want to pin a version (`ipynb-mcp-server@0.1.0`). |
+| **From source** | `git clone https://github.com/3021244161/ipynb-mcp && cd ipynb-mcp && pnpm install && pnpm build` | **Only if you are changing the code** — see [Development](#development). |
+
+Requirements: **Node ≥ 22** (which brings `npm` and `npx`). Python is needed only at the moment a cell actually runs, and the server finds it itself — see [Interpreter selection](#interpreter-selection). The installer never runs `pip install` and never compiles anything.
+
+## Add it to your client (60 seconds)
 
 ```bash
 # 1. it is a plain stdio server — nothing to install, nothing to start
