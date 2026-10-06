@@ -13,7 +13,7 @@ node <repo>/lib/bin.js --root <你的 notebook 目录>
 
 ```bash
 cd <repo> && pnpm build && npm pack
-npx -y file:./ipynb-mcp-server-0.1.0.tgz --root <你的 notebook 目录>
+npx -y file:./ipynb-mcp-server-<version>.tgz --root <你的 notebook 目录>
 ```
 
 | # | 步骤 | 通过标准 | 证据（截图/日志路径） |

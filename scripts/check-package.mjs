@@ -120,6 +120,7 @@ const ROOT_ALLOWED = new Set([
   'CHANGELOG.md',
   'LICENSE',
   'README.md',
+  'README.zh-CN.md',
   'SPEC.md',
   'package.json',
   'pnpm-lock.yaml',

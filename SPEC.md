@@ -903,7 +903,7 @@ export interface MarkdownIssue { severity: 'error' | 'warning', rule: string, li
 
 ```
 ipynb-mcp/
-├── package.json          # name: ipynb-mcp-server · version 0.1.0 · license MIT · type module
+├── package.json          # name: ipynb-mcp-server · version 0.1.1 · license MIT · type module
 │                         # bin: { "ipynb-mcp-server": "./lib/bin.js" } · engines.node ">=22"
 │                         # files: ["lib", "python", "README.md", "LICENSE"]
 │                         # dependencies: @modelcontextprotocol/sdk 1.31.x（唯一运行时依赖）

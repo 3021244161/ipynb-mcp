@@ -24,7 +24,7 @@
 | 方式 | 命令 | 适用场景 |
 |---|---|---|
 | **按需运行（推荐）** | `npx -y ipynb-mcp-server --root /你的/notebook/目录` | 你只是要在 MCP 客户端配置里用它。不常驻安装，`npx` 首次使用时会从 npm 取包并缓存。 |
-| **全局安装** | `npm install -g ipynb-mcp-server`，然后 `ipynb-mcp-server --root /你的/notebook/目录` | 你想让命令进 `PATH`，或想锁定版本（`ipynb-mcp-server@0.1.0`）。 |
+| **全局安装** | `npm install -g ipynb-mcp-server`，然后 `ipynb-mcp-server --root /你的/notebook/目录` | 你想让命令进 `PATH`，或想锁定版本（`ipynb-mcp-server@<版本号>`）。 |
 | **从源码** | `git clone https://github.com/3021244161/ipynb-mcp && cd ipynb-mcp && pnpm install && pnpm build` | **只有你要改代码时才需要**，见 [开发](#开发)。 |
 
 环境要求：**Node ≥ 22**（自带 `npm` 与 `npx`）。Python 只在真正执行 cell 的那一刻才需要，且由服务自己去找——见 [解释器选择](#解释器选择)。安装过程**不执行 `pip install`、不编译任何东西**。

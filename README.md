@@ -24,7 +24,7 @@ An [MCP](https://modelcontextprotocol.io) server that lets any AI agent **read, 
 | How | Command | When to use it |
 |---|---|---|
 | **Run on demand — recommended** | `npx -y ipynb-mcp-server --root /path/to/your/notebooks` | You only need it inside an MCP client's config. Nothing is installed permanently; `npx` fetches the published package into its cache the first time. |
-| **Install globally** | `npm install -g ipynb-mcp-server` then `ipynb-mcp-server --root /path/to/your/notebooks` | You want the command on `PATH`, or want to pin a version (`ipynb-mcp-server@0.1.0`). |
+| **Install globally** | `npm install -g ipynb-mcp-server` then `ipynb-mcp-server --root /path/to/your/notebooks` | You want the command on `PATH`, or want to pin a version (`ipynb-mcp-server@<version>`). |
 | **From source** | `git clone https://github.com/3021244161/ipynb-mcp && cd ipynb-mcp && pnpm install && pnpm build` | **Only if you are changing the code** — see [Development](#development). |
 
 Requirements: **Node ≥ 22** (which brings `npm` and `npx`). Python is needed only at the moment a cell actually runs, and the server finds it itself — see [Interpreter selection](#interpreter-selection). The installer never runs `pip install` and never compiles anything.

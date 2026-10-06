@@ -2,7 +2,30 @@
 
 本项目的接口变更遵循 D22 兼容承诺（工具名与参数名在 1.x 内不删不改；新增参数一律可选带默认值；返回字段只增不删）。
 
-## [Unreleased] 0.1.0 — 第十六轮代码复核整改（上线前）
+## [0.1.1] — 包名改为 ipynb-mcp-server、README 安装说明与中文版（2026-10-06）
+
+> 来源：发布后的人工复核（"GitHub 里有没有说清怎么装？要不要拉源码？"）。
+> 0.1.0 以 `ipynb-mcp` 之名发布；本版把包名改为 **`ipynb-mcp-server`**，并补齐"怎么装"的文档与中文版。
+> **工具名 / 参数名 / 返回字段与 0.1.0 完全一致**（本轮只改元数据与文档），符合 D22 的 1.x 兼容承诺；唯一对客户端可见的行为差异是 MCP `initialize` 自报的 server name 随之变为 `ipynb-mcp-server`。升级方式：客户端配置里的包名换成 `npx -y ipynb-mcp-server`。
+
+### Changed — 发布身份与文档
+
+| 项 | 变化 |
+|---|---|
+| npm 包名 | `ipynb-mcp` → **`ipynb-mcp-server`**（`bin` 同步改名；旧名 0.1.0 留在 registry 并标记废弃 `Renamed: use ipynb-mcp-server`）。仓库名未变。 |
+| `package.json` | 补 `keywords`（12）/`repository`/`homepage`/`bugs`——此前全为空，npm 站内搜索与 npm 页面的仓库链接都拿不到。 |
+| `README.md` | 新增 `## Install`：三条路径（按需 `npx` / `npm install -g` / 从源码，并标注"仅改代码时才需要"）+ Requirements（Node ≥ 22；Python 仅在真正执行 cell 时需；安装过程不 `pip install`、不编译）。原 `## 60 seconds` 改名 `## Add it to your client (60 seconds)`，把"装"和"配"分开。 |
+| `README.zh-CN.md` | **新增**：README 全文中文翻译，中英互链，末尾注明"如中英有出入以英文版为准"。**随包发布**（本轮加入 `files` 与 `check-package` 的根目录白名单）。 |
+| `SPEC.md` / `AGENTS.md` / `docs/OPEN_QUESTIONS.md` / `docs/E2E-CHECKLIST.md` / `dsh-ipynb-mcp/*` | 包身份同步改名；**运行时名字刻意不变**（日志前缀 `[ipynb-mcp]`、connection file 前缀 `ipynb-mcp-<id>-<pid>-<rand>.json`、artifact 缓存目录、测试 venv），历史归档报告与 `CHANGELOG` 旧条目不改。 |
+| 仓库外 | GitHub topics 12 个；tag `v0.1.0` + Release（上一版补建），本版另打 `v0.1.1`。 |
+
+### 门禁
+
+`typecheck` / `lint`（含 format、indent，以及 check-docs 的 "SPEC §12 verbatim"）/ 615 单测 / `check:package` / `check:release` 12/12——全绿。
+
+---
+
+## [0.1.0] — 第十六轮代码复核整改（上线前）
 
 > 来源：`docs/review/ipynb-mcp-code-review-v16.md`（评级 **B**：1 条 🟡 + 2 条 🟢）。
 > v15 的唯一 🔴（V15-1）经同一批探针复验为**真修**：12 MiB 源码 + `include_source='full'` 从"断连"变成 422 ms 正常返回（8.00 MiB + 标记 + 指名警告），F2/F3 无回归，`pnpm lint` 真正 0 警。
