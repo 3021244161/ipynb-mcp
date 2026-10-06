@@ -19,6 +19,8 @@
 | `SPEC.md` / `AGENTS.md` / `docs/OPEN_QUESTIONS.md` / `docs/E2E-CHECKLIST.md` / `dsh-ipynb-mcp/*` | 包身份同步改名；**运行时名字刻意不变**（日志前缀 `[ipynb-mcp]`、connection file 前缀 `ipynb-mcp-<id>-<pid>-<rand>.json`、artifact 缓存目录、测试 venv），历史归档报告与 `CHANGELOG` 旧条目不改。 |
 | 仓库外 | GitHub topics 12 个；tag `v0.1.0` + Release（上一版补建），本版另打 `v0.1.1`。 |
 
+README 首屏另有新增的 `## Who this is for` / `## 这个工具适合谁`（学生 / 数据工作者 / 老师 / 任何把 agent 指向真实文件的人）——首屏的吸引力优先；仓库 About 描述也重写为面向同样受众的一句话，Website 指向 npm 包页。
+
 ### 门禁
 
 `typecheck` / `lint`（含 format、indent，以及 check-docs 的 "SPEC §12 verbatim"）/ 615 单测 / `check:package` / `check:release` 12/12——全绿。
@@ -64,6 +66,8 @@
 - **V16-2① 夹具形状矩阵**：v15 已建（大单值文本 / 大量小值 / **大 source** / 非 ASCII / 转义富集 / **大图片** / 失败路径），矩阵写在测试文件里并已在 `AGENTS.md §9` 成规则。本轮又补两格（被截断的 `stream` 项、被截断的摘要）。
 - **V16-2② `check-indent` 扩到 `.mjs`**：**v15 已完成**。本轮实测复核（往临时目录放一个缩进错的 `.mjs`，`check-indent` 报 `line 3 is indented 6, expected 4` 并以 1 退出），所以这条不再成立。
 - **V16-2③ F6/F7**：F7（`structuredClone` 深拷贝）的注释与实现一致（v14 已订正）；F6（预算挡下的图片已物化）仍按 **D-066** 登记为已知行为，修法需把预算前移到 `applyImagePolicy`，属独立改动。
+
+README 首屏另有新增的 `## Who this is for` / `## 这个工具适合谁`（学生 / 数据工作者 / 老师 / 任何把 agent 指向真实文件的人）——首屏的吸引力优先；仓库 About 描述也重写为面向同样受众的一句话，Website 指向 npm 包页。
 
 ### 门禁与覆盖
 
@@ -117,6 +121,8 @@
 ### 交付前亲自试用
 
 三个真客户端脚本（`scripts/trial-v15.mjs` 24/24、`scripts/trial-real-notebook.mjs` 5/5、`scripts/trial-real-run.mjs` 10/10）手工跑过：六个工具全流程、CAS 负例、锚定编辑、真 kernel 执行与写回、五种载荷形状、按 pid 断言内核进程回收；并在**原始的 37.5 MiB xgboost notebook** 上验证读（三种模式）与"插入探针 → 执行 → 写回 → 删除 → 关内核"完整链路。试用过程中发现并修正了**我自己的三处 API 误用**（`insert_cell` 用 `source` 且禁锚、`delete_cell` 要求锚、`stale_analysis` 属于 run 而非 read）——服务端每次都给出正确的 `invalid_ops`，是脚本猜错了规格。
+
+README 首屏另有新增的 `## Who this is for` / `## 这个工具适合谁`（学生 / 数据工作者 / 老师 / 任何把 agent 指向真实文件的人）——首屏的吸引力优先；仓库 About 描述也重写为面向同样受众的一句话，Website 指向 npm 包页。
 
 ### 门禁与覆盖
 

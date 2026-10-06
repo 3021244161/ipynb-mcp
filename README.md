@@ -9,6 +9,13 @@
 
 An [MCP](https://modelcontextprotocol.io) server that lets any AI agent **read, edit and run local Jupyter notebooks** — safely, with zero setup.
 
+## Who this is for
+
+- **Students.** A course hands you a `.ipynb` full of empty cells to fill in. Let the agent read the task, write the cells and run them — and because every edit carries an anchor, an edit that races the cell you are typing in JupyterLab **fails loudly instead of overwriting you**.
+- **Data people.** Your analysis *is* the notebook, and its outputs hold the plots and dataframes you care about. "Change this one cell and re-run just it" is the whole point: `resume` touches one cell, not the forty before it — and the images come back as images.
+- **Teachers.** An assignment already lives in a notebook: let the agent read what each student's cells actually produce. It can edit a submission, but never silently — writes are anchored, atomic, and always preceded by a rolling backup.
+- **Anyone pointing an agent at real files.** The interesting part is not that it can edit your notebook; it is that it can **show you it did not corrupt it**.
+
 ## The three things that go wrong without it
 
 | What happens today | What this server does instead |
