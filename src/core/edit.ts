@@ -185,8 +185,8 @@ export function applyEditOps(
         const actualRangeText = lines.slice(startLine - 1, endLine).join('\n');
         const userAnchor = readStringField(raw, 'expected_text', opIndex)!;
         checkTextAnchor(notebook, cell, userAnchor, actualRangeText, 'line_text', opIndex, options);
-        lines.splice(startLine - 1, endLine - startLine + 1, ...newText.split('\n'));
-        setCellSource(cell, lines.join('\n'));
+        const replaced = lines.slice(0, startLine - 1).concat(newText.split('\n'), lines.slice(endLine));
+        setCellSource(cell, replaced.join('\n'));
         trackMarkdownWrite(cell, kind, options, markdownIssues);
         touchedCell = cell;
         break;
@@ -213,8 +213,8 @@ export function applyEditOps(
             after: actualAfter,
           });
         }
-        lines.splice(atLine - 1, 0, ...newText.split('\n'));
-        setCellSource(cell, lines.join('\n'));
+        const inserted = lines.slice(0, atLine - 1).concat(newText.split('\n'), lines.slice(atLine - 1));
+        setCellSource(cell, inserted.join('\n'));
         trackMarkdownWrite(cell, kind, options, markdownIssues);
         touchedCell = cell;
         break;

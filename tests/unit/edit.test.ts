@@ -55,6 +55,22 @@ function expectError(action: () => unknown): IpynbError {
   }
 }
 
+describe('[step4] large line edits respect the same CAS contract', () => {
+  it.each(['replace_lines', 'insert_lines'])('[U2][U6] edits 150,000 lines with %s without an argument overflow', (op) => {
+    const inserted = 'x = 1\n'.repeat(149_999) + 'x = 1';
+    const notebook = parseNotebook(Buffer.from(notebookJson([codeCell('before\nold\nafter', 'large')])), hasher);
+    const edit = op === 'replace_lines'
+      ? { op, cell_index: 0, start_line: 2, end_line: 2, expected_text: 'old', new_text: inserted }
+      : { op, cell_index: 0, at_line: 2, expected_before: 'before', expected_after: 'old', new_text: inserted };
+    const result = apply(notebook, [edit]);
+    expect(cellSource(notebook.cells[0]!)).toBe(op === 'replace_lines'
+      ? `before\n${inserted}\nafter`
+      : `before\n${inserted}\nold\nafter`);
+    expect(result.changedCells[0]?.new_line_count).toBe(op === 'replace_lines' ? 150_002 : 150_003);
+    expect(result.applied).toBe(1);
+  });
+});
+
 describe('[step4][U2] replace_lines with mismatched expected_text', () => {
   it('fails with cas_mismatch, leaves the file untouched, and reports a retryable anchor', async () => {
     const json = notebookJson([codeCell('a = 1\nb = 2\nc = 3', 'cell-0')]);
