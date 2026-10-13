@@ -59,6 +59,28 @@ function richNotebookJson(): string {
 }
 
 describe('[step3] parseNotebook', () => {
+  it.each([
+    [0x80],
+    [0xc0, 0xaf],
+    [0xe2, 0x82],
+    [0xed, 0xa0, 0x80],
+  ])('[U1] rejects malformed UTF-8 instead of silently changing source bytes: %j', (...badBytes) => {
+    const prefix = Buffer.from('{"nbformat":4,"nbformat_minor":5,"metadata":{},"cells":[{"cell_type":"code","metadata":{},"source":"');
+    const suffix = Buffer.from('","outputs":[],"execution_count":null}]}');
+    const bytes = Buffer.concat([prefix, Buffer.from(badBytes), suffix]);
+    expect(() => parseNotebook(bytes, hasher)).toThrowError(expect.objectContaining({ code: 'parse_failed' }));
+  });
+
+  it('[U1] preserves valid UTF-8 including a literal replacement character', () => {
+    const bytes = Buffer.from(JSON.stringify({
+      nbformat: 4, nbformat_minor: 5, metadata: {},
+      cells: [{ cell_type: 'code', id: 'utf8', metadata: {}, source: '中文😀\ufffd', outputs: [], execution_count: null }],
+    }));
+    const notebook = parseNotebook(bytes, hasher);
+    expect(cellSource(notebook.cells[0]!)).toBe('中文😀\ufffd');
+    expect(serializeNotebook(notebook)).toContain('中文😀\ufffd');
+  });
+
   it('rejects invalid JSON with parse_failed', () => {
     expect(() => parseNotebook(new TextEncoder().encode('{not json'), hasher)).toThrowError(
       expect.objectContaining({ code: 'parse_failed' }),

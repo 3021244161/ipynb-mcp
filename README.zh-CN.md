@@ -107,6 +107,8 @@ dsh 用户：安装配套的 `dsh-ipynb-mcp` bundle（见 [dsh-ipynb-mcp/](./dsh
 
 写入会在临时文件准备完成后、每次重命名尝试前复检 notebook 的内容哈希，包括 Windows 共享冲突后的重试。发现外部修改时返回 `file_changed`；重试期间收到取消会丢弃临时文件。
 
+UTF-8 编码损坏的 notebook 会返回 `parse_failed`，读取时不会静默替换字符并在后续写入中保存替换结果。
+
 默认配置下，**单格**执行是同步返回的（其预估上界恰好等于那个 10 倍阈值）；**两格及以上**、或调大了 `--exec-timeout-seconds` 时，会返回一个后台 `run_id`，用 `notebook_run_status` 轮询。这个倍数来自 `DEVIATIONS.md` D-015。
 
 ## 解释器选择

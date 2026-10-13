@@ -49,7 +49,7 @@ export function parseNotebook(rawBytes: Uint8Array, hasher: Hasher): NotebookFil
     // `18446744073709551616` is silently rounded on the way in and the rounded
     // value is what a later write-back stores (review v9 V9-5). The exact parser
     // builds the same tree for every other value (see core/json-exact.ts).
-    doc = parseJsonExact(new TextDecoder().decode(rawBytes));
+    doc = parseJsonExact(new TextDecoder('utf-8', { fatal: true }).decode(rawBytes));
   } catch (cause) {
     // The message must describe the CAUSE, because "not valid JSON" is a claim about the
     // authority and it was false in two ways (review v11 V11-8): a document too deeply nested
