@@ -577,13 +577,15 @@ function casMismatch(
   // Computed once: truncateText walks the whole source, and a large cell paid
   // for that walk twice on every anchor mismatch (review v3 QUAL-7).
   const truncatedSource = truncateText(currentSource);
+  const truncatedActual = truncate(actual);
   return new IpynbError('cas_mismatch', 'compare-and-swap anchor mismatch', {
     failed_op_index: opIndex,
     anchor,
     cell_index: notebook.cells.indexOf(cell),
     cell_id: cell.id ?? null,
-    expected: truncate(expected),
-    actual: truncate(actual),
+    expected: truncate(expected).value,
+    actual: truncatedActual.value,
+    actual_truncated: truncatedActual.truncated,
     current_source_hash: cellSourceHash(cell, options.hasher),
     current_source: truncatedSource.text,
     current_source_truncated: truncatedSource.truncated,
@@ -610,11 +612,21 @@ function rangeOutOfBounds(opIndex: number, kind: string, reason: string): IpynbE
   });
 }
 
-function truncate(value: JsonValue): JsonValue {
-  if (typeof value === 'string' && value.length > MAX_DETAIL_TEXT) {
-    return `${value.slice(0, MAX_DETAIL_TEXT)}…`;
+function truncate(value: JsonValue): { value: JsonValue; truncated: boolean } {
+  if (typeof value === 'string') {
+    const result = truncateText(value);
+    return { value: result.text, truncated: result.truncated };
   }
-  return value;
+  if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+    let truncated = false;
+    const entries = Object.entries(value).map(([key, entry]) => {
+      const result = truncate(entry);
+      truncated ||= result.truncated;
+      return [key, result.value];
+    });
+    return { value: Object.fromEntries(entries) as JsonValue, truncated };
+  }
+  return { value, truncated: false };
 }
 
 function truncateText(value: string): { text: string; truncated: boolean } {

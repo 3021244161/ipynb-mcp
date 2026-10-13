@@ -72,6 +72,30 @@ describe('[step4] large line edits respect the same CAS contract', () => {
 });
 
 describe('[step4][U2] replace_lines with mismatched expected_text', () => {
+  it.each([10, 5000])('[U2] reports whether the actual text was truncated (%i characters)', (length) => {
+    const notebook = parseNotebook(Buffer.from(notebookJson([codeCell('x'.repeat(length), 'cas')])), hasher);
+    const error = expectError(() => apply(notebook, [{
+      op: 'replace_source', cell_index: 0, expected_text: 'stale', new_text: 'replacement',
+    }]));
+    const detail = error.detail as Record<string, unknown>;
+    expect(detail['actual_truncated']).toBe(length > 4000);
+    expect(detail['actual']).toBe(length > 4000 ? 'x'.repeat(4000) + '…' : 'x'.repeat(length));
+    expect(detail['current_source_hash']).toBe(`sha256:${hasher.sha256Hex('x'.repeat(length))}`);
+  });
+
+  it('[U6] bounds both neighbor anchors and reports truncation on a mismatch', () => {
+    const notebook = parseNotebook(Buffer.from(notebookJson([codeCell('x'.repeat(100_000), 'neighbors')])), hasher);
+    const error = expectError(() => apply(notebook, [{
+      op: 'insert_lines', cell_index: 0, at_line: 1,
+      expected_before: '', expected_after: 'y'.repeat(100_000), new_text: 'replacement',
+    }]));
+    const detail = error.detail as Record<string, unknown>;
+    expect(detail['actual']).toEqual({ before: '', after: 'x'.repeat(4000) + '…' });
+    expect(detail['expected']).toEqual({ before: '', after: 'y'.repeat(4000) + '…' });
+    expect(detail['actual_truncated']).toBe(true);
+    expect(cellSource(notebook.cells[0]!)).toBe('x'.repeat(100_000));
+  });
+
   it('fails with cas_mismatch, leaves the file untouched, and reports a retryable anchor', async () => {
     const json = notebookJson([codeCell('a = 1\nb = 2\nc = 3', 'cell-0')]);
     const { target, notebook, bytes } = await parseFile('u2.ipynb', json);

@@ -109,6 +109,8 @@ dsh 用户：安装配套的 `dsh-ipynb-mcp` bundle（见 [dsh-ipynb-mcp/](./dsh
 
 UTF-8 编码损坏的 notebook 会返回 `parse_failed`，读取时不会静默替换字符并在后续写入中保存替换结果。
 
+CAS 不匹配的详情包含 `actual_truncated` 和 `current_source_truncated`。长文本和邻接锚限制为 4000 字符加截断标记；`current_source_hash` 保持完整，可用哈希锚重试。
+
 默认配置下，**单格**执行是同步返回的（其预估上界恰好等于那个 10 倍阈值）；**两格及以上**、或调大了 `--exec-timeout-seconds` 时，会返回一个后台 `run_id`，用 `notebook_run_status` 轮询。这个倍数来自 `DEVIATIONS.md` D-015。
 
 ## 解释器选择

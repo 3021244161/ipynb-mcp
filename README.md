@@ -109,6 +109,8 @@ Writes recheck the notebook's content hash after preparing the temporary file an
 
 Malformed UTF-8 notebooks fail with `parse_failed`; the reader never silently substitutes characters that could later be written back.
 
+CAS mismatch details include `actual_truncated` and `current_source_truncated`. Long text and neighbor anchors are limited to 4000 characters plus a truncation marker; `current_source_hash` remains complete for retrying with a hash anchor.
+
 With the defaults, a single-cell run is executed synchronously (its upper bound is exactly the 10× cut-off); two or more cells, or a raised `--exec-timeout-seconds`, return a background `run_id` you poll with `notebook_run_status`. The multiplier is `DEVIATIONS.md` D-015.
 
 ## Interpreter selection
