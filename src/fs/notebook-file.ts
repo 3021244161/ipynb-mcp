@@ -198,25 +198,8 @@ async function writeNotebookFileUnlocked(
   // Optimistic-lock recheck over the read->write window (SPEC §4.1.8):
   // even without expected_content_hash from the caller we compare the
   // on-disk bytes against what we parsed.
-  let currentBytes: Uint8Array;
-  try {
-    currentBytes = await readFile(absolutePath);
-  } catch (cause) {
-    if (lockErrno(cause) === 'ENOENT') {
-      throw new IpynbError('file_not_found', `notebook file not found: ${absolutePath}`, {
-        path: absolutePath,
-      });
-    }
-    throw translateLockError(cause, absolutePath);
-  }
-  const currentHash = `sha256:${options.hasher.sha256Hex(currentBytes)}`;
   const expected = options.expectedContentHash ?? notebook.contentHash;
-  if (currentHash !== expected) {
-    throw new IpynbError('file_changed', 'notebook file changed since it was read', {
-      expected,
-      actual: currentHash,
-    });
-  }
+  await assertContentUnchanged(absolutePath, options.hasher, expected);
 
   const serialize = options.serialize ?? serializeNotebook;
   // `await` so an async hook (the test seam for "the write is about to land") can
@@ -268,9 +251,28 @@ async function writeNotebookFileUnlocked(
 
   await atomicWriteFile(absolutePath, serialized, {
     signal: options.signal,
+    // Serialization, backup and fsync all yield; a read-time check cannot protect
+    // changes during those operations or during Windows sharing-violation retries.
+    beforeRename: () => assertContentUnchanged(absolutePath, options.hasher, expected),
     platform: options.platform,
     onCleanupError: options.onCleanupError,
   });
   const contentHashAfter = `sha256:${options.hasher.sha256Hex(serialized)}`;
   return { backupPath, contentHashAfter, serialized };
+}
+
+async function assertContentUnchanged(absolutePath: string, hasher: Hasher, expected: string): Promise<void> {
+  let currentBytes: Uint8Array;
+  try {
+    currentBytes = await readFile(absolutePath);
+  } catch (cause) {
+    if (lockErrno(cause) === 'ENOENT') {
+      throw new IpynbError('file_not_found', `notebook file not found: ${absolutePath}`, { path: absolutePath });
+    }
+    throw translateLockError(cause, absolutePath);
+  }
+  const actual = `sha256:${hasher.sha256Hex(currentBytes)}`;
+  if (actual !== expected) {
+    throw new IpynbError('file_changed', 'notebook file changed since it was read', { expected, actual });
+  }
 }

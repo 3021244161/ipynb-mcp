@@ -30,6 +30,67 @@ function errorWithCode(code: string): Error & { code: string } {
 }
 
 describe('[step2] atomicWriteFile', () => {
+  it('[U12] validates external changes again after a sharing violation', async () => {
+    const target = path.join(dir, 'external-retry.ipynb');
+    await writeFile(target, 'original');
+    let attempts = 0;
+    const deps: AtomicWriteDeps = {
+      open: (t, flags, mode) => fsOpen(t, flags, mode) as Promise<FileHandleLike>,
+      rename: async (from, to) => {
+        attempts += 1;
+        if (attempts === 1) {
+          await writeFile(to, 'external edit');
+          throw errorWithCode('EBUSY');
+        }
+        await import('node:fs/promises').then((m) => m.rename(from, to));
+      },
+      unlink: (t) => import('node:fs/promises').then((m) => m.unlink(t)),
+      fsyncDir: async () => undefined,
+      stat: async () => null,
+      readdir: async () => [],
+      now: () => new Date(),
+      sleep: async () => undefined,
+    };
+    await expect(atomicWriteFile(target, 'our edit', {
+      deps,
+      beforeRename: async () => {
+        if (await readFile(target, 'utf8') !== 'original') {
+          throw new IpynbError('file_changed', 'target changed during retry', {});
+        }
+      },
+    })).rejects.toMatchObject({ code: 'file_changed' });
+    expect(attempts).toBe(1);
+    expect(await readFile(target, 'utf8')).toBe('external edit');
+    expect(await tmpFiles()).toEqual([]);
+  });
+
+  it('[I14] aborts without replacing the target when cancellation arrives during a rename retry', async () => {
+    const target = path.join(dir, 'abort-retry.ipynb');
+    await writeFile(target, 'external original');
+    const controller = new AbortController();
+    let attempts = 0;
+    const deps: AtomicWriteDeps = {
+      open: (t, flags, mode) => fsOpen(t, flags, mode) as Promise<FileHandleLike>,
+      rename: async (from, to) => {
+        attempts += 1;
+        if (attempts === 1) {
+          throw errorWithCode('EBUSY');
+        }
+        await import('node:fs/promises').then((m) => m.rename(from, to));
+      },
+      unlink: (t) => import('node:fs/promises').then((m) => m.unlink(t)),
+      fsyncDir: async () => undefined,
+      stat: async () => null,
+      readdir: async () => [],
+      now: () => new Date(),
+      sleep: async () => { controller.abort(new Error('cancelled during retry')); },
+    };
+    await expect(atomicWriteFile(target, 'our edit', { deps, signal: controller.signal })).rejects.toThrow('cancelled during retry');
+    expect(attempts).toBe(1);
+    expect(await readFile(target, 'utf8')).toBe('external original');
+    expect(await tmpFiles()).toEqual([]);
+  });
+
   it('writes the target content and leaves no temp files behind', async () => {
     const target = path.join(dir, 'nb.ipynb');
     await atomicWriteFile(target, '{"cells": []}');

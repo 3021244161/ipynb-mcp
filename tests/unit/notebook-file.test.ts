@@ -2,14 +2,14 @@
 // §10.2 I15 (a locked notebook must map to notebook_locked, never internal),
 // §4.1.8 (the optimistic-lock recheck), §5.5.5 (self check before writing).
 
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { IpynbError } from '../../src/core/errors.js';
-import { parseNotebook } from '../../src/core/parse.js';
+import { parseNotebook, serializeNotebook } from '../../src/core/parse.js';
 import { hasher } from '../../src/hash.js';
 import {
   pendingWriteLockCount,
@@ -33,6 +33,37 @@ const NOTEBOOK_JSON = JSON.stringify({
   nbformat_minor: 5,
   metadata: {},
   cells: [{ cell_type: 'code', id: 'c0', metadata: {}, source: 'x = 1', outputs: [], execution_count: null }],
+});
+
+describe('[step2][U12] external changes during the write window', () => {
+  it.each(['serialization', 'backup'])('[U12] preserves an external edit during %s', async (phase) => {
+    const target = path.join(dir, `external-${phase}.ipynb`);
+    await writeFile(target, NOTEBOOK_JSON);
+    const notebook = await readNotebookFile(target, hasher);
+    notebook.cells[0]!.source = 'our edit';
+    const external = NOTEBOOK_JSON.replace('x = 1', 'external edit');
+    await expect(writeNotebookFile(notebook, target, {
+      hasher,
+      backupKeep: 10,
+      createBackup: phase === 'backup',
+      serialize: async (value) => {
+        if (phase === 'serialization') {
+          await writeFile(target, external);
+        }
+        return serializeNotebook(value);
+      },
+      copyFileImpl: async (src, dest) => {
+        await copyFile(src, dest);
+        await writeFile(target, external);
+      },
+    })).rejects.toMatchObject({
+      code: 'file_changed',
+      detail: { expected: notebook.contentHash, actual: `sha256:${hasher.sha256Hex(external)}` },
+    });
+    expect(await readFile(target, 'utf8')).toBe(external);
+    expect((await readdir(dir)).filter((name) => name.includes('.tmp-'))).toEqual([]);
+    expect(pendingWriteLockCount()).toBe(0);
+  });
 });
 
 function errorWithCode(code: string): Error & { code: string } {

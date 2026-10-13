@@ -97,6 +97,8 @@ async function pruneStaleTempFiles(
 export interface AtomicWriteOptions {
   /** Aborting before rename discards the temp file and leaves the target untouched (SPEC §4.6.2). */
   readonly signal?: AbortSignal;
+  /** Validate the target after temp-file preparation and before every rename attempt. */
+  readonly beforeRename?: () => Promise<void>;
   readonly deps?: AtomicWriteDeps;
   /** Default: process.platform. Windows skips the directory fsync (SPEC §9). */
   readonly platform?: NodeJS.Platform;
@@ -133,7 +135,7 @@ export async function atomicWriteFile(
     }
     throwIfAborted(options.signal);
     try {
-      await renameWithLockRetry(deps, tmpPath, absolutePath);
+      await renameWithLockRetry(deps, tmpPath, absolutePath, options);
       renamed = true;
     } catch (cause) {
       if (isLockError(cause)) {
@@ -231,10 +233,16 @@ export async function renameWithLockRetry(
   deps: AtomicWriteDeps,
   from: string,
   to: string,
+  options: Pick<AtomicWriteOptions, 'signal' | 'beforeRename'> = {},
 ): Promise<void> {
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const deadline = Date.now() + RENAME_RETRY_WINDOW_MS;
   for (let attempt = 0; ; attempt += 1) {
+    throwIfAborted(options.signal);
+    if (options.beforeRename !== undefined) {
+      await options.beforeRename();
+    }
+    throwIfAborted(options.signal);
     try {
       await deps.rename(from, to);
       return;
