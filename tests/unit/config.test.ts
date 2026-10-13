@@ -168,6 +168,24 @@ describe('[step1] CLI parsing', () => {
 });
 
 describe('[step1] numeric and enum validation (startup errors → exit 2)', () => {
+  it.each(['9007199254740993', '9'.repeat(400)])('[U27] rejects unsafe CLI integers: %s', (value) => {
+    const result = parseConfig(['--kernel-idle-seconds', value], BASE_ENV);
+    expect(result.config).toBeUndefined();
+    expect(result.errors[0]).toContain('safe integer');
+  });
+
+  it('[U27] rejects overflowing integer environment values', () => {
+    const result = parseConfig([], { ...BASE_ENV, IPYNB_BACKUP_KEEP: '9'.repeat(400) });
+    expect(result.config).toBeUndefined();
+    expect(result.errors[0]).toContain('safe integer');
+  });
+
+  it('[U27] accepts the largest exactly representable configuration integer', () => {
+    const result = parseConfig(['--backup-keep', '9007199254740991'], BASE_ENV);
+    expect(result.errors).toEqual([]);
+    expect(result.config?.backupKeep).toBe(9007199254740991);
+  });
+
   it('rejects non-integer and out-of-range numbers', () => {
     expect(parseConfig(['--exec-timeout-seconds', '0'], BASE_ENV).errors[0]).toContain('must be >= 1');
     expect(parseConfig(['--exec-timeout-seconds', '86401'], BASE_ENV).errors[0]).toContain('must be <= 86400');
@@ -205,6 +223,29 @@ describe('[step1] normalizeForCompare', () => {
 
 describe('[step1] validateStartupFiles (startup failures → exit 2, SPEC §5.1)', () => {
   const win32 = 'win32' as const;
+
+  it.each(['//server/share', '//server/share/', '\\\\server\\share\\'])('[U11] rejects a UNC filesystem root: %s', (root) => {
+    const cfg = parseConfig(['--root', root], BASE_ENV).config!;
+    const errors = validateStartupFiles(cfg, makeFsDeps({ existingPaths: [root] }), win32);
+    expect(errors.join('\n')).toContain('filesystem root');
+  });
+
+  it('[U11] does not create artifacts after rejecting the root', () => {
+    const cfg = parseConfig(['--root', 'C:/Users/test'], BASE_ENV).config!;
+    let created = false;
+    const errors = validateStartupFiles(cfg, makeFsDeps({
+      existingPaths: ['C:/Users/test'],
+      mkdirSync: () => { created = true; return undefined; },
+    }), win32);
+    expect(errors.join('\n')).toContain('user home directory');
+    expect(created).toBe(false);
+  });
+
+  it('[U11] accepts a directory inside a UNC share', () => {
+    const root = '//server/share/notebooks';
+    const cfg = parseConfig(['--root', root], BASE_ENV).config!;
+    expect(validateStartupFiles(cfg, makeFsDeps({ existingPaths: [root] }), win32)).toEqual([]);
+  });
 
   it('rejects a root that does not exist or is not a directory', () => {
     const cfg = parseConfig(['--root', 'C:/missing'], BASE_ENV).config!;

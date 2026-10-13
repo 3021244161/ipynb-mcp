@@ -103,6 +103,8 @@ Precedence: CLI flags > `IPYNB_*` environment variables > defaults. Boolean flag
 
 Startup failures (bad values, root does not exist / is your home dir / artifact dir unwritable) exit with code **2**.
 
+Numeric configuration values must be safe integers (at most `9007199254740991`) within each option's range. Filesystem roots include Windows UNC share roots; choose a notebook subdirectory instead. A rejected root does not create the artifact directory.
+
 With the defaults, a single-cell run is executed synchronously (its upper bound is exactly the 10× cut-off); two or more cells, or a raised `--exec-timeout-seconds`, return a background `run_id` you poll with `notebook_run_status`. The multiplier is `DEVIATIONS.md` D-015.
 
 ## Interpreter selection

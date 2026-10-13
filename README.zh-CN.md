@@ -103,6 +103,8 @@ dsh 用户：安装配套的 `dsh-ipynb-mcp` bundle（见 [dsh-ipynb-mcp/](./dsh
 
 启动失败（参数值非法、root 不存在 / 是家目录 / artifact 目录不可写）会以退出码 **2** 结束。
 
+数值配置必须是安全整数（不超过 `9007199254740991`），并满足对应选项的范围限制。文件系统根也包括 Windows UNC 共享根目录，应选择其中的 notebook 子目录。root 校验被拒绝时不会创建 artifact 目录。
+
 默认配置下，**单格**执行是同步返回的（其预估上界恰好等于那个 10 倍阈值）；**两格及以上**、或调大了 `--exec-timeout-seconds` 时，会返回一个后台 `run_id`，用 `notebook_run_status` 轮询。这个倍数来自 `DEVIATIONS.md` D-015。
 
 ## 解释器选择

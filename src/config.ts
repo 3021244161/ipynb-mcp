@@ -217,6 +217,10 @@ function parseNumber(raw: string, optionName: string, spec: OptionSpec, errors: 
     return undefined;
   }
   const value = Number(raw.trim());
+  if (!Number.isSafeInteger(value)) {
+    errors.push(`option --${optionName} must be a safe integer, got: ${raw}`);
+    return undefined;
+  }
   if (spec.min !== undefined && value < spec.min) {
     errors.push(`option --${optionName} must be >= ${spec.min}, got: ${value}`);
     return undefined;
@@ -414,7 +418,7 @@ function absolutePath(target: string): string {
 
 function isFilesystemRoot(normalizedPath: string, platform: NodeJS.Platform): boolean {
   if (platform === 'win32') {
-    return /^[a-z]:$/.test(normalizedPath);
+    return normalizeForCompare(path.win32.parse(normalizedPath).root, platform) === normalizedPath;
   }
   // POSIX: '/' normalises to itself (not ''), so both spellings must count
   // (review C6b — `--root /` used to fence the whole filesystem).
@@ -470,6 +474,10 @@ export function validateStartupFiles(
   }
   if (isFilesystemRoot(normalizeForCompare(rootReal, platform), platform)) {
     errors.push(`--root must not be a filesystem root (${rootReal}); pass an explicit --root`);
+  }
+
+  if (errors.length > 0) {
+    return errors;
   }
 
   try {
