@@ -2,6 +2,8 @@
 
 ## 2026-10-14 — 0.1.2 发布检查
 
+发布提交 `df55ac8` 的 [GitHub CI run 38495436726](https://github.com/3021244161/ipynb-mcp/actions/runs/38495436726) **9/9 job 成功**：Windows / Ubuntu 的 Node 22、24 单测，macOS 的 Node 22 单测，以及 Windows / Ubuntu × Python 3.10、3.12 集成。CI 按现有配置执行外部 nbformat、smoke、打包门禁，并在 Ubuntu / Python 3.12 执行安装包验证；macOS 仍仅通过 unit 层验证，不运行 integration。第三方客户端手工 E1–E9 未执行。
+
 在下述 Windows / Node 26.7.0 / 既有专用 Python venv 环境，将主包更新到 0.1.2 后重新通过 typecheck、lint、663/663 单测、build、check:package（145 文件，23 个变异）及 check:release（安装 tarball 后 12/12 检查，含真实 kernel）。首轮单测误设置了集成测试专用的 `IPYNB_TEST_REQUIRE_VENV=1`，导致三个回退用例失败；移除该开关后整套通过，未修改代码或断言。本次版本更新不涉及运行时代码，96 个集成与 26 个 smoke 的证据沿用下方修复阶段记录。第三方客户端手工验收仍未执行。
 
 ## 2026-10-13 本轮本地复验

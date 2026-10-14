@@ -11,6 +11,8 @@
 
 GitHub 远端检查连续两次失败：常规 fetch 与临时 `http.proxy=` 覆盖均连接到不可用的 `127.0.0.1:10808`。读取配置确认根因为 URL 专用的 `http.https://github.com.proxy` 优先于通用项。用户确认 WiFi 可直连后，以 `http.https://github.com.proxy=` 仅覆盖本次命令，fetch 成功；未修改全局 Git 配置。npm 登录及 registry 查询正常。
 
+发布二次认证记录：npm 登录及 whoami 有效，但非交互 publish 返回 EOTP；两次交互 publish 生成的官方 web 认证链接均被用户报告跳转至主页，未完成认证。检查本机 npm CLI 确认链接由 registry 响应提供、命令同时轮询认证结果；浏览器侧跳转根因尚未确认。按用户要求停止所有等待认证的 publish 命令，交由用户在自己的交互终端手动发布同一个已验证的 tarball。
+
 ## SPEC 偏离条目
 
 | # | 日期 | SPEC 位置 | 偏离内容 | 理由 | 影响面 | 状态 |
