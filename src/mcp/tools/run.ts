@@ -48,6 +48,7 @@ export async function handleNotebookRun(
   args: Record<string, unknown>,
   hooks?: RunToolHooks,
 ): Promise<ToolOutcome> {
+  let detachClientAbort = (): void => undefined;
   return runTool(async () => {
     rejectUnknownArguments(args, RUN_ARGUMENTS);
     const inputPath = requireNonEmptyString(args, 'path');
@@ -101,20 +102,18 @@ export async function handleNotebookRun(
       const codeIndexes = notebook.cells
         .map((cell, index) => (cell.cell_type === 'code' ? index : -1))
         .filter((index) => index >= 0);
-      targetCount = parseCellSelector(cellSelector, codeIndexes).length;
+      targetCount = parseCellSelector(cellSelector, codeIndexes, notebook.cells.length).length;
     }
     // Client cancellation interrupts the in-flight cell immediately (SPEC §4.6.2).
     if (hooks?.signal !== undefined && !hooks.signal.aborted) {
-      hooks.signal.addEventListener(
-        'abort',
-        () => {
-          void ctx.registry.interrupt(absolutePath).catch((cause: unknown) => {
-            ctx.logger.warn(`client-cancel interrupt failed for ${absolutePath}: ${String(cause)}`);
-          });
-        },
-        // The listener must not outlive the run it belongs to (review W8).
-        { once: true },
-      );
+      const signal = hooks.signal;
+      const interrupt = (): void => {
+        void ctx.registry.interrupt(absolutePath).catch((cause: unknown) => {
+          ctx.logger.warn(`client-cancel interrupt failed for ${absolutePath}: ${String(cause)}`);
+        });
+      };
+      signal.addEventListener('abort', interrupt, { once: true });
+      detachClientAbort = () => signal.removeEventListener('abort', interrupt);
     }
 
     // D14's literal rule compares the timeout UPPER BOUND against the
@@ -161,7 +160,7 @@ export async function handleNotebookRun(
             : undefined,
         },
       );
-      return { payload: completedPayload(outcome), imageBlocks: outcome.image_blocks };
+      return { payload: completedPayload(outcome), imageBlocks: outcome.image_blocks, imageArtifacts: outcome.image_artifacts };
     }
 
     // ---- background path ----
@@ -185,7 +184,7 @@ export async function handleNotebookRun(
       poll_after_ms: 2000,
     };
     return { payload: payload as unknown as JsonValue };
-  });
+  }).finally(() => detachClientAbort());
 }
 
 async function executeBackgroundRun(
@@ -242,6 +241,7 @@ async function executeBackgroundRun(
     handle.writeBack = { performed: outcome.write_back.performed, backupPath: outcome.write_back.backup_path };
     handle.warnings = outcome.warnings;
     handle.imageBlocks = outcome.image_blocks;
+    handle.imageArtifacts = outcome.image_artifacts;
     // `settle`, not a direct assignment: a cancel may already have landed this
     // run in `cancelled`, and overwriting that would flip a terminal state the
     // client was already told about (review v5 NEW5-REPRO). The facts gathered

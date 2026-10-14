@@ -111,6 +111,8 @@ UTF-8 编码损坏的 notebook 会返回 `parse_failed`，读取时不会静默�
 
 CAS 不匹配的详情包含 `actual_truncated` 和 `current_source_truncated`。长文本和邻接锚限制为 4000 字符加截断标记；`current_source_hash` 保持完整，可用哈希锚重试。
 
+cell 选择器的端点必须是 notebook 范围内的安全整数，校验通过后才会展开区间。`mode='full'` 忽略选择器。取消无需 progress 通知，已结束请求不会残留中断监听器。
+
 默认配置下，**单格**执行是同步返回的（其预估上界恰好等于那个 10 倍阈值）；**两格及以上**、或调大了 `--exec-timeout-seconds` 时，会返回一个后台 `run_id`，用 `notebook_run_status` 轮询。这个倍数来自 `DEVIATIONS.md` D-015。
 
 ## 解释器选择
@@ -130,7 +132,7 @@ CAS 不匹配的详情包含 `actual_truncated` 和 `current_source_truncated`�
 - **执行就是任意代码执行。** 把 root 指向你愿意让 agent 写入的目录；围栏是路径边界，不是沙箱。只运行你愿意执行的 notebook。
 - **stale 分析只支持 Python。** 非 Python kernel（R、Julia 等）可以读/改/跑，但会跳过 stale 分析（`method: "skipped"`）。它也看不穿 `globals()`/`locals()`/`exec`/`eval`/`setattr`、属性赋值（`obj.attr = 1`）和 `import *`。当某个 cell 解析失败时，整轮分析会退化为保守的正则兜底（所有置信度降为 `low`；正则兜底还漏掉元组解包、带注解的赋值、缩进赋值与 `with … as`，并可能把字符串/注释里的标识符误判为使用）。
 - **不支持交互式 widget**（`application/vnd.jupyter.widget-view+json` 降级为 `unsupported`）。
-- **单个响应有体积预算（默认 8 MiB），因为客户端超过 10 MiB 就会死。** 工具结果以单行 JSON-RPC 传输，而 MCP SDK 的读取器遇到超过 10 MiB 的行会直接关闭连接——你会看到 `-32000 Connection closed`，此后该会话里的每一次调用都回 `Not connected`：**丢的是会话，不是这一条响应**。所以服务会提前降级：最大的文本值被截短并标注，必要时整段输出被丢弃，图片在放不下时被扣住。每一次移除都带 `output_truncated` 警告，被扣住的图片字节仍可通过载荷里已有的 `artifact_path` 取回。**这个预算被刻意放在悬崖之下，因此 8–10 MiB 之间的响应是被截短后发出的**——本来能被你客户端接受的内容，会以"截短并标注"的形式到达。如果你的客户端缓冲区确实更大，可以调高 `--max-response-bytes`（或 `IPYNB_MAX_RESPONSE_BYTES`）；对超大 notebook，优先用 `include_outputs: 'summary'` 或 `cell_indexes`（`DEVIATIONS.md` D-065、D-067）。
+- **单个响应有体积预算（默认 8 MiB），因为客户端超过 10 MiB 就会死。** 工具结果以单行 JSON-RPC 传输，而 MCP SDK 的读取器遇到超过 10 MiB 的行会直接关闭连接——你会看到 `-32000 Connection closed`，此后该会话里的每一次调用都回 `Not connected`：**丢的是会话，不是这一条响应**。所以服务会提前降级：最大的文本值被截短并标注，必要时整段输出被丢弃，图片在放不下时被扣住。预算导致的移除会带 `output_truncated` 警告。未返回的图片其 `artifact_path` 和 `image_index` 均为 null，也不会写入磁盘；可按 cell 分批读取，或在客户端允许时调高响应预算。**这个预算被刻意放在悬崖之下，因此 8–10 MiB 之间的响应是被截短后发出的**——本来能被你客户端接受的内容，会以"截短并标注"的形式到达。如果你的客户端缓冲区确实更大，可以调高 `--max-response-bytes`（或 `IPYNB_MAX_RESPONSE_BYTES`）；对超大 notebook，优先用 `include_outputs: 'summary'` 或 `cell_indexes`（`DEVIATIONS.md` D-065、D-067）。
 - **内存占用与 notebook 体积成正比，而一个 notebook 可以比默认堆还大。** 读取与执行都会把文档整个持在内存里；一个真实的 37.5 MiB notebook（xgboost 调参那种，输出里塞满 SHAP 图与 dataframe）在一次完整 `notebook_run` 里峰值约 **0.9 GiB**。这在 Node 默认堆里是舒服的，而这个数字本身是"去掉一处 16 倍解析缺陷"之后的结果——更早的版本对同一个文件需要 **2.2 GiB**，并会以 `FATAL ERROR: Ineffective mark-compacts near heap limit` 崩掉，客户端只看到 `-32000 Connection closed`，而且那台 server 名下**所有** kernel 一起死（`DEVIATIONS.md` D-059）。如果你有远大于此的 notebook，给这个服务的环境块里加 `NODE_OPTIONS=--max-old-space-size=4096`；成本随文件线性增长，所以 100 MiB 的 notebook 需要几个 GiB。
 - **图片密集的单格执行仍受传输层约束。** sidecar 每个响应只发一行 NDJSON，而行上限为 64 MiB；由于 `exec_cell` 响应要承载所有输出的 base64，单格产出超过约 64 MiB base64 图片数据（例如好几张接近 `max_image_bytes` 的图）时会以协议错误失败，而不是把图片返回给你。可以调低 `max_image_bytes`、拆格，或用 `notebook_read` 把图片单独读回来。记为 `DEVIATIONS.md` D-017。**一次协议错误会把整个 sidecar 拆掉，于是它承载的每一个 kernel（该解释器下所有 notebook 的）跟着一起死**：下一次 `notebook_run` 会通过 `replay` 静默重建，但已经在内存里跑完的长训练格不会重跑。
 - **在"没有 cell 正在执行"时死掉的 kernel，要到下一次请求才会被发现。** sidecar 只在执行 cell 期间轮询 kernel 进程；格与格之间，它只会在下一次调用到达时才知道外部杀进程（OOM killer、`taskkill`）。`notebook_run` 在复用会话前会探测 kernel 存活，所以这种情况会变成静默 `replay`/重建而不是报错——但那一刻 kernel 的内存状态已经没了。

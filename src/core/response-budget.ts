@@ -150,14 +150,20 @@ export function escapedByteLength(value: string): number {
     } else if (code < 0x800) {
       bytes += 2;
     } else if (code >= 0xd800 && code <= 0xdbff) {
-      bytes += 3;
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        index += 1;
+      } else {
+        bytes += 7;
+      }
     } else if (code >= 0xdc00 && code <= 0xdfff) {
-      bytes += 1;
+      bytes += 7;
     } else {
       bytes += 3;
     }
   }
-  return bytes + 2; // the surrounding quotes
+  return bytes + 4; // quotes are themselves escaped inside the MCP text block
 }
 
 /**
@@ -456,6 +462,7 @@ export function enforceResponseBudget(payload: JsonValue, maxBytes: number): Res
           continue;
         }
         container[key] = [sliced];
+        shortenedScalars.push(key);
         size += slicedBytes - bytes;
       }
     } else {
@@ -578,26 +585,31 @@ export function enforceResponseBudget(payload: JsonValue, maxBytes: number): Res
  * `cell_indexes` and the `include_*` switches are the real remedy, so they are named.
  */
 function refusalPayload(original: JsonValue, maxBytes: number, size: number): JsonValue {
-  const identity: Record<string, JsonValue> = {};
+  const refusal: Record<string, JsonValue> = {
+    response_budget_exceeded: true,
+    warnings: [warning(
+      `this response is about ${describeBudget(size)} and could not be reduced below the ${describeBudget(maxBytes)} budget. Nothing was sent, so no value is half-delivered: read the notebook in parts with \`cell_indexes\`, use \`include_source='none'\` or \`include_outputs='summary'\` for an overview, or raise \`--max-response-bytes\` if your client's limit allows`,
+    )],
+  };
+  if (estimatedJsonBytes(refusal) > maxBytes) {
+    refusal['warnings'] = [warning('Response budget exceeded; request fewer cells or outputs.')];
+  }
   if (typeof original === 'object' && original !== null && !Array.isArray(original)) {
-    for (const [key, value] of Object.entries(original as Record<string, JsonValue>)) {
+    const record = original as Record<string, JsonValue>;
+    // A per-value limit does not bound thousands of scalars or long field names.
+    // Refusals only need the tool identity and terminal classification to retry.
+    for (const key of ['code', 'message', 'path', 'run_id', 'kernel_id', 'kind', 'state', 'status', 'cell_count', 'content_hash']) {
+      const value = record[key];
       // Only scalars, and only small ones: the point is a payload that certainly fits.
-      if (typeof value === 'string' && value.length <= 300) {
-        identity[key] = value;
-      } else if (typeof value === 'number' || typeof value === 'boolean') {
-        identity[key] = value;
+      if (
+        ((typeof value === 'string' && value.length <= 300) || typeof value === 'number' || typeof value === 'boolean') &&
+        estimatedJsonBytes({ ...refusal, [key]: value }) <= maxBytes
+      ) {
+        refusal[key] = value;
       }
     }
   }
-  return {
-    ...identity,
-    response_budget_exceeded: true,
-    warnings: [
-      warning(
-        `this response is about ${describeBudget(size)} and could not be reduced below the ${describeBudget(maxBytes)} budget. Nothing was sent, so no value is half-delivered: read the notebook in parts with \`cell_indexes\`, use \`include_source='none'\` or \`include_outputs='summary'\` for an overview, or raise \`--max-response-bytes\` if your client's limit allows`,
-      ),
-    ],
-  };
+  return refusal;
 }
 
 function warning(message: string): JsonValue {

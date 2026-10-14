@@ -47,7 +47,7 @@
 | **我修复时新引入的错误** | ✅ | 调和按"本次调用切过 `source`"给**每格**置 `true`，于是 4 字符的 cell 被报成"已截断"而它的值完整。改为按**每格自己的值**判定；新增的 per-cell 用例专测这一格 |
 | **V16-2①** 夹具形状矩阵 | ✅ | v15 已建（7 格）并在 `AGENTS.md §9` 成规则；本轮补 2 格（被截断的 `stream` 项、被截断的摘要） |
 | **V16-2②** `check-indent` 扩到 `.mjs` | ✅（v15 已完成，本轮复核） | **评审的这条不成立**：v15 已扩。本轮实测复核——往临时目录放一个缩进错的 `.mjs`，`check-indent` 报 `line 3 is indented 6, expected 4` 并以 1 退出 |
-| **V16-2③** F6/F7 复核 | ✅ | F7（`structuredClone`）注释与实现一致（v14 已订正）；F6 仍按 **D-066** 登记（修法要把预算前移到 `applyImagePolicy`，独立改动） |
+| **V16-2③** F6/F7 复核 | ✅ | F7（`structuredClone`）注释与实现一致；F6 于 2026-10-13 由 `finalizeToolResult` 与 `materializeImageArtifact` 延迟物化修复，见 D-066 与 U26 回归 |
 
 ### 16.2 我自己发现并修掉的（本轮"自我严格 review"的产出）
 

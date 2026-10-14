@@ -4,6 +4,7 @@
 // the image policy allows blocks to be returned.
 
 import { createWarning, type JsonValue, type Warning } from '../../core/errors.js';
+import { TRUNCATION_MARKER } from '../../core/response-budget.js';
 import { mapRawOutputs, rawOutputsOfCell, collectOutputWarnings, type OutputItem } from '../../core/outputs.js';
 import {
   cellSource,
@@ -12,13 +13,14 @@ import {
   readNotebookMetadata,
   type NotebookFile,
 } from '../../core/parse.js';
-import { applyImagePolicy, shouldReturnImages, type ImagesPolicy } from '../../fs/artifact.js';
+import { applyImagePolicy, shouldReturnImages, type ImageArtifactPlan, type ImagesPolicy } from '../../fs/artifact.js';
 
 const SUMMARY_PREVIEW_CHARS = 160;
 
 export interface RenderReadResult {
   readonly payload: Record<string, unknown>;
   readonly imageBlocks: ReadonlyArray<{ data: string; media_type: 'image/png' | 'image/jpeg' }>;
+  readonly artifactPlans: readonly ImageArtifactPlan[];
 }
 
 export interface RenderReadInput {
@@ -41,6 +43,7 @@ export interface RenderReadInput {
 export async function renderReadResult(input: RenderReadInput): Promise<RenderReadResult> {
   const warnings: Warning[] = [];
   const imageBlocks: Array<{ data: string; media_type: 'image/png' | 'image/jpeg' }> = [];
+  const artifactPlans: ImageArtifactPlan[] = [];
 
   const doc = input.notebook.doc;
   const { kernelName, languageName, languageVersion } = readNotebookMetadata(doc);
@@ -114,7 +117,7 @@ export async function renderReadResult(input: RenderReadInput): Promise<RenderRe
       const policyResult = await applyImagePolicy(
         mapped.items,
         mapped.extractedImages,
-        { returnImages, maxImages: input.maxImagesPerCall, indexStart: imageCursor },
+        { returnImages, maxImages: input.maxImagesPerCall, indexStart: imageCursor, deferWrites: true },
         {
           artifactRoot: input.artifactDir,
           notebookAbsPath: input.path,
@@ -133,6 +136,7 @@ export async function renderReadResult(input: RenderReadInput): Promise<RenderRe
         warnings.push(warning);
       }
       imageCursor += policyResult.materialized.length;
+      artifactPlans.push(...policyResult.artifactPlans);
       if (returnImages) {
         for (const materialized of policyResult.materialized) {
           const image = mapped.items[materialized.outputIndex];
@@ -199,7 +203,7 @@ export async function renderReadResult(input: RenderReadInput): Promise<RenderRe
     cells: cellsPayload,
     warnings,
   };
-  return { payload, imageBlocks };
+  return { payload, imageBlocks, artifactPlans };
 }
 
 /**
@@ -234,11 +238,15 @@ export function reconcileTruncationFlags(payload: JsonValue, truncatedFields: re
     return payload;
   }
   const record = payload as Record<string, JsonValue>;
-  const cells = record['cells'];
-  if (!Array.isArray(cells)) {
-    return payload;
+  const detail = record['detail'];
+  if (typeof detail === 'object' && detail !== null && !Array.isArray(detail)) {
+    reconcileTruncationFlags(detail, truncatedFields);
   }
-  const cutMarker = 'truncated to fit the response budget]';
+  const cells = [
+    ...(Array.isArray(record['cells']) ? record['cells'] : []),
+    ...(Array.isArray(record['executed']) ? record['executed'] : []),
+  ];
+  const cutMarker = TRUNCATION_MARKER;
   const endsCut = (value: unknown): boolean => typeof value === 'string' && value.endsWith(cutMarker);
   for (const entry of cells) {
     if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
@@ -260,6 +268,7 @@ export function reconcileTruncationFlags(payload: JsonValue, truncatedFields: re
         const stream = item as Record<string, JsonValue>;
         if (stream['kind'] === 'stream' && endsCut(stream['text'])) {
           stream['truncated'] = true;
+          stream['truncated_at_chars'] = String(stream['text']).length - cutMarker.length;
         }
       }
     }
@@ -328,8 +337,8 @@ function summarizeOutputs(items: readonly OutputItem[]): OutputSummary[] {
           width: item.width,
           height: item.height,
           bytes: item.bytes,
-          artifact_path: null,
-          image_index: null,
+          artifact_path: item.artifact_path,
+          image_index: item.image_index,
         };
       case 'error':
         return { kind: 'error', error_name: item.error_name, preview: truncatePreview(item.error_value) };

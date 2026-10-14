@@ -2,6 +2,7 @@
 // retention of at most 20 finished runs or 10 minutes (whichever first).
 
 import type { Warning } from '../core/errors.js';
+import type { ImageArtifactPlan } from '../fs/artifact.js';
 import type { ExecutedCell, RunImageBlock, RunOutcome } from '../run.js';
 
 export type RunState = 'running' | 'completed' | 'failed' | 'cancelled';
@@ -20,6 +21,7 @@ export interface RunHandle {
   error: { code: string; message: string } | null;
   warnings: Warning[];
   imageBlocks: RunImageBlock[];
+  imageArtifacts: readonly ImageArtifactPlan[];
   /**
    * Are the facts (`executed`, `warnings`, `write_back`) still being gathered?
    *
@@ -74,6 +76,7 @@ export class RunStore {
       error: null,
       warnings: [],
       imageBlocks: [],
+      imageArtifacts: [],
       factsPending: false,
       createdAt: this.#now(),
       finishedAt: null,

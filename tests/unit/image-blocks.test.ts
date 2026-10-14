@@ -12,7 +12,7 @@
 // authority that produced the `-32602`. Nothing here inspects `OutputItem` to
 // decide whether an image is returnable.
 
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -24,7 +24,7 @@ import type { JsonValue } from '../../src/core/errors.js';
 import { parseNotebook } from '../../src/core/parse.js';
 import { hasher } from '../../src/hash.js';
 import { renderReadResult } from '../../src/mcp/render/read.js';
-import { toCallToolResult } from '../../src/mcp/tools/result.js';
+import { finalizeToolResult, toCallToolResult } from '../../src/mcp/tools/result.js';
 
 let artifactRoot: string;
 
@@ -102,15 +102,15 @@ function notebookWithBrokenImagePerCell(cellCount: number): string {
   });
 }
 
-async function readFull(json: string): Promise<Rendered> {
+async function readFull(json: string, maxResponseBytes?: number, includeOutputs: 'full' | 'summary' = 'full', imagesPolicy: 'auto' | 'always' = 'auto'): Promise<Rendered> {
   const notebook = parseNotebook(new TextEncoder().encode(json), hasher);
   const rendered = await renderReadResult({
     notebook,
     path: path.join(path.dirname(artifactRoot), 'nb.ipynb'),
     includeSource: 'preview',
-    includeOutputs: 'full',
+    includeOutputs,
     previewLines: 12,
-    imagesPolicy: 'auto',
+    imagesPolicy,
     maxImagesPerCall: 20,
     maxImageBytes: 20 * 1024 * 1024,
     inlineTextChars: 20000,
@@ -119,12 +119,75 @@ async function readFull(json: string): Promise<Rendered> {
     realpath: (target) => target,
     hasher,
   });
-  const result = toCallToolResult({
+  const result = await finalizeToolResult({
     payload: rendered.payload as JsonValue,
     imageBlocks: rendered.imageBlocks,
-  });
+    imageArtifacts: rendered.artifactPlans,
+  }, { maxResponseBytes });
   return { content: result.content, payload: rendered.payload };
 }
+
+describe('[U26] an image withheld by the response budget is not materialized', () => {
+  it('[U26] summary with images=always points to the returned image and its artifact', async () => {
+    const result = await readFull(notebookWithImageValue(PNG_B64), undefined, 'summary', 'always');
+    expect(imageBlocksOf(result.content)).toHaveLength(1);
+    const block = result.content[0]!;
+    if (block.type !== 'text') {
+      throw new Error('missing text result');
+    }
+    const body = JSON.parse(block.text) as { cells: Array<{ outputs_summary: Array<{ image_index: number; artifact_path: string }> }> };
+    const item = body.cells[0]!.outputs_summary[0]!;
+    expect(item.image_index).toBe(0);
+    expect(await readFile(item.artifact_path)).toEqual(Buffer.from(PNG));
+  });
+
+  it('[U26] leaves no new artifacts or dangling image references', async () => {
+    const before = await readdir(artifactRoot, { recursive: true }).catch(() => []);
+    const bytes = new Uint8Array(100_000);
+    bytes.set(pngBytes(97));
+    const result = await readFull(notebookWithImageValue(encodeBase64(bytes)), 70 * 1024);
+    expect(imageBlocksOf(result.content)).toHaveLength(0);
+    expect(await readdir(artifactRoot, { recursive: true }).catch(() => [])).toEqual(before);
+    const text = result.content[0]!;
+    if (text.type !== 'text') {
+      throw new Error('missing text result');
+    }
+    const body = JSON.parse(text.text) as { cells: Array<{ outputs: Array<Record<string, unknown>> }> };
+    expect(body.cells[0]!.outputs[0]).toMatchObject({ artifact_path: null, image_index: null });
+    expect(JSON.stringify(body)).toContain('output_truncated');
+    expect(JSON.stringify(body)).not.toContain('image_materialize_failed');
+  });
+
+  it('[U26] a failed artifact write removes its block and renumbers the surviving image without changing the stored snapshot', async () => {
+    const json = JSON.parse(notebookWithImageValue(encodeBase64(pngBytes(85)))) as { cells: Array<{ outputs: unknown[] }> };
+    json.cells[0]!.outputs.push({ output_type: 'display_data', metadata: {}, data: { 'image/png': encodeBase64(pngBytes(86)) } });
+    const rendered = await renderReadResult({
+      notebook: parseNotebook(Buffer.from(JSON.stringify(json)), hasher),
+      path: path.join(path.dirname(artifactRoot), 'failure.ipynb'),
+      includeSource: 'preview', includeOutputs: 'full', previewLines: 12, imagesPolicy: 'auto',
+      maxImagesPerCall: 20, maxImageBytes: 20971520, inlineTextChars: 20000,
+      artifactDir: artifactRoot, platform: process.platform, realpath: (target) => target, hasher,
+    });
+    const first = rendered.artifactPlans[0]!;
+    await mkdir(first.artifactPath, { recursive: true });
+    const outcome = { payload: rendered.payload as JsonValue, imageBlocks: rendered.imageBlocks, imageArtifacts: rendered.artifactPlans };
+    const result = await finalizeToolResult(outcome);
+    expect(imageBlocksOf(result.content).map((block) => block.data)).toEqual([encodeBase64(pngBytes(86))]);
+    const text = result.content[0]!;
+    if (text.type !== 'text') {
+      throw new Error('missing text result');
+    }
+    const body = JSON.parse(text.text) as { cells: Array<{ outputs: Array<Record<string, unknown>> }>; warnings: Array<{ code: string }> };
+    expect(body.cells[0]!.outputs[0]).toMatchObject({ image_index: null, artifact_path: null });
+    expect(body.cells[0]!.outputs[1]?.['image_index']).toBe(0);
+    expect(await readFile(String(body.cells[0]!.outputs[1]?.['artifact_path']))).toEqual(Buffer.from(pngBytes(86)));
+    expect(body.warnings.filter((warning) => warning.code === 'image_materialize_failed')).toHaveLength(1);
+    const snapshot = rendered.payload['cells'] as Array<{ outputs: Array<{ image_index: number }> }>;
+    expect(snapshot[0]!.outputs.map((item) => item.image_index)).toEqual([0, 1]);
+    await rm(first.artifactPath, { recursive: true });
+    expect(imageBlocksOf((await finalizeToolResult(outcome)).content)).toHaveLength(2);
+  });
+});
 
 function imageBlocksOf(content: Rendered['content']): Array<{ data: string; mimeType: string }> {
   const blocks: Array<{ data: string; mimeType: string }> = [];

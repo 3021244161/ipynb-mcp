@@ -52,7 +52,7 @@ export async function handleRunStatus(
       error: handle.error,
       warnings: handle.warnings,
     };
-    return { payload: payload as JsonValue, imageBlocks: handle.imageBlocks };
+    return { payload: payload as JsonValue, imageBlocks: handle.imageBlocks, imageArtifacts: handle.imageArtifacts };
   });
 }
 

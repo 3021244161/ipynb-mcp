@@ -17,6 +17,24 @@ function expectInvalid(selector: string): IpynbError {
 }
 
 describe('[U13][A10] cell_selector grammar (SPEC §4.7)', () => {
+  it('[U13] rejects an index that would be rounded to a different cell', () => {
+    expectInvalid('9007199254740993');
+  });
+
+  it('[U13] rejects ranges outside the notebook before expanding them', () => {
+    expect(() => parseCellSelector('0-10000', [0, 1, 2])).toThrowError(
+      expect.objectContaining({ code: 'range_out_of_bounds' }),
+    );
+  });
+
+  it('[U13] rejects unsafe range endpoints without entering a non-progressing loop', () => {
+    expectInvalid('9007199254740992-9007199254740992');
+  });
+
+  it('[U13] preserves trailing non-code indexes for the caller to validate', () => {
+    expect(parseCellSelector('1', [0], 2)).toEqual([1]);
+  });
+
   it('rejects a descending range with invalid_targets', () => {
     expectInvalid('5-3');
   });

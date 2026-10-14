@@ -11,7 +11,7 @@ import { z } from 'zod';
 
 import { IpynbError } from './core/errors.js';
 import type { ToolContext } from './mcp/context.js';
-import { runTool, toCallToolResult, type ToolOutcome } from './mcp/tools/result.js';
+import { runTool, finalizeToolResult, type ToolOutcome } from './mcp/tools/result.js';
 import { handleNotebookRead, notebookReadDescription } from './mcp/tools/read.js';
 import { handleNotebookEdit, notebookEditDescription } from './mcp/tools/edit.js';
 import { handleNotebookRun, notebookRunDescription, type RunToolHooks } from './mcp/tools/run.js';
@@ -79,14 +79,14 @@ export function createServer(ctx: ToolContext): McpServer {
       // The response budget is applied at the ONE exit every tool shares, so no tool can forget it. It
       // is the server's promise about what the transport can carry, not a per-tool policy, which is why
       // it lives here rather than in each handler (review v13 V13-1).
-      return toCallToolResult(outcome, { maxResponseBytes: ctx.config.maxResponseBytes });
+      return finalizeToolResult(outcome, { maxResponseBytes: ctx.config.maxResponseBytes, logger: ctx.logger, signal: extra.signal });
     };
   };
 
   const progressHooks = (extra: Extra): RunToolHooks => {
     const token = extra._meta?.progressToken;
     if (token === undefined || token === null) {
-      return {};
+      return { signal: extra.signal };
     }
     return {
       onProgress: (event) => {

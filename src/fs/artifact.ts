@@ -26,6 +26,14 @@ export interface ImagePolicyDecision {
    * cell — read/run loop over cells and must pass a running cursor).
    */
   readonly indexStart?: number;
+  /** The MCP result boundary decides which blocks fit before any artifact is written. */
+  readonly deferWrites?: boolean;
+}
+
+export interface ImageArtifactPlan {
+  readonly imageIndex: number;
+  readonly artifactPath: string;
+  readonly base64: string;
 }
 
 export interface MaterializeContext {
@@ -49,6 +57,7 @@ export interface ApplyPolicyResult {
    */
   readonly materialized: ReadonlyArray<{ outputIndex: number; artifactPath: string; base64: string }>;
   readonly warnings: Warning[];
+  readonly artifactPlans: readonly ImageArtifactPlan[];
 }
 
 /**
@@ -80,6 +89,7 @@ export async function applyImagePolicy(
 ): Promise<ApplyPolicyResult> {
   const warnings: Warning[] = [];
   const materialized: Array<{ outputIndex: number; artifactPath: string; base64: string }> = [];
+  const artifactPlans: ImageArtifactPlan[] = [];
 
   if (!decision.returnImages || decision.maxImages <= 0) {
     if (decision.returnImages && decision.maxImages <= 0 && extractedImages.length > 0) {
@@ -88,7 +98,7 @@ export async function applyImagePolicy(
         `image count exceeds max_images_per_call (0); no images returned`,
       ));
     }
-    return { items, materialized, warnings };
+    return { items, materialized, warnings, artifactPlans };
   }
 
   const dirKey = createHash('sha1')
@@ -133,34 +143,13 @@ export async function applyImagePolicy(
     const artifactPath = path
       .join(context.artifactRoot, dirKey, fileName)
       .replace(/\\/g, '/');
-    try {
-      await mkdir(path.dirname(artifactPath), { recursive: true });
-      // Idempotent materialization: same content + same indexes -> same file,
-      // never overwritten (SPEC §5.9).
-      await writeFile(artifactPath, image.bytes, { flag: 'wx' });
-    } catch (cause) {
-      const code = (cause as NodeJS.ErrnoException).code;
-      if (code !== 'EEXIST') {
-        warnings.push(createWarning(
-          'image_materialize_failed',
-          `failed to write artifact ${artifactPath}: ${String(cause)}`,
-        ));
-        continue;
-      }
-      // EEXIST: expected to be identical content, but a process death
-      // mid-write leaves a truncated file that must never be served as the
-      // artifact — verify the length and rewrite when it mismatches
-      // (review A26).
-      try {
-        const existing = await stat(artifactPath);
-        if (existing.size !== image.bytes.byteLength) {
-          await writeFile(artifactPath, image.bytes);
-        }
-      } catch (statCause) {
-        warnings.push(createWarning(
-          'image_materialize_failed',
-          `failed to verify existing artifact ${artifactPath}: ${String(statCause)}`,
-        ));
+    const plan = { imageIndex, artifactPath, base64 };
+    if (decision.deferWrites) {
+      artifactPlans.push(plan);
+    } else {
+      const failure = await materializeImageArtifact(plan);
+      if (failure !== null) {
+        warnings.push(failure);
         continue;
       }
     }
@@ -173,7 +162,28 @@ export async function applyImagePolicy(
     imageIndex += 1;
   }
 
-  return { items, materialized, warnings };
+  return { items, materialized, warnings, artifactPlans };
+}
+
+export async function materializeImageArtifact(plan: ImageArtifactPlan): Promise<Warning | null> {
+  const bytes = Buffer.from(plan.base64, 'base64');
+  try {
+    await mkdir(path.dirname(plan.artifactPath), { recursive: true });
+    await writeFile(plan.artifactPath, bytes, { flag: 'wx' });
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code !== 'EEXIST') {
+      return createWarning('image_materialize_failed', `failed to write artifact ${plan.artifactPath}: ${String(cause)}`);
+    }
+    try {
+      const existing = await stat(plan.artifactPath);
+      if (existing.size !== bytes.byteLength) {
+        await writeFile(plan.artifactPath, bytes);
+      }
+    } catch (statCause) {
+      return createWarning('image_materialize_failed', `failed to verify existing artifact ${plan.artifactPath}: ${String(statCause)}`);
+    }
+  }
+  return null;
 }
 
 /**

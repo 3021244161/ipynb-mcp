@@ -11,7 +11,7 @@
 // a large-output notebook must come back as a response that fits, marked as truncated, on a connection
 // that is still alive afterwards.
 
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -39,7 +39,7 @@ beforeAll(async () => {
     // RESPONSE BUDGET rather than the per-output limit. With the default (20 000) most fixtures are cut before
     // the budget ever sees them, which is why one case in this file originally proved nothing: it asserted that
     // the budget had cut stream items while `truncated` was being set by `inline_text_chars` instead.
-    args: [path.join(REPO_ROOT, 'lib', 'bin.js'), '--root', workspace, '--inline-text-chars', '4000000'],
+    args: [path.join(REPO_ROOT, 'lib', 'bin.js'), '--root', workspace, '--inline-text-chars', '4000000', '--artifact-dir', path.join(workspace, 'artifacts')],
     env: { ...process.env, IPYNB_PYTHON: resolvedTestInterpreter() ?? BASE_PYTHON } as Record<string, string>,
     stderr: 'pipe',
   });
@@ -122,6 +122,13 @@ async function callRead(target: string, includeOutputs: string) {
 }
 
 describe('[V13-1] a response that would exceed the client frame limit is degraded, not sent', () => {
+  it.each(['\ud800', '\udfff'])('[U24] unpaired Unicode %j is bounded and the real SDK connection survives', async (unit) => {
+    const target = await writeLargeNotebook('surrogate.ipynb', 0, unit.repeat(2 * 1024 * 1024));
+    const { body } = await callRead(target, 'full');
+    expect(JSON.stringify(body['warnings'] ?? [])).toContain('output_truncated');
+    expect((await callRead(target, 'summary')).body['cell_count']).toBe(1);
+  }, 180_000);
+
   it('[V13-1] an 11 MiB output comes back inside the budget, marked truncated, and the link survives', async () => {
     const target = await writeLargeNotebook('huge.ipynb', HUGE_CHARS);
 
@@ -432,6 +439,7 @@ describe('[V15-1] a source-heavy response is bounded', () => {
  */
 describe('[V15-3] the fixture-shape matrix: a large image output', () => {
   it('[V15-3] an output holding a multi-megabyte image stays deliverable', async () => {
+    const artifactsBefore = await readdir(path.join(workspace, 'artifacts'), { recursive: true }).catch(() => []);
     const target = path.join(workspace, 'bigimage.ipynb');
     // A real PNG header so the bytes are decodable and the image path is exercised rather than rejected as a
     // bad payload: 1x1 PNG header + a large `tEXt`-style tail makes a valid-enough file for the pipeline.
@@ -472,8 +480,12 @@ describe('[V15-3] the fixture-shape matrix: a large image output', () => {
     // The frame — text plus every image block the SDK will serialize — must stay inside the client's limit.
     expect(bytes, `text frame was ${(bytes / 1024 / 1024).toFixed(2)} MiB`).toBeLessThan(10 * 1024 * 1024);
     expect(blockCount).toBeGreaterThanOrEqual(1);
+    expect(blockCount).toBe(1);
+    const cells = body['cells'] as Array<{ outputs: Array<Record<string, unknown>> }>;
+    expect(cells[0]!.outputs[0]).toMatchObject({ image_index: null, artifact_path: null });
+    expect(await readdir(path.join(workspace, 'artifacts'), { recursive: true }).catch(() => [])).toEqual(artifactsBefore);
     // Whatever happened to the image, the payload must be coherent and the session must survive. A withheld
-    // image is the documented degradation (its `artifact_path` stays authoritative); a killed session is not.
+    // image has null references and writes no artifact; a killed session is not a degradation.
     expect(body['path']).toBeDefined();
     const after = await callRead(target, 'none');
     expect(after.body['path']).toBeDefined();

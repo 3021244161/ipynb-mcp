@@ -72,7 +72,7 @@ export async function handleNotebookRead(
       realpath: ctx.realpath,
       hasher: ctx.hasher,
     });
-    return { payload: rendered.payload as import('../../core/errors.js').JsonValue, imageBlocks: rendered.imageBlocks };
+    return { payload: rendered.payload as import('../../core/errors.js').JsonValue, imageBlocks: rendered.imageBlocks, imageArtifacts: rendered.artifactPlans };
   });
 }
 

@@ -24,7 +24,7 @@ import {
 import { cellSource, readNotebookMetadata, type Hasher, type NotebookDoc, type NotebookFile } from './core/parse.js';
 import { analyzeStale, downgradeConfidence, regexDefs, regexUses, type StaleCell } from './core/stale.js';
 import type { IpynbConfig } from './config.js';
-import { applyImagePolicy, shouldReturnImages, type ImagesPolicy } from './fs/artifact.js';
+import { applyImagePolicy, shouldReturnImages, type ImageArtifactPlan, type ImagesPolicy } from './fs/artifact.js';
 import { readNotebookFile, writeNotebookFile } from './fs/notebook-file.js';
 import type { KernelRegistry } from './kernel/registry.js';
 import { resolveForNotebook } from './kernel/interpreter.js';
@@ -120,6 +120,7 @@ export interface RunOutcome {
   };
   readonly warnings: Warning[];
   readonly image_blocks: RunImageBlock[];
+  readonly image_artifacts: readonly ImageArtifactPlan[];
   readonly content_hash_after: string | null;
 }
 
@@ -143,6 +144,7 @@ export interface RunDeps {
 export function parseCellSelector(
   selector: string,
   codeCellIndexes: readonly number[],
+  cellCount = codeCellIndexes.reduce((count, index) => Math.max(count, index + 1), 0),
 ): number[] {
   const trimmed = selector.trim();
   if (trimmed === 'all' || trimmed === '') {
@@ -182,7 +184,7 @@ export function parseCellSelector(
       }
       const start = Number(rawStart);
       const end = Number(rawEnd);
-      if (!Number.isInteger(start) || !Number.isInteger(end)) {
+      if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)) {
         throw new IpynbError('invalid_targets', `invalid range in cell_selector: ${piece}`, {
           cell_selector: selector,
         });
@@ -192,21 +194,31 @@ export function parseCellSelector(
           cell_selector: selector,
         });
       }
+      assertSelectorIndex(end, cellCount, selector);
       for (let i = start; i <= end; i += 1) {
         selected.add(i);
       }
     } else {
       const value = Number(piece);
-      if (!Number.isInteger(value)) {
+      if (!Number.isSafeInteger(value)) {
         throw new IpynbError('invalid_targets', `invalid index in cell_selector: ${piece}`, {
           cell_selector: selector,
         });
       }
+      assertSelectorIndex(value, cellCount, selector);
       selected.add(value);
     }
   }
   const sorted = [...selected].sort((a, b) => a - b);
   return sorted;
+}
+
+function assertSelectorIndex(index: number, cellCount: number, selector: string): void {
+  if (index >= cellCount) {
+    throw new IpynbError('range_out_of_bounds', `cell_selector index ${index} is beyond the last cell (${cellCount - 1})`, {
+      cell_selector: selector, cell_index: index,
+    });
+  }
 }
 
 export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOutcome> {
@@ -253,7 +265,7 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
       codeCellIndexes.push(index);
     }
   }
-  const selected = parseCellSelector(req.cellSelector, codeCellIndexes);
+  const selected = req.mode === 'full' ? [...codeCellIndexes] : parseCellSelector(req.cellSelector, codeCellIndexes, notebook.cells.length);
   for (const index of selected) {
     const cell = notebook.cells[index];
     if (cell === undefined) {
@@ -367,13 +379,10 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
   // The client's signal is the other trigger, and the FIRST one to fire is the one that caused this
   // failure. `??=` keeps that order: if the kernel died first, a cancel arriving during the write-back
   // does not relabel the run as cancelled.
-  req.abort?.signal?.addEventListener(
-    'abort',
-    () => {
-      firstAbort.reason ??= 'cancelled';
-    },
-    { once: true },
-  );
+  const recordClientAbort = (): void => {
+    firstAbort.reason ??= 'cancelled';
+  };
+  req.abort?.signal?.addEventListener('abort', recordClientAbort, { once: true });
   // ROB-1: the merged signal registers listeners on a long-lived signal; they
   // must be detached on the normal path too, not only when abort fires.
   const merged = combineAbortSignals(req.abort?.signal, kernelAbort.signal);
@@ -397,6 +406,7 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
   // execute when a timeout/cancel interrupts the run (SPEC §4.7 rule 3).
   const executed: ExecutedCell[] = [];
   const imageBlocks: RunImageBlock[] = [];
+  const imageArtifacts: ImageArtifactPlan[] = [];
   const executedCellsSet = new Set<number>();
   // Mime values dropped because nbformat cannot store them, collected across the
   // whole call so ONE warning can report this, any truncation, and any value the
@@ -552,7 +562,7 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
         const policyResult = await applyImagePolicy(
             mapped.items,
             mapped.extractedImages,
-            { returnImages, maxImages: deps.config.maxImagesPerCall, indexStart: imageCursor },
+            { returnImages, maxImages: deps.config.maxImagesPerCall, indexStart: imageCursor, deferWrites: true },
             {
               artifactRoot: deps.config.artifactDir,
               notebookAbsPath: req.path,
@@ -576,6 +586,7 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
           }
         }
         imageCursor += policyResult.materialized.length;
+        imageArtifacts.push(...policyResult.artifactPlans);
         for (const materialized of policyResult.materialized) {
           const image = mapped.items[materialized.outputIndex];
           if (image === undefined || image.kind !== 'image') {
@@ -886,6 +897,7 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
         write_back: writeBack,
         warnings,
         image_blocks: imageBlocks,
+        image_artifacts: imageArtifacts,
         content_hash_after: contentHashAfter,
       };
     } finally {
@@ -893,6 +905,7 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
     }
   } finally {
     merged.cleanup();
+    req.abort?.signal?.removeEventListener('abort', recordClientAbort);
     unregisterKernelAbort();
   }
 }

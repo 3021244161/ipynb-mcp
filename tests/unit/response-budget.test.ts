@@ -7,6 +7,65 @@ import {
   estimatedJsonBytes,
 } from '../../src/core/response-budget.js';
 import { reconcileTruncationFlags } from '../../src/mcp/render/read.js';
+import { IpynbError } from '../../src/core/errors.js';
+import { toCallToolResult } from '../../src/mcp/tools/result.js';
+
+describe('[U21b][U24] response budget boundaries', () => {
+  it.each(['\ud800', '\udfff', '\ud800\ud800', '\udfff\udfff'])('[U24] counts JSON escaping of unpaired surrogates: %j', (unit) => {
+    const value = unit.repeat(1000);
+    const serializedTwice = JSON.stringify(JSON.stringify(value));
+    const stringContentBytes = Buffer.byteLength(serializedTwice, 'utf8') - 6;
+    expect(escapedByteLength(value)).toBeGreaterThanOrEqual(stringContentBytes);
+  });
+
+  it('[U24] keeps a refusal within budget even for many top-level scalar fields', () => {
+    const fields = Object.fromEntries(Array.from({ length: 8000 }, (_, index) => [`field${index}`, 1234567890]));
+    const outcome = enforceResponseBudget({ path: 'x.ipynb', ...fields }, 4096);
+    expect(Buffer.byteLength(JSON.stringify(outcome.payload), 'utf8')).toBeLessThanOrEqual(4096);
+    expect(outcome.estimatedBytes).toBeLessThanOrEqual(4096);
+    expect(outcome.payload).toMatchObject({ path: 'x.ipynb', response_budget_exceeded: true });
+  });
+
+  it('[U24] bounds the combined refusal identity after JSON escaping', () => {
+    const identity = Object.fromEntries(['message', 'path', 'run_id', 'kernel_id', 'kind', 'state', 'status', 'content_hash']
+      .map((key) => [key, '\udfff'.repeat(300)]));
+    const outcome = enforceResponseBudget({ code: 'exec_timeout', ...identity, bulk: Array(8000).fill(1) }, 4096);
+    expect(Buffer.byteLength(JSON.stringify(outcome.payload), 'utf8')).toBeLessThanOrEqual(4096);
+    expect(outcome.estimatedBytes).toBeLessThanOrEqual(4096);
+    expect(outcome.payload).toMatchObject({ code: 'exec_timeout', response_budget_exceeded: true });
+  });
+
+  it.each(['completed', 'failed'])('[U21b] marks budget-truncated stream outputs in %s runs', (state) => {
+    const executed = [{ cell_index: 0, outputs: [{ kind: 'stream', text: 'x'.repeat(200_000), truncated: false, truncated_at_chars: null }] }];
+    const outcome = state === 'completed'
+      ? { payload: { kind: 'completed', executed, warnings: [] } }
+      : { error: new IpynbError('exec_timeout', 'timed out', { executed }) };
+    const result = toCallToolResult(outcome, { maxResponseBytes: 65_536 });
+    const block = result.content[0]!;
+    if (block.type !== 'text') {
+      throw new Error('missing text result');
+    }
+    const body = JSON.parse(block.text) as Record<string, unknown>;
+    const parent = state === 'completed' ? body : body['detail'] as Record<string, unknown>;
+    const stream = (parent['executed'] as Array<{ outputs: Array<Record<string, unknown>> }>)[0]!.outputs[0]!;
+    expect(String(stream['text'])).toContain(TRUNCATION_MARKER);
+    expect(stream['truncated']).toBe(true);
+    expect(stream['truncated_at_chars']).toBe(String(stream['text']).length - TRUNCATION_MARKER.length);
+  });
+
+  it('[U21b] marks a single-line source preview shortened by the frame budget', () => {
+    const result = toCallToolResult({ payload: {
+      cells: [{ source: null, source_preview: ['x'.repeat(200_000)], source_truncated: false }], warnings: [],
+    } }, { maxResponseBytes: 65_536 });
+    const block = result.content[0]!;
+    if (block.type !== 'text') {
+      throw new Error('missing text result');
+    }
+    const body = JSON.parse(block.text) as { cells: Array<{ source_preview: string[]; source_truncated: boolean }> };
+    expect(body.cells[0]!.source_preview[0]).toContain(TRUNCATION_MARKER);
+    expect(body.cells[0]!.source_truncated).toBe(true);
+  });
+});
 
 /**
  * [V14-11] The degradation loops must TERMINATE, and must never make a payload bigger.

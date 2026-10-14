@@ -20,7 +20,7 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import type { IpynbConfig } from '../../src/config.js';
-import { IpynbError } from '../../src/core/errors.js';
+import { IpynbError, type JsonValue } from '../../src/core/errors.js';
 import { PathFence } from '../../src/fs/fence.js';
 import { hasher } from '../../src/hash.js';
 import { SIDECAR_REQUIRED_MODULES } from '../../src/kernel/interpreter.js';
@@ -29,7 +29,7 @@ import { createLogger } from '../../src/log.js';
 import type { ToolContext } from '../../src/mcp/context.js';
 import { RunStore } from '../../src/mcp/run-store.js';
 import { handleNotebookRead } from '../../src/mcp/tools/read.js';
-import { toCallToolResult } from '../../src/mcp/tools/result.js';
+import { finalizeToolResult } from '../../src/mcp/tools/result.js';
 import { runNotebook, type RunDeps } from '../../src/run.js';
 import { prepareVenv } from './test-venv.js';
 
@@ -158,8 +158,14 @@ describe('[V9-1] a data: URL image survives a real run, on the wire and on disk'
       deps(),
     );
 
-    expect(outcome.image_blocks).toHaveLength(1);
-    const bytes = decodedBlock(outcome.image_blocks[0]!.data);
+    const delivered = await finalizeToolResult({
+      payload: { executed: outcome.executed as unknown as JsonValue },
+      imageBlocks: outcome.image_blocks,
+      imageArtifacts: outcome.image_artifacts,
+    });
+    const blocks = delivered.content.filter((block) => block.type === 'image');
+    expect(blocks).toHaveLength(1);
+    const bytes = decodedBlock(blocks[0]!.data);
     expect(bytes.subarray(0, 8)).toEqual(PNG_MAGIC);
 
     const item = (outcome.executed[0]!.outputs[0] ?? {}) as Record<string, unknown>;
@@ -198,7 +204,7 @@ describe('[V9-1] a data: URL image survives a real run, on the wire and on disk'
     // value has to decode to the bytes the kernel displayed.
     const outcome = await handleNotebookRead(readContext(), { path: nb, include_outputs: 'full' });
     expect('error' in outcome).toBe(false);
-    const result = toCallToolResult(outcome);
+    const result = await finalizeToolResult(outcome);
     expect(result.isError).toBeUndefined();
     const images = result.content.filter((block) => block.type === 'image') as Array<{ data: string }>;
     expect(images).toHaveLength(1);
