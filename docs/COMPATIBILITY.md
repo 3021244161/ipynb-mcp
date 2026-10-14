@@ -1,5 +1,11 @@
 # COMPATIBILITY — 实测过的客户端与版本矩阵
 
+## 2026-10-13 本轮本地复验
+
+Windows x64，Node **26.7.0**、pnpm **11.7.0**、SDK **1.31.0**：typecheck / lint / build 通过，**663 单测（34 文件）**、**96 集成（13 文件）**、**26/26 smoke** 通过；离线 **check:package 通过（145 文件，23 个变异均被检测）**。现有测试 venv 的基础环境为 Python **3.10.14**、ipykernel **6.25.2**、jupyter_client **8.3.1**、nbformat **5.9.2**；本轮未安装 Python 包。详细记录见 `docs/review/2026-10-13-0.1.1-bugfixes.md`。
+
+真实 SDK stdio 已复验超预算文本、未配对 Unicode、预算扣图不落盘、连接后续调用存活。Windows 进程清理测试需要沙箱允许 taskkill 终结测试自己的子进程；解除该限制后整个集成套件通过。第三方客户端 E1–E9、Linux/macOS 本轮仍未执行；下方旧矩阵保留其原始日期与环境。
+
 ## 客户端矩阵
 
 | 客户端 | 版本 | 状态 | 备注 |
