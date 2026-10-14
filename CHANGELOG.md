@@ -2,14 +2,16 @@
 
 本项目的接口变更遵循 D22 兼容承诺（工具名与参数名在 1.x 内不删不改；新增参数一律可选带默认值；返回字段只增不删）。
 
-## [Unreleased] — 0.1.1 缺陷修复
+## [0.1.2] — 0.1.1 缺陷修复（2026-10-14）
 
 - 拒绝非法启动整数、UNC 共享根目录及损坏的 UTF-8；启动校验失败不创建 artifact 目录。
 - 写入前及 rename 重试前复检外部编辑与取消；修复大行数 CAS 编辑及错误详情截断。
 - 选择器展开前检查安全整数与范围；full 模式忽略选择器；修复无 progressToken 的取消传播与监听器清理。
 - 按实际 JSON 转义计算响应预算，同步截断标志；图片在最终响应选择后才物化，失败、预算扣图与取消均保留正确引用。
 
-本地验证：663 单测、96 集成、26 smoke，typecheck / lint / build / 离线 package 检查通过。版本保持 0.1.1，未发布。详细缺陷与平台范围见 [审计记录](docs/review/2026-10-13-0.1.1-bugfixes.md)。
+修复阶段验证：663 单测、96 集成、26 smoke，typecheck / lint / build / 离线 package 检查通过。主包升级为 0.1.2，工具名与参数名保持兼容；补回 SPEC 已定义的 CAS 错误详情字段。详细缺陷与平台范围见 [审计记录](docs/review/2026-10-13-0.1.1-bugfixes.md)。
+
+发布前再次通过 typecheck / lint / 663 单测 / build / check:package（145 文件、23 个变异），以及安装 tarball 后的 check:release 12/12（真实 stdio 与 kernel）。
 
 ## [0.1.1] — 包名改为 ipynb-mcp-server、README 安装说明与中文版（2026-10-06）
 

@@ -1,5 +1,9 @@
 # COMPATIBILITY — 实测过的客户端与版本矩阵
 
+## 2026-10-14 — 0.1.2 发布检查
+
+在下述 Windows / Node 26.7.0 / 既有专用 Python venv 环境，将主包更新到 0.1.2 后重新通过 typecheck、lint、663/663 单测、build、check:package（145 文件，23 个变异）及 check:release（安装 tarball 后 12/12 检查，含真实 kernel）。首轮单测误设置了集成测试专用的 `IPYNB_TEST_REQUIRE_VENV=1`，导致三个回退用例失败；移除该开关后整套通过，未修改代码或断言。本次版本更新不涉及运行时代码，96 个集成与 26 个 smoke 的证据沿用下方修复阶段记录。第三方客户端手工验收仍未执行。
+
 ## 2026-10-13 本轮本地复验
 
 Windows x64，Node **26.7.0**、pnpm **11.7.0**、SDK **1.31.0**：typecheck / lint / build 通过，**663 单测（34 文件）**、**96 集成（13 文件）**、**26/26 smoke** 通过；离线 **check:package 通过（145 文件，23 个变异均被检测）**。现有测试 venv 的基础环境为 Python **3.10.14**、ipykernel **6.25.2**、jupyter_client **8.3.1**、nbformat **5.9.2**；本轮未安装 Python 包。详细记录见 `docs/review/2026-10-13-0.1.1-bugfixes.md`。
