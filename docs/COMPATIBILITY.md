@@ -1,5 +1,11 @@
 # COMPATIBILITY — 实测过的客户端与版本矩阵
 
+## 2026-10-15 — dev issue 修复本地验证
+
+Windows x64 / Node 26.7.0 / pnpm 11.7.0 / 既有测试虚拟环境：typecheck、lint、build、**679/679 单测（36 文件）**、**107/107 集成（14 文件，无跳过）**、**26/26 SDK stdio smoke** 全部通过；check:package 检查 145 文件并检出 23 个变异。新增覆盖后台中途查询、轻量轮询无图片落盘、取消半截结果、快照竞态、restart 重新选择 kernelspec 与实际 sys.executable、IPython 保守降级。四个守卫变异均触发断言失败并恢复，详见 [本轮记录](review/2026-10-15-github-issues.md)。
+
+本轮未安装依赖或 Python 包，未改版本或发布 npm。第三方 GUI 客户端及 Linux/macOS 本轮本地未执行；既有 CI 的 macOS 层仍只有 unit，没有 integration。本条仅记录本地证据，远端 CI 单独查看。
+
 ## 2026-10-14 — 0.1.2 发布检查
 
 发布提交 `df55ac8` 的 [GitHub CI run 38495436726](https://github.com/3021244161/ipynb-mcp/actions/runs/38495436726) **9/9 job 成功**：Windows / Ubuntu 的 Node 22、24 单测，macOS 的 Node 22 单测，以及 Windows / Ubuntu × Python 3.10、3.12 集成。CI 按现有配置执行外部 nbformat、smoke、打包门禁，并在 Ubuntu / Python 3.12 执行安装包验证；macOS 仍仅通过 unit 层验证，不运行 integration。第三方客户端手工 E1–E9 未执行。

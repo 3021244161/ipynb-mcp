@@ -160,9 +160,10 @@ describe('[step9][U24] response shape across all six tools', () => {
       'Edit notebook cells. Every source change requires a compare-and-swap anchor (expected_source_hash or expected_text); a mismatch fails the whole request without writing.',
     );
     expect(byName.get('notebook_run')).toBe(
-      "Execute notebook cells. mode='resume' runs only the target cells in the live kernel; 'replay' silently rebuilds state from cell 0 first; 'full' re-runs everything.",
+      "Execute notebook cells. mode='resume' runs only target cells in the live kernel; 'replay' silently rebuilds state from cell 0 first; 'full' runs all code cells without resetting a live kernel or its import cache. For clean validation, restart the kernel before full. Inspect executed[].status for cell failures; completed does not mean all cells succeeded.",
     );
-    expect(byName.get('notebook_run_status')).toBe('Poll a background notebook run started by notebook_run.');
+    expect(byName.get('notebook_run_status')).toContain("include_outputs='none'");
+    expect(byName.get('notebook_run_status')).toContain('executed[].status');
     expect(byName.get('notebook_run_cancel')).toBe('Cancel a background notebook run started by notebook_run.');
     expect(byName.get('notebook_kernel')).toBe(
       'Inspect or manage the kernels held for notebooks: status, start, shutdown, restart.',

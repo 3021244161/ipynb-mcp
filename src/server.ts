@@ -213,6 +213,7 @@ export function createServer(ctx: ToolContext): McpServer {
       // the SDK side deliberately passes unknown keys through.
       inputSchema: strict({
         run_id: z.string().describe('Run id returned by notebook_run'),
+        include_outputs: z.string().optional().describe("Output detail: 'none' for cheap polling without images; 'full' (default) for completed-cell outputs"),
       }),
     },
     wrap((args) => {

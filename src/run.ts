@@ -129,6 +129,14 @@ export type RunProgressEvent =
   | { readonly phase: 'cell'; readonly completed: number; readonly total: number; readonly current_cell_index: number }
   | { readonly phase: 'write_back'; readonly completed: number; readonly total: number };
 
+export interface CompletedCellSnapshot {
+  readonly cell: ExecutedCell;
+  readonly replayedCellIndexes: number[];
+  readonly warnings: Warning[];
+  readonly imageBlocks: RunImageBlock[];
+  readonly imageArtifacts: readonly ImageArtifactPlan[];
+}
+
 export interface RunDeps {
   readonly registry: KernelRegistry;
   readonly hasher: Hasher;
@@ -138,6 +146,8 @@ export interface RunDeps {
   readonly realpath: (target: string) => string;
   readonly platform?: NodeJS.Platform;
   readonly onProgress?: (event: RunProgressEvent) => void;
+  readonly onKernelReady?: (kernelId: string) => void;
+  readonly onCellCompleted?: (snapshot: CompletedCellSnapshot) => void;
 }
 
 /** Parse a cell_selector into ascending deduped code-cell indexes (SPEC §4.7). */
@@ -471,6 +481,7 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
           { warnings, droppedMimes },
         );
       }
+      deps.onKernelReady?.(session.kernelId);
       deps.onProgress?.({ phase: 'start', total: targets.length });
 
       // ---- replay prefix: silent, no outputs, no counters, nothing written ------
@@ -652,7 +663,23 @@ export async function runNotebook(req: RunRequest, deps: RunDeps): Promise<RunOu
           cell.outputs = sanitized.outputs;
           cell.execution_count = representableExecutionCount(result.result.executionCount);
           executedCellsSet.add(index);
+          // Publish only after the abort/timeout gates: an interrupted cell's
+          // partial output must never look like a completed checkpoint (#4).
+          if (deps.onCellCompleted !== undefined) {
+            const snapshotWarnings = [...warnings];
+            pushCallWarnings(snapshotWarnings, executed, droppedMimes);
+            deps.onCellCompleted({
+              cell: executed[executed.length - 1]!,
+              replayedCellIndexes: [...replayPrefix],
+              warnings: snapshotWarnings,
+              imageBlocks: [...imageBlocks],
+              imageArtifacts: [...imageArtifacts],
+            });
+          }
         } else {
+          // The interrupted cell did not complete. Keep it out of the terminal
+          // executed list too, which is copied back into a background handle.
+          executed.pop();
           cell.outputs = savedOutputs;
           cell.execution_count = representableExecutionCount(savedCount);
         }

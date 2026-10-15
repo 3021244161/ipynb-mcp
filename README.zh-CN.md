@@ -115,11 +115,29 @@ cell 选择器的端点必须是 notebook 范围内的安全整数，校验通�
 
 默认配置下，**单格**执行是同步返回的（其预估上界恰好等于那个 10 倍阈值）；**两格及以上**、或调大了 `--exec-timeout-seconds` 时，会返回一个后台 `run_id`，用 `notebook_run_status` 轮询。这个倍数来自 `DEVIATIONS.md` D-015。
 
+## 运行、轮询与干净验证
+
+后台运行绑定 kernel 后即可查询其 ID；每个目标 cell 完成后，即使下一格仍在执行，也能查询该格结果。Replay 保持静默，未完成 cell 的输出不会作为已完成结果发布。输出在运行结束时写回；请检查 `write_back`，取消后还要等 `facts_pending` 变为 false，才能把写回信息视为最终事实。
+
+频繁轮询时使用 `notebook_run_status(run_id='run-1', include_outputs='none')`。它保留运行状态、进度、已完成 cell 的索引与 `status`、写回等信息，将 `outputs` 数组置空，不返回图片、不写 artifact。省略该参数或指定 `'full'` 可获取完整结果，仍受现有输出预算约束。轻量轮询不会丢弃存储的完整结果；写回后也可以用 `notebook_read(cell_indexes=[...], include_outputs='full')` 单独读取需要的 cell。
+
+**运行结束不等于全部成功。** `kind: 'completed'` / `state: 'completed'` 只表示执行编排结束。Python 异常仍通过 `executed[].status: 'error'` 和 traceback 报告，不会变成 MCP 基础设施错误。请检查每格状态；评分检查若只打印不及格分数而不抛异常，其状态仍然是 `ok`，还需单独核对实际结果。
+
+**`full` 会在现有 kernel 中运行全部代码 cell。** 它忽略 `cell_selector`，保留内存变量和 Python 导入缓存。需要干净验证时：
+
+1. 调用 `notebook_kernel(action='restart', path='analysis.ipynb')`。
+2. 调用 `notebook_run(mode='full', path='analysis.ipynb')`。
+3. 若返回后台 `run_id`，用 `include_outputs='none'` 轮询到运行结束且 `facts_pending` 为 false，根据 `executed[].status` 找出失败 cell，再按需读取输出。
+
+重启只重置 kernel 内存，不会删除 notebook 代码生成的文件。验证若依赖这些文件的初始状态，请自行准备；服务不会替你删除它们。
+
 ## 解释器选择
 
 当 notebook 需要 kernel 时，解释器按候选链解析：`--python` → notebook 自带的 `metadata.kernelspec` argv → notebook 同级的 `.venv`/`venv` → `PATH` 上的 `python3`/`python`。每个失败的候选都会被记录；**只有全部失败**时工具才报错（并附上可直接执行的 `pip install ipykernel` 命令——服务自己从不安装任何东西）。与 kernelspec 不一致的 `.venv` 会产生 `kernelspec_mismatch` 警告；用 `--python` 可以显式钉住一个。
 
 `IPYNB_PYTHON` 与 `--python` 等价，都会覆盖 notebook 的 kernelspec；希望每个 notebook 使用自己的环境时，请移除该服务级覆盖项。若已找到的 kernelspec 指向不存在的解释器，或解释器缺少所需模块，回退前会通过 `kernelspec_mismatch` 说明被拒绝的解释器及原因。`kernel_spec_name` 表示请求的 spec；请检查 `interpreter_path`，必要时执行 `import sys; print(sys.executable)` 核对实际环境。服务不会安装或修复 Python 包。
+
+`notebook_kernel(action='restart', path=...)` 会重新读取 notebook 并解析解释器，因此修改 kernelspec 或修复此前的回退环境后，重启即可生效。没有现存 kernel 时会创建新 kernel，始终不会自动执行 cell。
 
 ## 输出、图片与大数
 
@@ -130,6 +148,8 @@ cell 选择器的端点必须是 notebook 范围内的安全整数，校验通�
 **`application/json` 里的大整数。** nbformat 对 json 取值不做类型约束，而 JavaScript 无法精确表示的整数（超出 ±2^53，例如 `2**64`）无法原样穿过 JSON number 通道。这类值在文件里**逐字节保留**（一次读-写往返不再把它四舍五入），响应也会如实报告而不是假装无事：每当该输出被完整返回（完整输出读取或执行），该项会带 `warnings` 数组，调用级 `warnings[]` 也会增加一条——code 为 `output_truncated`（它本来就在 SPEC §7 的封闭码表里）——其 message 含**精确数字**。`value` 字段存的是最接近的 double，因为那正是 JSON 通道本身能承载、任何 JSON 客户端都会解析出来的东西；你需要的数字在 warning 里，也在文件里。
 
 ## 已知限制
+
+- **IPython 语法会导致 stale 分析降级。** 含 `!command`、`%magic` 或 `%%cell-magic` 的 cell 无法被原始 Python symtable 解析，因此整轮分析退回低置信度 regex。分析不会执行 shell 命令或安装包。静态预处理还需保守处理 magic 的隐藏影响，后续方案见 [设计记录](docs/ISSUE_FOLLOWUPS.md#ipython-analysis-8)。
 
 - **执行就是任意代码执行。** 把 root 指向你愿意让 agent 写入的目录；围栏是路径边界，不是沙箱。只运行你愿意执行的 notebook。
 - **stale 分析只支持 Python。** 非 Python kernel（R、Julia 等）可以读/改/跑，但会跳过 stale 分析（`method: "skipped"`）。它也看不穿 `globals()`/`locals()`/`exec`/`eval`/`setattr`、属性赋值（`obj.attr = 1`）和 `import *`。当某个 cell 解析失败时，整轮分析会退化为保守的正则兜底（所有置信度降为 `low`；正则兜底还漏掉元组解包、带注解的赋值、缩进赋值与 `with … as`，并可能把字符串/注释里的标识符误判为使用）。

@@ -49,7 +49,7 @@ export async function handleNotebookKernel(
     const inputPath = requireNonEmptyString(args, 'path');
     const absolutePath = ctx.fence.assertInside(inputPath);
 
-    if (action === 'shutdown' || action === 'restart') {
+    const abortRuns = (): void => {
       // Fail every running background run hosted on this notebook's kernel
       // immediately (SPEC §4.8): abort now, interrupt best-effort; completed
       // cells still get written back by the background task.
@@ -70,42 +70,38 @@ export async function handleNotebookKernel(
           });
         }
       }
-    }
-
-    if (action === 'start') {
-      const notebook = await readNotebookFile(absolutePath, ctx.hasher);
-      // Single shared entry with runNotebook (B1): same candidate chain, same
-      // ipykernel probe cache — the tool layer assembles no deps itself.
-      const meta = readNotebookMetadata(notebook.doc);
-      const resolution = await resolveForNotebook(
-        { notebookPath: absolutePath, explicitPython: ctx.config.python, platform: ctx.platform },
-        { kernelSpecName: meta.kernelName, languageInfoName: meta.languageName },
-      );
-      const session = await ctx.registry.getOrCreate({
-        notebookPath: absolutePath,
-        interpreterPath: resolution.interpreterPath,
-        kernelSpecName: resolution.kernelSpecName,
-        language: resolution.language,
-      });
-      const payload: Record<string, unknown> = {
-        action,
-        kernels: [sessionInfo(session)],
-        warnings: resolution.warnings,
-      };
-      return { payload: payload as JsonValue };
-    }
+    };
 
     if (action === 'shutdown') {
+      abortRuns();
       await ctx.registry.shutdown(absolutePath);
       const payload: Record<string, unknown> = { action, kernels: [], warnings: [] };
       return { payload: payload as JsonValue };
     }
 
-    const session = await ctx.registry.restart(absolutePath);
+    const notebook = await readNotebookFile(absolutePath, ctx.hasher);
+    // Restart must resolve the notebook again: the previous session may have
+    // fallen back or been started before its kernelspec changed (#3).
+    const meta = readNotebookMetadata(notebook.doc);
+    const resolution = await resolveForNotebook(
+      { notebookPath: absolutePath, explicitPython: ctx.config.python, platform: ctx.platform },
+      { kernelSpecName: meta.kernelName, languageInfoName: meta.languageName },
+    );
+    if (action === 'restart') {
+      // Failed preflight must leave the existing run and kernel untouched.
+      abortRuns();
+      await ctx.registry.shutdown(absolutePath);
+    }
+    const session = await ctx.registry.getOrCreate({
+      notebookPath: absolutePath,
+      interpreterPath: resolution.interpreterPath,
+      kernelSpecName: resolution.kernelSpecName,
+      language: resolution.language,
+    });
     const payload: Record<string, unknown> = {
-      action: 'restart',
-      kernels: session === null ? [] : [sessionInfo(session)],
-      warnings: [],
+      action,
+      kernels: [sessionInfo(session)],
+      warnings: resolution.warnings,
     };
     return { payload: payload as JsonValue };
   });

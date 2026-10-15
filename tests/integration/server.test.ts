@@ -4,14 +4,14 @@
 
 import { spawn } from 'node:child_process';
 import { existsSync, readdirSync, realpathSync } from 'node:fs';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import type { IpynbConfig } from '../../src/config.js';
 import { hasher } from '../../src/hash.js';
@@ -21,7 +21,7 @@ import { RunStore } from '../../src/mcp/run-store.js';
 import { PathFence } from '../../src/fs/fence.js';
 import { createLogger } from '../../src/log.js';
 import { createServer } from '../../src/server.js';
-import { BASE_PYTHON, prepareVenv } from './test-venv.js';
+import { BASE_PYTHON, prepareVenv, resolvedTestInterpreter } from './test-venv.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -272,6 +272,144 @@ async function handleEditThroughAbort(nb: string, signal: AbortSignal) {
   );
   return toCallToolResult(outcome);
 }
+
+describe('[I16][U24] live background checkpoints (#4)', () => {
+  it('returns the first cell while the second cell is deliberately blocked', async () => {
+    const ready = path.join(workspace, 'checkpoint-ready');
+    const release = path.join(workspace, 'checkpoint-release');
+    const nb = await writeNb('checkpoint.ipynb', [
+      codeCell('c0', 'print("checkpoint result")'),
+      codeCell('c1', [
+        'import os, time',
+        'print("unfinished output")',
+        `open(${JSON.stringify(ready)}, "w").close()`,
+        `while not os.path.exists(${JSON.stringify(release)}):`,
+        '    time.sleep(0.05)',
+      ].join('\n')),
+      codeCell('c2', 'print("final result")'),
+    ]);
+    const before = await readFile(nb, 'utf8');
+    let runId: string | undefined;
+    try {
+      const started = await callTool('notebook_run', { path: nb, mode: 'full', timeout_seconds: 300 });
+      const startBody = JSON.parse(String(started.content[0]?.text)) as Record<string, unknown>;
+      expect(startBody['kind']).toBe('background');
+      runId = String(startBody['run_id']);
+      await vi.waitFor(() => expect(existsSync(ready)).toBe(true), { timeout: 30_000, interval: 100 });
+      const response = await callTool('notebook_run_status', { run_id: runId });
+      const live = JSON.parse(String(response.content[0]?.text)) as Record<string, unknown>;
+      expect(live).toMatchObject({ state: 'running', progress: { completed: 1, total: 3, current_cell_index: 1 }, write_back: { performed: false } });
+      expect(live['kernel_id']).toBe(registry.findByNotebook(nb)?.kernelId);
+      expect(live['kernel_id']).toMatch(/^kernel-/);
+      expect(live['executed']).toEqual([expect.objectContaining({ cell_index: 0, status: 'ok' })]);
+      expect(JSON.stringify(live['executed'])).toContain('checkpoint result');
+      expect(JSON.stringify(live['executed'])).not.toContain('unfinished output');
+      expect(await readFile(nb, 'utf8')).toBe(before);
+      await writeFile(release, 'release');
+      await vi.waitFor(() => expect(runStore.get(runId!)?.finishedAt).not.toBeNull(), { timeout: 30_000, interval: 100 });
+      const terminal = await callTool('notebook_run_status', { run_id: runId });
+      const body = JSON.parse(String(terminal.content[0]?.text)) as Record<string, unknown>;
+      expect(body).toMatchObject({ state: 'completed', progress: { completed: 3 }, write_back: { performed: true } });
+      expect(body['executed']).toHaveLength(3);
+    } finally {
+      await writeFile(release, 'release');
+      if (runId !== undefined) {
+        await vi.waitFor(() => expect(runStore.get(runId!)?.finishedAt).not.toBeNull(), { timeout: 30_000, interval: 100 });
+      }
+      await callTool('notebook_kernel', { path: nb, action: 'shutdown' });
+      expect(registry.findByNotebook(nb)).toBeNull();
+    }
+  });
+});
+
+describe('[I4][U24] completion and clean validation (#5/#7)', () => {
+  it('full retains memory until the kernel is explicitly restarted', async () => {
+    const nb = await writeNb('full-counter.ipynb', [codeCell('counter', 'counter = globals().get("counter", 0) + 1\nprint(counter)')]);
+    try {
+      for (const expected of [1, 2, 1]) {
+        if (expected === 1 && registry.findByNotebook(nb) !== null) {
+          await callTool('notebook_kernel', { path: nb, action: 'restart' });
+        }
+        const response = await callTool('notebook_run', { path: nb, mode: 'full', timeout_seconds: 30 });
+        const body = JSON.parse(String(response.content[0]?.text)) as { kind: string; executed: Array<{ outputs: Array<{ text?: string }> }> };
+        expect(body.kind).toBe('completed');
+        expect(body.executed[0]?.outputs.map((output) => output.text ?? '').join('')).toBe(`${expected}\n`);
+      }
+    } finally {
+      await callTool('notebook_kernel', { path: nb, action: 'shutdown' });
+      expect(registry.findByNotebook(nb)).toBeNull();
+    }
+  });
+
+  it.each([30, 300])('preserves cell exceptions when orchestration completes (timeout=%s)', async (timeout) => {
+    const nb = await writeNb(`mixed-errors-${timeout}.ipynb`, [codeCell('failure', 'raise ValueError("intentional failure")'), codeCell('success', 'print("later cell ran")')]);
+    try {
+      const started = await callTool('notebook_run', { path: nb, mode: 'full', timeout_seconds: timeout });
+      expect(started.isError).not.toBe(true);
+      let body = JSON.parse(String(started.content[0]?.text)) as Record<string, unknown>;
+      if (timeout === 300) {
+        expect(body['kind']).toBe('background');
+        const runId = String(body['run_id']);
+        await vi.waitFor(() => expect(runStore.get(runId)?.finishedAt).not.toBeNull(), { timeout: 30_000, interval: 100 });
+        const status = await callTool('notebook_run_status', { run_id: runId, include_outputs: 'none' });
+        const summary = JSON.parse(String(status.content[0]?.text)) as Record<string, unknown>;
+        expect(summary).toMatchObject({ state: 'completed', error: null });
+        expect(summary['executed']).toEqual([expect.objectContaining({ cell_index: 0, status: 'error', outputs: [] }), expect.objectContaining({ cell_index: 1, status: 'ok', outputs: [] })]);
+        const full = await callTool('notebook_run_status', { run_id: runId });
+        body = JSON.parse(String(full.content[0]?.text)) as Record<string, unknown>;
+      } else {
+        expect(body['kind']).toBe('completed');
+      }
+      expect(body['executed']).toEqual([expect.objectContaining({ cell_index: 0, status: 'error' }), expect.objectContaining({ cell_index: 1, status: 'ok' })]);
+      expect(JSON.stringify(body['executed'])).toContain('intentional failure');
+      expect(JSON.stringify(body['executed'])).toContain('later cell ran');
+    } finally {
+      await callTool('notebook_kernel', { path: nb, action: 'shutdown' });
+      expect(registry.findByNotebook(nb)).toBeNull();
+    }
+  });
+});
+
+describe('[I17] named interpreter selection (#3)', () => {
+  it.each(['cold', 'changed'] as const)('restarts and executes in the current custom kernelspec (%s)', async (initial) => {
+    const jupyterRoot = path.join(workspace, 'custom-jupyter');
+    const specDir = path.join(jupyterRoot, 'kernels', 'micp-yolo');
+    const interpreter = resolvedTestInterpreter();
+    await mkdir(specDir, { recursive: true });
+    await writeFile(path.join(specDir, 'kernel.json'), JSON.stringify({ argv: [interpreter, '-m', 'ipykernel_launcher', '-f', '{connection_file}'], display_name: 'Custom test kernel', language: 'python' }));
+    const nb = path.join(workspace, `custom-spec-${initial}.ipynb`);
+    const document = { nbformat: 4, nbformat_minor: 5, metadata: { kernelspec: { name: 'micp-yolo', display_name: 'Custom test kernel', language: 'python' } }, cells: [codeCell('probe', 'import sys\nprint(sys.executable)')] };
+    await writeFile(nb, JSON.stringify(document));
+    const previous = process.env['JUPYTER_PATH'];
+    process.env['JUPYTER_PATH'] = jupyterRoot;
+    try {
+      if (initial === 'changed') {
+        await writeFile(nb, JSON.stringify({ ...document, metadata: { kernelspec: { name: 'python3', display_name: 'Python 3', language: 'python' } } }));
+        const started = await callTool('notebook_kernel', { path: nb, action: 'start' });
+        expect(started.isError).not.toBe(true);
+        await writeFile(nb, JSON.stringify(document));
+      }
+      const restarted = await callTool('notebook_kernel', { path: nb, action: 'restart' });
+      const kernel = (JSON.parse(String(restarted.content[0]?.text)) as { kernels: Array<{ interpreter_path: string; kernel_spec_name: string }> }).kernels[0]!;
+      expect(kernel).toMatchObject({ interpreter_path: interpreter, kernel_spec_name: 'micp-yolo' });
+      const ran = await callTool('notebook_run', { path: nb, mode: 'resume', timeout_seconds: 30 });
+      expect(ran.isError).not.toBe(true);
+      const result = JSON.parse(String(ran.content[0]?.text)) as { interpreter_path: string; executed: Array<{ outputs: Array<{ text?: string }> }> };
+      expect(result.interpreter_path).toBe(interpreter);
+      const printed = result.executed[0]!.outputs.map((output) => output.text ?? '').join('').trim();
+      const normalize = (target: string) => process.platform === 'win32' ? realpathSync(target).toLowerCase() : realpathSync(target);
+      expect(normalize(printed)).toBe(normalize(interpreter));
+    } finally {
+      if (previous === undefined) {
+        delete process.env['JUPYTER_PATH'];
+      } else {
+        process.env['JUPYTER_PATH'] = previous;
+      }
+      await callTool('notebook_kernel', { path: nb, action: 'shutdown' });
+      expect(registry.findByNotebook(nb)).toBeNull();
+    }
+  });
+});
 
 describe('[I16] background run vs kernel restart', () => {
   it('fails the run immediately, writes completed cells, keeps status queryable', async () => {

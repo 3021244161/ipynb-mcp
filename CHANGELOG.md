@@ -4,7 +4,12 @@
 
 ## Unreleased
 
-- #3：不可用的 kernelspec 解释器回退时，通过现有 `kernelspec_mismatch` 说明路径与拒绝原因；显式解释器优先级不变。
+- #3：restart 重新读取 notebook 并解析当前 kernelspec，不再复用旧解释器；没有 kernel 时正常新建。不可用的 spec 解释器回退时，通过现有 `kernelspec_mismatch` 说明路径与拒绝原因；显式解释器优先级不变。
+- #4：后台运行及时发布 kernel ID 与已完成目标 cell 的结果；取消时不再把未完成 cell 的半截输出列为完成结果。
+- #6：`notebook_run_status` 新增可选 `include_outputs: 'none' | 'full'`，默认 `'full'`；轻量轮询保留 cell 状态等元数据，不返回图片、不写 artifact。
+- 修复响应刚好压到预算内后，追加截断警告导致丢失运行事实的问题。
+- #5 / #7：双语 README 与模型工具说明明确 completed、cell 成败、评分结果的区别，以及 restart 后 full 的干净验证流程。
+- #8：补充 IPython shell/magic 导致整轮 stale 分析降级的限制与后续静态处理方案；当前分析语义不变。
 
 ## [0.1.2] — 0.1.1 缺陷修复（2026-10-14）
 
