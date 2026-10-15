@@ -505,7 +505,10 @@ export function enforceResponseBudget(payload: JsonValue, maxBytes: number): Res
   // and omission carried two entries with the same code — a shape the spec forbids and the existing
   // assertion would have caught if any fixture had needed both phases (v14 F5).
   const warnings: JsonValue[] = [];
-  if (truncatedFields > 0 || removedItems > 0) {
+  const updateWarning = (): void => {
+    if (truncatedFields === 0 && removedItems === 0) {
+      return;
+    }
     const parts: string[] = [];
     if (shortenedScalars.length > 0) {
       // Named, deduplicated, and bounded: a payload can hold thousands of shortened fields, and the warning
@@ -526,17 +529,32 @@ export function enforceResponseBudget(payload: JsonValue, maxBytes: number): Res
     // The advice has to hold for the common case, which is ONE cell whose ONE output is large: "ask for
     // fewer cells" was not actionable there (v14 V14-2). Where the whole value still is, and how to get at
     // it in pieces, are true either way.
-    warnings.push(
-      warning(
-        `${parts.join('; ')} to fit the ${describeBudget(maxBytes)} response budget. The notebook still holds every value on disk: read it in parts with \`cell_indexes\`, use \`include_outputs='summary'\` for previews, or raise \`--max-response-bytes\` if your client's limit allows`,
-      ),
+    warnings[0] = warning(
+      `${parts.join('; ')} to fit the ${describeBudget(maxBytes)} response budget. The notebook still holds every value on disk: read it in parts with \`cell_indexes\`, use \`include_outputs='summary'\` for previews, or raise \`--max-response-bytes\` if your client's limit allows`,
     );
-  }
+  };
+  updateWarning();
 
   if (warnings.length > 0) {
     const existing = working['warnings'];
     working['warnings'] = [...(Array.isArray(existing) ? existing : []), ...warnings];
     size = estimatedJsonBytes(working);
+    // The warning is part of the frame too. A nearly-full projection can still
+    // fit by dropping a few more outputs; refusing here used to hide run facts
+    // solely because the explanation of truncation crossed the budget (#4/#6).
+    while (size > maxBytes) {
+      const outputs = findDroppableOutputs(working);
+      const last = outputs?.pop();
+      if (last === undefined) {
+        break;
+      }
+      guardPasses();
+      const previousWarningBytes = estimatedJsonBytes(warnings[0]);
+      removedItems += 1;
+      updateWarning();
+      working['warnings'] = [...(Array.isArray(existing) ? existing : []), ...warnings];
+      size += estimatedJsonBytes(warnings[0]) - previousWarningBytes - estimatedJsonBytes(last) - 1;
+    }
   }
 
   // THE LAST RESORT: the frame must never leave here above the budget.
