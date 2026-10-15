@@ -119,6 +119,8 @@ cell 选择器的端点必须是 notebook 范围内的安全整数，校验通�
 
 当 notebook 需要 kernel 时，解释器按候选链解析：`--python` → notebook 自带的 `metadata.kernelspec` argv → notebook 同级的 `.venv`/`venv` → `PATH` 上的 `python3`/`python`。每个失败的候选都会被记录；**只有全部失败**时工具才报错（并附上可直接执行的 `pip install ipykernel` 命令——服务自己从不安装任何东西）。与 kernelspec 不一致的 `.venv` 会产生 `kernelspec_mismatch` 警告；用 `--python` 可以显式钉住一个。
 
+`IPYNB_PYTHON` 与 `--python` 等价，都会覆盖 notebook 的 kernelspec；希望每个 notebook 使用自己的环境时，请移除该服务级覆盖项。若已找到的 kernelspec 指向不存在的解释器，或解释器缺少所需模块，回退前会通过 `kernelspec_mismatch` 说明被拒绝的解释器及原因。`kernel_spec_name` 表示请求的 spec；请检查 `interpreter_path`，必要时执行 `import sys; print(sys.executable)` 核对实际环境。服务不会安装或修复 Python 包。
+
 ## 输出、图片与大数
 
 `include_outputs: 'full'` 的读取会把每个已存输出投影成 [SPEC.md](./SPEC.md) §5.4 定义的某种 `OutputItem`，并把图片项作为原生 MCP image block 返回。有两种取值形态值得单独说明，因为真实 notebook 里两种都常见。

@@ -119,6 +119,8 @@ With the defaults, a single-cell run is executed synchronously (its upper bound 
 
 When a notebook needs a kernel, the interpreter is resolved by candidate chain: `--python` → the notebook's own `metadata.kernelspec` argv → `.venv`/`venv` next to the notebook → `python3`/`python` on PATH. Every failed candidate is recorded; only if all fail does the tool error (with a ready-to-run `pip install ipykernel` command — the server never installs anything itself). A `.venv` that disagrees with the kernelspec produces a `kernelspec_mismatch` warning; pass `--python` to pin one explicitly.
 
+`IPYNB_PYTHON` is the environment-variable equivalent of `--python`: either overrides the notebook's kernelspec for the server. Remove that override to let each notebook select its own environment. If a resolved kernelspec points to a missing interpreter or one missing required modules, `kernelspec_mismatch` now names the rejected interpreter and reason before fallback. `kernel_spec_name` identifies the requested spec; check `interpreter_path` and, when needed, run `import sys; print(sys.executable)` to verify the actual environment. The server does not install or repair Python packages.
+
 ## Outputs, images and large numbers
 
 An `include_outputs: 'full'` read projects every stored output into one of the `OutputItem` shapes of [SPEC.md](./SPEC.md) §5.4 and returns image items as native MCP image blocks. Two value shapes are worth their own paragraph, because real notebooks contain both.

@@ -80,6 +80,45 @@ function fakeDeps(world: FakeWorld): InterpreterDeps & { readonly probed: string
 
 const NOTEBOOK = '/work/nb.ipynb';
 
+describe('[I17][U23] Windows user kernelspec selection (#3)', () => {
+  function windowsWorld(modules: readonly string[], present = true) {
+    const chosen = path.resolve('fake-envs/yolo/python.exe');
+    const appData = path.resolve('fake-AppData');
+    const kernelJson = path.join(appData, 'jupyter', 'kernels', 'micp-yolo', 'kernel.json');
+    const deps = fakeDeps({
+      interpreters: { ...(present ? { [chosen]: { modules } } : {}), python: { modules: SIDECAR_REQUIRED_MODULES } },
+      pathCommands: {},
+    });
+    const exists = deps.existsSync;
+    return { chosen, deps: {
+      ...deps, platform: 'win32' as const, env: { APPDATA: appData },
+      existsSync: (target: string) => target === kernelJson || exists(target),
+      readFile: async () => JSON.stringify({ argv: [chosen, '-m', 'ipykernel_launcher', '-f', '{connection_file}'], language: 'python' }),
+    } };
+  }
+
+  it('uses a valid named user interpreter instead of PATH Python', async () => {
+    const { chosen, deps } = windowsWorld(SIDECAR_REQUIRED_MODULES);
+    const result = await resolveInterpreter({ explicitPython: null, notebookPath: NOTEBOOK, kernelSpecName: 'micp-yolo', languageInfoName: 'python' }, deps);
+    expect(result).toMatchObject({ interpreterPath: chosen, kernelSpecName: 'micp-yolo', warnings: [] });
+    expect(deps.probed).toContain(chosen);
+  });
+
+  it.each([true, false])('explains fallback from a resolved but unusable user interpreter (present=%s)', async (present) => {
+    const { chosen, deps } = windowsWorld(['ipykernel'], present);
+    const result = await resolveInterpreter({ explicitPython: null, notebookPath: NOTEBOOK, kernelSpecName: 'micp-yolo', languageInfoName: 'python' }, deps);
+    expect(result.interpreterPath).toBe('python');
+    expect(result.warnings).toEqual([expect.objectContaining({ code: 'kernelspec_mismatch' })]);
+    expect(result.warnings[0]!.message).toContain(chosen);
+    expect(result.warnings[0]!.message).toContain(present ? 'missing_module:jupyter_client' : 'not found');
+  });
+
+  it('keeps explicit interpreter failure final even with a usable user spec', async () => {
+    const { deps } = windowsWorld(SIDECAR_REQUIRED_MODULES);
+    await expect(resolveInterpreter({ explicitPython: path.resolve('missing-python.exe'), notebookPath: NOTEBOOK, kernelSpecName: 'micp-yolo', languageInfoName: 'python' }, deps)).rejects.toMatchObject({ code: 'interpreter_not_found' });
+  });
+});
+
 /** Resolve and return the thrown error, so a passing case cannot be a missing throw. */
 async function failureOf(
   deps: InterpreterDeps,
