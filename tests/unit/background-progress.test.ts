@@ -86,6 +86,14 @@ describe('[U24][I16] background completed-cell visibility (#4)', () => {
     const config = { ...parseConfig(['--root', workspace, '--artifact-dir', path.join(workspace, 'artifacts')], {}).config!, backgroundThresholdSeconds: 0, maxResponseBytes: 32_768 };
     const registry = new KernelRegistry({ idleSeconds: 3600, transportFactory: () => backend });
     const runStore = new RunStore();
+    // Completion is an event; CI scheduling within an arbitrary one-second
+    // polling window is not part of the checkpoint or write-back contract.
+    const runFinished = deferred<void>();
+    const finishRun = runStore.finish.bind(runStore);
+    vi.spyOn(runStore, 'finish').mockImplementation((runId) => {
+      finishRun(runId);
+      runFinished.resolve();
+    });
     const server = createServer({ config, registry, runStore, fence: new PathFence(workspace, false, process.platform), hasher, logger: createLogger('error'), realpath: (target) => target, platform: process.platform });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     const client = new Client({ name: 'progress-test', version: '0.0.0' });
@@ -147,7 +155,8 @@ describe('[U24][I16] background completed-cell visibility (#4)', () => {
       } else {
         backend.releaseSecond.resolve({ ...OK, executionCount: 2 });
       }
-      await vi.waitFor(() => expect(runStore.get(runId!)?.finishedAt).not.toBeNull());
+      await runFinished.promise;
+      expect(runStore.get(runId)?.finishedAt).not.toBeNull();
       const terminal = await call('notebook_run_status', { run_id: runId });
       expect(terminal).toMatchObject({ state: cancel ? 'cancelled' : 'completed', write_back: { performed: true }, facts_pending: false });
       if (cancel) {
@@ -161,7 +170,8 @@ describe('[U24][I16] background completed-cell visibility (#4)', () => {
       backend.allowStart.resolve();
       backend.releaseSecond.resolve(OK);
       if (runId !== undefined) {
-        await vi.waitFor(() => expect(runStore.get(runId!)?.finishedAt).not.toBeNull());
+        await runFinished.promise;
+        expect(runStore.get(runId)?.finishedAt).not.toBeNull();
       }
       await client.close();
       await server.close();
