@@ -133,6 +133,68 @@ function createInput(): {
 }
 
 describe('[R1] a session whose sidecar died is dropped, not kept forever', () => {
+  it('[I9][I16] rejects old cleanup that outlives a completed shutdown and replacement', async () => {
+    const sidecar = makeSidecar();
+    const registry = registryWith(sidecar);
+    await registry.getOrCreate(createInput());
+    sidecar.transport.statusQuery = () => Promise.resolve({ alive: false, executionCount: 1, pid: 4242 });
+    let entered!: () => void;
+    const cleaning = new Promise<void>((resolve) => { entered = resolve; });
+    let complete!: () => void;
+    const cleanup = new Promise<void>((resolve) => { complete = resolve; });
+    const shutdown = sidecar.transport.shutdownKernel.bind(sidecar.transport);
+    let calls = 0;
+    sidecar.transport.shutdownKernel = async () => {
+      calls += 1;
+      if (calls === 1) { entered(); await cleanup; }
+      return shutdown();
+    };
+    const reuse = registry.getOrCreate(createInput()).then(
+      (session) => ({ session, error: null }),
+      (error: unknown) => ({ session: null, error }),
+    );
+    try {
+      await cleaning;
+      await registry.shutdown(NOTEBOOK);
+      const replacement = await registry.getOrCreate({ ...createInput(), interpreterPath: 'new-python', kernelSpecName: 'new-spec' });
+      complete();
+      expect(await reuse).toMatchObject({ session: null, error: { code: 'kernel_died' } });
+      expect(registry.listKernels().map((session) => session.kernelId)).toEqual([replacement.kernelId]);
+    } finally {
+      complete();
+      await reuse;
+      await registry.shutdownAll();
+    }
+  });
+
+  it.each([true, false])('[I9][I16] rejects a retired session after an in-flight liveness probe (alive=%s)', async (alive) => {
+    const sidecar = makeSidecar();
+    const registry = registryWith(sidecar);
+    const original = await registry.getOrCreate(createInput());
+    let entered!: () => void;
+    const probing = new Promise<void>((resolve) => { entered = resolve; });
+    let complete!: (status: KernelStatusResult) => void;
+    const result = new Promise<KernelStatusResult>((resolve) => { complete = resolve; });
+    sidecar.transport.statusQuery = () => { entered(); return result; };
+    const reuse = registry.getOrCreate(createInput()).then(
+      (session) => ({ session, error: null }),
+      (error: unknown) => ({ session: null, error }),
+    );
+    try {
+      await probing;
+      await registry.shutdown(NOTEBOOK);
+      const replacement = await registry.getOrCreate({ ...createInput(), interpreterPath: 'new-python', kernelSpecName: 'new-spec' });
+      complete({ alive, executionCount: 1, pid: 4242 });
+      expect(await reuse).toMatchObject({ session: null, error: { code: 'kernel_died' } });
+      expect(replacement.kernelId).not.toBe(original.kernelId);
+      expect(registry.listKernels().map((session) => session.kernelId)).toEqual([replacement.kernelId]);
+    } finally {
+      complete({ alive: true, executionCount: 1, pid: 4242 });
+      await reuse;
+      await registry.shutdownAll();
+    }
+  });
+
   it('recovers on the NEXT call when the dead session is still registered', async () => {
     const sidecar = makeSidecar();
     const registry = registryWith(sidecar);
