@@ -117,7 +117,7 @@ cell 选择器的端点必须是 notebook 范围内的安全整数，校验通�
 
 ## 运行、轮询与干净验证
 
-后台运行绑定 kernel 后即可查询其 ID；每个目标 cell 完成后，即使下一格仍在执行，也能查询该格结果。Replay 保持静默，未完成 cell 的输出不会作为已完成结果发布。输出在运行结束时写回；请检查 `write_back`，取消后还要等 `facts_pending` 变为 false，才能把写回信息视为最终事实。
+后台运行绑定 kernel 后即可查询其 ID；每个目标 cell 完成后，即使下一格仍在执行，也能查询该格结果。Replay 保持静默，未完成 cell 的输出不会作为已完成结果发布。输出在运行结束时写回；请检查 `write_back`，取消、关闭或重启后还要等 `facts_pending` 变为 false，才能把写回信息视为最终事实。
 
 频繁轮询时使用 `notebook_run_status(run_id='run-1', include_outputs='none')`。它保留运行状态、进度、已完成 cell 的索引与 `status`、写回等信息，将 `outputs` 数组置空，不返回图片、不写 artifact。省略该参数或指定 `'full'` 可获取完整结果，仍受现有输出预算约束。轻量轮询不会丢弃存储的完整结果；写回后也可以用 `notebook_read(cell_indexes=[...], include_outputs='full')` 单独读取需要的 cell。
 
@@ -137,7 +137,7 @@ cell 选择器的端点必须是 notebook 范围内的安全整数，校验通�
 
 `IPYNB_PYTHON` 与 `--python` 等价，都会覆盖 notebook 的 kernelspec；希望每个 notebook 使用自己的环境时，请移除该服务级覆盖项。若已找到的 kernelspec 指向不存在的解释器，或解释器缺少所需模块，回退前会通过 `kernelspec_mismatch` 说明被拒绝的解释器及原因。`kernel_spec_name` 表示请求的 spec；请检查 `interpreter_path`，必要时执行 `import sys; print(sys.executable)` 核对实际环境。服务不会安装或修复 Python 包。
 
-`notebook_kernel(action='restart', path=...)` 会重新读取 notebook 并解析解释器，因此修改 kernelspec 或修复此前的回退环境后，重启即可生效。没有现存 kernel 时会创建新 kernel，始终不会自动执行 cell。
+`notebook_kernel(action='restart', path=...)` 会重新读取 notebook 并解析解释器，因此修改 kernelspec 或修复此前的回退环境后，重启即可生效。旧 kernel 即使尚在启动，也会先关闭再替换。没有现存 kernel 时会创建新 kernel，始终不会自动执行 cell。
 
 ## 输出、图片与大数
 

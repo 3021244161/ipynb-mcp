@@ -56,6 +56,7 @@ export async function handleNotebookKernel(
       for (const runId of ctx.runStore.listRunningRunIds()) {
         const handle = ctx.runStore.get(runId);
         if (handle !== null && handle.notebookPath === absolutePath) {
+          handle.factsPending = true;
           handle.abortReason = 'kernel_died';
           handle.abortController.abort();
           // SPEC §4.8 rule 1: the run lands in its terminal state IMMEDIATELY

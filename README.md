@@ -117,7 +117,7 @@ With the defaults, a single-cell run is executed synchronously (its upper bound 
 
 ## Running, polling and clean validation
 
-Background status publishes the kernel ID once it is bound and each target cell's result once that cell has finished, even while a later cell is still running. Replay stays silent. Unfinished-cell output is not a completed checkpoint. Outputs are written back at the end of the run; inspect `write_back` and, after cancellation, wait until `facts_pending` is false before treating those facts as final.
+Background status publishes the kernel ID once it is bound and each target cell's result once that cell has finished, even while a later cell is still running. Replay stays silent. Unfinished-cell output is not a completed checkpoint. Outputs are written back at the end of the run; inspect `write_back` and, after cancellation, shutdown or restart, wait until `facts_pending` is false before treating those facts as final.
 
 For cheap repeated polling, call `notebook_run_status(run_id='run-1', include_outputs='none')`. It returns the existing run facts and completed-cell metadata, including each cell's `status` and index, with empty `outputs` arrays and no images or artifact writes. Omit `include_outputs`, or set it to `'full'`, to retrieve full results subject to the normal output budget. Cheap polling does not discard those stored results. After write-back you can also read individual cells with `notebook_read(cell_indexes=[...], include_outputs='full')`.
 
@@ -137,7 +137,7 @@ When a notebook needs a kernel, the interpreter is resolved by candidate chain: 
 
 `IPYNB_PYTHON` is the environment-variable equivalent of `--python`: either overrides the notebook's kernelspec for the server. Remove that override to let each notebook select its own environment. If a resolved kernelspec points to a missing interpreter or one missing required modules, `kernelspec_mismatch` now names the rejected interpreter and reason before fallback. `kernel_spec_name` identifies the requested spec; check `interpreter_path` and, when needed, run `import sys; print(sys.executable)` to verify the actual environment. The server does not install or repair Python packages.
 
-`notebook_kernel(action='restart', path=...)` re-reads the current notebook and resolves its interpreter again, so changing its kernelspec or repairing an earlier fallback takes effect on restart. With no existing kernel, restart creates a fresh one. It never executes cells automatically.
+`notebook_kernel(action='restart', path=...)` re-reads the current notebook and resolves its interpreter again, so changing its kernelspec or repairing an earlier fallback takes effect on restart. It retires the previous kernel even if that kernel is still starting. With no existing kernel, restart creates a fresh one. It never executes cells automatically.
 
 ## Outputs, images and large numbers
 
