@@ -1,5 +1,13 @@
 # COMPATIBILITY — 实测过的客户端与版本矩阵
 
+## 2026-10-16 — 0.1.3 发布验证
+
+Windows x64 / Node 26.7.0 / pnpm 11.7.0，使用既有专用测试 venv（Python 3.10.14、ipykernel 6.25.2、jupyter_client 8.3.1、nbformat 5.9.2）：最终生命周期修复后 **686/686 单测（38 文件）**、typecheck、lint、build、check:package（145 文件、23 个变异）通过；0.1.3 tarball 安装后的 **check:release 12/12** 通过，包含真实 stdio 和真实 kernel。
+
+原始 dev 提交另通过本机 **107/107 集成（14 文件，无跳过）** 与 **26/26 SDK stdio smoke**；最终发布提交的 Windows/Ubuntu 集成与跨平台单测以 [PR #9 的 CI 检查](https://github.com/3021244161/ipynb-mcp/pull/9/checks) 为准。新增 7 个确定性回归用例验证了启动/关闭/探测的竞态和终结期间的写回事实，逐项先红后绿，独立复核无剩余阻塞项。详细过程见 [0.1.3 发布审查](review/2026-10-16-0.1.3-release.md)。
+
+第三方 GUI 客户端 E1–E9 未执行；macOS 仍只在 CI 跑 unit，不跑 integration。未新增依赖或修改用户 Python 环境。
+
 ## 2026-10-15 — dev issue 修复本地验证
 
 Windows x64 / Node 26.7.0 / pnpm 11.7.0 / 既有测试虚拟环境：typecheck、lint、build、**679/679 单测（36 文件）**、**107/107 集成（14 文件，无跳过）**、**26/26 SDK stdio smoke** 全部通过；check:package 检查 145 文件并检出 23 个变异。新增覆盖后台中途查询、轻量轮询无图片落盘、取消半截结果、快照竞态、restart 重新选择 kernelspec 与实际 sys.executable、IPython 保守降级。四个守卫变异均触发断言失败并恢复，详见 [本轮记录](review/2026-10-15-github-issues.md)。
