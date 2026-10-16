@@ -1,6 +1,6 @@
 {
   "name": "ipynb-mcp-server",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "MCP server (stdio) for AI agents to safely read, edit and run local Jupyter notebooks \u2014 zero service, CAS-guarded edits, resumable execution.",
   "license": "MIT",
   "type": "module",

@@ -35,7 +35,7 @@ export const RUN_ARGUMENTS = [
 export const MAX_SELECTOR_LENGTH = 4096;
 
 export const notebookRunDescription =
-  "Execute notebook cells. mode='resume' runs only the target cells in the live kernel; 'replay' silently rebuilds state from cell 0 first; 'full' re-runs everything.";
+  "Execute notebook cells. mode='resume' runs only target cells in the live kernel; 'replay' silently rebuilds state from cell 0 first; 'full' runs all code cells without resetting a live kernel or its import cache. For clean validation, restart the kernel before full. Inspect executed[].status for cell failures; completed does not mean all cells succeeded.";
 
 export interface RunToolHooks {
   /** Progress notifications (client provided _meta.progressToken). */
@@ -217,6 +217,15 @@ async function executeBackgroundRun(
         logger: ctx.logger,
         realpath: ctx.realpath,
         platform: ctx.platform,
+        onKernelReady: (kernelId) => { handle.kernelId = kernelId; },
+        onCellCompleted: (snapshot) => {
+          handle.executed.push(snapshot.cell);
+          handle.replayedCellIndexes = snapshot.replayedCellIndexes;
+          handle.warnings = snapshot.warnings;
+          handle.imageBlocks = snapshot.imageBlocks;
+          handle.imageArtifacts = snapshot.imageArtifacts;
+          handle.progress.completed = handle.executed.length;
+        },
         onProgress: (event) => {
           if (event.phase === 'cell') {
             handle.progress = {

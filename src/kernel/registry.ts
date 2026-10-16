@@ -65,7 +65,11 @@ export class KernelRegistry {
   readonly #sessions = new Map<string, Session>(); // reuseKey -> session
   readonly #kernels = new Map<string, Session>(); // kernelId -> session
   readonly #transports = new Map<string, KernelTransport>(); // interpreter -> transport
-  readonly #starting = new Map<string, Promise<KernelSessionInfo>>(); // reuseKey -> in-flight start
+  readonly #starting = new Map<string, { notebookPath: string; promise: Promise<KernelSessionInfo> }>();
+  readonly #shuttingDown = new Map<string, Promise<void>>(); // normalized notebook path -> shutdown barrier
+  // A completed shutdown must still invalidate probes/cleanup that began in
+  // the previous lifecycle, after its active barrier has disappeared.
+  readonly #shutdownEpochs = new Map<string, number>();
   // Run-level locks keyed by NORMALIZED notebook path: a restart/fresh session
   // replaces the session object, so hanging the lock off the session let a
   // second run slip in with the first still in flight (review W5).
@@ -254,6 +258,12 @@ export class KernelRegistry {
      */
     knownAlive?: boolean;
   }): Promise<KernelSessionInfo> {
+    const notebookKey = this.#norm(input.notebookPath);
+    const shuttingDown = this.#shuttingDown.get(notebookKey);
+    if (shuttingDown !== undefined) {
+      await shuttingDown;
+    }
+    let shutdownEpoch = this.#shutdownEpochs.get(notebookKey) ?? 0;
     const key = this.#reuseKey(input.notebookPath, input.interpreterPath, input.kernelSpecName);
     const existing = this.#sessions.get(key);
     if (existing !== undefined) {
@@ -268,10 +278,18 @@ export class KernelRegistry {
         this.#logger?.warn(`dropped a session whose sidecar died: ${existing.kernelId}`);
       } else if (input.fresh === true) {
         await this.shutdown(input.notebookPath);
-      } else if (input.knownAlive ?? (await this.#probeKernel(existing))) {
-        existing.lastUsedAt = this.#now();
-        return this.#toInfo(existing);
+        shutdownEpoch = this.#shutdownEpochs.get(notebookKey) ?? 0;
       } else {
+        const alive = input.knownAlive ?? (await this.#probeKernel(existing));
+        if (this.#sessions.get(key) !== existing || this.#shuttingDown.has(notebookKey) || (this.#shutdownEpochs.get(notebookKey) ?? 0) !== shutdownEpoch) {
+          throw new IpynbError('kernel_died', 'kernel was shut down while its liveness was being checked', {
+            kernel_id: existing.kernelId,
+          });
+        }
+        if (alive) {
+          existing.lastUsedAt = this.#now();
+          return this.#toInfo(existing);
+        }
         // The kernel process itself is gone (OOM / external kill) and only the
         // sidecar outlived it. Reusing the session would fail the run ~5s later
         // (the sidecar's iopub poll is what first notices) instead of rebuilding
@@ -279,14 +297,22 @@ export class KernelRegistry {
         await this.#discardDeadKernel(existing);
       }
     }
+    // A liveness probe above can yield to shutdown. Do not register a new
+    // startup behind the barrier's snapshot of the kernels it must retire.
+    const shutdownAfterProbe = this.#shuttingDown.get(notebookKey);
+    if (shutdownAfterProbe !== undefined || (this.#shutdownEpochs.get(notebookKey) ?? 0) !== shutdownEpoch) {
+      throw new IpynbError('kernel_died', 'kernel was shut down while preparing its replacement', {
+        path: input.notebookPath,
+      });
+    }
     const inflight = this.#starting.get(key);
     if (inflight !== undefined) {
-      return inflight;
+      return inflight.promise;
     }
     const promise = this.#startNew(key, input).finally(() => {
       this.#starting.delete(key);
     });
-    this.#starting.set(key, promise);
+    this.#starting.set(key, { notebookPath: input.notebookPath, promise });
     return promise;
   }
 
@@ -501,10 +527,38 @@ export class KernelRegistry {
   }
 
   async shutdown(notebookPath: string): Promise<void> {
-    const session = this.#findSessionByNotebook(notebookPath);
-    if (session === null) {
-      return;
+    const notebookKey = this.#norm(notebookPath);
+    const existing = this.#shuttingDown.get(notebookKey);
+    if (existing !== undefined) {
+      return existing;
     }
+    this.#shutdownEpochs.set(notebookKey, (this.#shutdownEpochs.get(notebookKey) ?? 0) + 1);
+    const pending = this.#shutdownNotebook(notebookKey).finally(() => {
+      this.#shuttingDown.delete(notebookKey);
+    });
+    this.#shuttingDown.set(notebookKey, pending);
+    return pending;
+  }
+
+  async #shutdownNotebook(notebookKey: string): Promise<void> {
+    // A start is invisible to session lookup until the sidecar answers. Drain
+    // those starts before replacement, including ones using the old spec.
+    const starts = [...this.#starting.values()]
+      .filter((entry) => this.#norm(entry.notebookPath) === notebookKey)
+      .map((entry) => entry.promise);
+    for (const result of await Promise.allSettled(starts)) {
+      if (result.status === 'rejected') {
+        this.#logger?.warn(`kernel startup failed during shutdown: ${String(result.reason)}`);
+      }
+    }
+    const sessions = [...this.#sessions.values()]
+      .filter((session) => this.#norm(session.notebookPath) === notebookKey);
+    for (const session of sessions) {
+      await this.#shutdownSession(session);
+    }
+  }
+
+  async #shutdownSession(session: Session): Promise<void> {
     if (isTransportDead(session.transport)) {
       // Nothing to shut down: the sidecar that hosted this kernel is gone, so
       // the kernel is gone too. Treat it as cleaned up instead of turning a

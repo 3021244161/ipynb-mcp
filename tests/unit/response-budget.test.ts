@@ -11,6 +11,21 @@ import { IpynbError } from '../../src/core/errors.js';
 import { toCallToolResult } from '../../src/mcp/tools/result.js';
 
 describe('[U21b][U24] response budget boundaries', () => {
+  it('[U21b] keeps run facts when the truncation warning itself crosses the budget', () => {
+    const original = {
+      run_id: 'run-1', state: 'running', kernel_id: 'kernel-1',
+      progress: { completed: 1, total: 2, current_cell_index: 1 },
+      executed: [{ cell_index: 0, status: 'ok', outputs: Array.from({ length: 1000 }, () => ({ kind: 'stream', text: '路径\\name\n'.repeat(20) })) }],
+      warnings: [],
+    };
+    const result = enforceResponseBudget(original, 32_000);
+    expect(result.payload).toMatchObject({ progress: { completed: 1 }, executed: [{ cell_index: 0, status: 'ok' }] });
+    expect(result.payload).not.toHaveProperty('response_budget_exceeded');
+    expect(result.estimatedBytes).toBeLessThanOrEqual(32_000);
+    expect(result.warnings).toEqual([expect.objectContaining({ code: 'output_truncated' })]);
+    expect(original.executed[0]!.outputs).toHaveLength(1000);
+  });
+
   it.each(['\ud800', '\udfff', '\ud800\ud800', '\udfff\udfff'])('[U24] counts JSON escaping of unpaired surrogates: %j', (unit) => {
     const value = unit.repeat(1000);
     const serializedTwice = JSON.stringify(JSON.stringify(value));

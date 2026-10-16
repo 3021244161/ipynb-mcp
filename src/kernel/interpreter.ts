@@ -336,6 +336,13 @@ export async function resolveInterpreter(
         failed.push({ path: resolvedArgv0, reason: 'not found' });
       }
     }
+    const rejected = failed[failed.length - 1];
+    pushMismatch(
+      warnings,
+      rejected === undefined
+        ? `kernelspec '${specName}' has no usable executable; falling back through the interpreter candidate chain`
+        : `kernelspec '${specName}' interpreter '${rejected.path}' was rejected (${rejected.reason}); falling back through the interpreter candidate chain`,
+    );
   }
 
   // ---- candidate 3: notebook-dir .venv / venv -----------------------------

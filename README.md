@@ -115,9 +115,29 @@ Cell selector endpoints must be safe integers within the notebook before ranges 
 
 With the defaults, a single-cell run is executed synchronously (its upper bound is exactly the 10× cut-off); two or more cells, or a raised `--exec-timeout-seconds`, return a background `run_id` you poll with `notebook_run_status`. The multiplier is `DEVIATIONS.md` D-015.
 
+## Running, polling and clean validation
+
+Background status publishes the kernel ID once it is bound and each target cell's result once that cell has finished, even while a later cell is still running. Replay stays silent. Unfinished-cell output is not a completed checkpoint. Outputs are written back at the end of the run; inspect `write_back` and, after cancellation, shutdown or restart, wait until `facts_pending` is false before treating those facts as final.
+
+For cheap repeated polling, call `notebook_run_status(run_id='run-1', include_outputs='none')`. It returns the existing run facts and completed-cell metadata, including each cell's `status` and index, with empty `outputs` arrays and no images or artifact writes. Omit `include_outputs`, or set it to `'full'`, to retrieve full results subject to the normal output budget. Cheap polling does not discard those stored results. After write-back you can also read individual cells with `notebook_read(cell_indexes=[...], include_outputs='full')`.
+
+**Completion is not a success verdict.** `kind: 'completed'` / `state: 'completed'` means execution orchestration has ended. Python exceptions remain `executed[].status: 'error'` with their tracebacks, and do not turn the call into an MCP infrastructure error. Check every cell's status. A grading check that prints a failing score without raising an exception still has status `ok`; inspect its actual result separately.
+
+**`full` runs all code cells in the existing kernel.** It ignores `cell_selector` and preserves in-memory variables and Python's import cache. For clean validation:
+
+1. Call `notebook_kernel(action='restart', path='analysis.ipynb')`.
+2. Call `notebook_run(mode='full', path='analysis.ipynb')`.
+3. If a background `run_id` is returned, poll with `include_outputs='none'` until the run ends and `facts_pending` is false. Inspect failed cell indexes via `executed[].status`, then retrieve the outputs you need.
+
+Restart resets kernel memory, not files created by notebook code. Prepare those files explicitly if your validation requires it; the server does not delete them.
+
 ## Interpreter selection
 
 When a notebook needs a kernel, the interpreter is resolved by candidate chain: `--python` → the notebook's own `metadata.kernelspec` argv → `.venv`/`venv` next to the notebook → `python3`/`python` on PATH. Every failed candidate is recorded; only if all fail does the tool error (with a ready-to-run `pip install ipykernel` command — the server never installs anything itself). A `.venv` that disagrees with the kernelspec produces a `kernelspec_mismatch` warning; pass `--python` to pin one explicitly.
+
+`IPYNB_PYTHON` is the environment-variable equivalent of `--python`: either overrides the notebook's kernelspec for the server. Remove that override to let each notebook select its own environment. If a resolved kernelspec points to a missing interpreter or one missing required modules, `kernelspec_mismatch` now names the rejected interpreter and reason before fallback. `kernel_spec_name` identifies the requested spec; check `interpreter_path` and, when needed, run `import sys; print(sys.executable)` to verify the actual environment. The server does not install or repair Python packages.
+
+`notebook_kernel(action='restart', path=...)` re-reads the current notebook and resolves its interpreter again, so changing its kernelspec or repairing an earlier fallback takes effect on restart. It retires the previous kernel even if that kernel is still starting. With no existing kernel, restart creates a fresh one. It never executes cells automatically.
 
 ## Outputs, images and large numbers
 
@@ -128,6 +148,8 @@ An `include_outputs: 'full'` read projects every stored output into one of the `
 **Large integers in `application/json`.** nbformat puts no type constraint on a json value, and an integer JavaScript cannot represent exactly (anything past ±2^53, e.g. `2**64`) cannot survive a JSON number channel unchanged. Such a value is preserved byte-for-byte in the file — a read/write round trip no longer rounds it — and the response reports it rather than pretending: whenever that output is returned in full (a full-output read, or a run), the item carries a `warnings` array and the call-level `warnings[]` gains one entry — code `output_truncated`, which is already in SPEC §7's closed table — whose message contains the **exact digits**. `value` holds the nearest double, because that is what the JSON channel itself can carry and what any JSON client would parse; the digits you need are in the warning and in the file.
 
 ## Known limitations
+
+- **IPython syntax can degrade stale analysis.** A cell containing `!command`, `%magic` or `%%cell-magic` cannot be parsed by raw Python symtable, so the whole analysis uses regex with low confidence. Analysis never executes shell commands or installs packages. Static preprocessing requires conservative treatment of hidden magic effects; see [the follow-up design](docs/ISSUE_FOLLOWUPS.md#ipython-analysis-8).
 
 - **Execution is arbitrary code execution.** Point the root at directories you would let the agent write to; the fence is a path boundary, not a sandbox. Only run notebooks you can read.
 - **Stale analysis is Python-only.** Non-Python kernels (R, Julia…) work for read/edit/run but skip stale analysis (`method: "skipped"`). It also cannot see through `globals()`/`locals()`/`exec`/`eval`/`setattr`, attribute assignments (`obj.attr = 1`) or `import *`. When a cell fails to parse, the whole analysis degrades to a conservative regex pass (all confidences drop to `low`; the regex pass additionally misses tuple unpacking, annotated assignments, indented assignments and `with … as`, and may flag identifiers inside strings/comments).

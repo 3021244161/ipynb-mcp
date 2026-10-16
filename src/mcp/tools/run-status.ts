@@ -1,13 +1,14 @@
 // notebook_run_status / notebook_run_cancel tools (SPEC §4.8).
 
 import { IpynbError, type JsonValue } from '../../core/errors.js';
-import { rejectUnknownArguments, requireNonEmptyString, type ToolContext } from '../context.js';
+import { optionalEnum, rejectUnknownArguments, requireNonEmptyString, type ToolContext } from '../context.js';
 import { runTool, type ToolOutcome } from './result.js';
 
 /** Declared arguments (SPEC §4.8); anything else is a caller mistake (SEC-1). */
-export const RUN_STATUS_ARGUMENTS = ['run_id'] as const;
+export const RUN_STATUS_ARGUMENTS = ['run_id', 'include_outputs'] as const;
+export const RUN_CANCEL_ARGUMENTS = ['run_id'] as const;
 
-export const notebookRunStatusDescription = 'Poll a background notebook run started by notebook_run.';
+export const notebookRunStatusDescription = "Poll a background notebook run. include_outputs='none' returns cell status without outputs or images; 'full' (default) retrieves outputs. Check executed[].status: completed means orchestration ended, not that every cell succeeded.";
 export const notebookRunCancelDescription = 'Cancel a background notebook run started by notebook_run.';
 
 export async function handleRunStatus(
@@ -17,6 +18,7 @@ export async function handleRunStatus(
   return runTool(async () => {
     rejectUnknownArguments(args, RUN_STATUS_ARGUMENTS);
     const runId = requireNonEmptyString(args, 'run_id');
+    const includeOutputs = optionalEnum(args, 'include_outputs', ['none', 'full'] as const, 'full');
     const handle = ctx.runStore.get(runId);
     if (handle === null) {
       throw new IpynbError('run_not_found', `unknown run_id: ${runId}`, { run_id: runId });
@@ -30,7 +32,9 @@ export async function handleRunStatus(
         total: handle.progress.total,
         current_cell_index: handle.progress.currentCellIndex,
       },
-      executed: handle.executed,
+      // A completion may land while runTool yields before response formatting.
+      // Keep the cell list aligned with this snapshot's progress and images.
+      executed: includeOutputs === 'full' ? [...handle.executed] : handle.executed.map((cell) => ({ ...cell, outputs: [] })),
       replayed_cell_indexes: handle.replayedCellIndexes,
       stale_cells: handle.staleCells,
       stale_analysis: handle.staleAnalysis,
@@ -52,7 +56,11 @@ export async function handleRunStatus(
       error: handle.error,
       warnings: handle.warnings,
     };
-    return { payload: payload as JsonValue, imageBlocks: handle.imageBlocks, imageArtifacts: handle.imageArtifacts };
+    return {
+      payload: payload as JsonValue,
+      imageBlocks: includeOutputs === 'full' ? handle.imageBlocks : [],
+      imageArtifacts: includeOutputs === 'full' ? handle.imageArtifacts : [],
+    };
   });
 }
 
@@ -61,7 +69,7 @@ export async function handleRunCancel(
   args: Record<string, unknown>,
 ): Promise<ToolOutcome> {
   return runTool(async () => {
-    rejectUnknownArguments(args, RUN_STATUS_ARGUMENTS);
+    rejectUnknownArguments(args, RUN_CANCEL_ARGUMENTS);
     const runId = requireNonEmptyString(args, 'run_id');
     const handle = ctx.runStore.get(runId);
     if (handle === null) {
