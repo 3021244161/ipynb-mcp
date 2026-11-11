@@ -120,12 +120,13 @@ export function findExportBrowser(
   } else if (platform === 'darwin') {
     candidates.push('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge');
   }
-  const names = platform === 'win32' ? ['chrome.exe', 'msedge.exe', 'chromium.exe'] : ['chromium', 'chromium-browser', 'google-chrome', 'google-chrome-stable', 'microsoft-edge'];
-  for (const dir of (env['PATH'] ?? '').split(platform === 'win32' ? ';' : ':')) {
-    if (dir !== '') {
-      for (const name of names) {
-        candidates.push(path.join(dir, name));
-      }
+  // Ubuntu can deny the namespace sandbox to standalone Chromium snapshots.
+  // Prefer installed Chrome/Edge across PATH before trying those builds.
+  const names = platform === 'win32' ? ['chrome.exe', 'msedge.exe', 'chromium.exe'] : ['google-chrome', 'google-chrome-stable', 'microsoft-edge', 'chromium', 'chromium-browser'];
+  const directories = (env['PATH'] ?? '').split(platform === 'win32' ? ';' : ':').filter((dir) => dir !== '');
+  for (const name of names) {
+    for (const dir of directories) {
+      candidates.push(path.join(dir, name));
     }
   }
   const found = candidates.find(exists);

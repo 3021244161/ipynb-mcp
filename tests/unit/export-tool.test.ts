@@ -142,3 +142,13 @@ it('[EXPORT][U27] describes a missing browser without spawning processes or retu
   const result = toCallToolResult({ payload: { output_path: '/report.html', format: 'html', warnings: [] } });
   expect(result.content).toHaveLength(1);
 });
+
+it.each([
+  { browsers: [['/snapshot/bin', 'chromium'], ['/system/bin', 'google-chrome']], selected: ['/system/bin', 'google-chrome'] },
+  { browsers: [['/snapshot/bin', 'chromium'], ['/system/bin', 'microsoft-edge']], selected: ['/system/bin', 'microsoft-edge'] },
+  { browsers: [['/snapshot/bin', 'chromium']], selected: ['/snapshot/bin', 'chromium'] },
+  { browsers: [['/system/bin', 'google-chrome-stable']], selected: ['/system/bin', 'google-chrome-stable'] },
+])('[EXPORT][U27] prefers installed Chrome/Edge over snapshot Chromium and preserves fallback: %j', ({ browsers, selected }) => {
+  const available = browsers.map((parts) => path.join(...parts));
+  expect(findExportBrowser('linux', { PATH: '/snapshot/bin:/system/bin' }, (target) => available.includes(target))).toBe(path.join(...selected));
+});

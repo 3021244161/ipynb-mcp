@@ -165,7 +165,7 @@ cell 选择器的端点必须是 notebook 范围内的安全整数，校验通�
 
 结果含 `output_path`、`format`、`bytes`、`cell_count`、`include_source`、源文件 `content_hash` 与 `warnings`；不向模型发送文档正文或图片 base64。即使设置 `--allow-outside-root`，导出的输入、输出及临时文件仍限制在 root 内。只读模式拒绝导出，源 notebook 永不作为覆盖目标。
 
-HTML 为独立文件，无需浏览器或 Python。PDF/PNG 使用本机已安装的 Chrome、Edge 或 Chromium，在标准安装目录或 PATH 中查找，不安装或下载依赖。每次使用独立临时浏览器配置，进程树停止后清理；支持取消，渲染超时为 60 秒。
+HTML 为独立文件，无需浏览器或 Python。PDF/PNG 使用本机已安装的 Chrome、Edge 或 Chromium，在标准安装目录或 PATH 中查找；优先选择已安装的 Chrome/Edge，再回退到独立 Chromium 构建，后者在 Ubuntu 上可能缺少可用沙箱。不安装或下载依赖。每次使用独立临时浏览器配置，进程树停止后清理；支持取消，渲染超时为 60 秒。
 
 支持常用 Markdown 标题、列表、代码围栏、链接、表格，已保存的 PNG/JPEG/SVG 图片、Markdown 附件、静态 HTML 表格、文本流、异常和 JSON。HTML 输出只保留受限的静态标签，原样式与活动内容会移除。脚本、widget、外部或本地图片引用及外部资源不加载；图片缺失或输出不支持时返回警告。不排版数学/LaTeX 及复杂 Markdown 扩展。PNG 上限为 16384 × 32767 且不超过 6400 万像素；更长的 notebook 请用 PDF 或 HTML。导出反映磁盘上已保存的输出，运行尚未写回时可能不是最新结果。
 

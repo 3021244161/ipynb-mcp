@@ -11,6 +11,7 @@ import { exportContext } from '../fixtures/export.js';
 let browser: string | undefined;
 try {
   browser = findExportBrowser();
+  process.stderr.write(`export browser tests use: ${browser}\n`);
 } catch (cause) {
   process.stderr.write(`export browser tests unavailable: ${cause instanceof Error ? cause.message : String(cause)}\n`);
 }

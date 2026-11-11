@@ -17,6 +17,8 @@ GitHub 远端检查连续两次失败：常规 fetch 与临时 `http.proxy=` 覆
 
 2026-11-11 导出验证环境记录：首次 PDF/PNG 实测及进一步错误详情核实均遇到 Chrome 提前退出。仅加载 about:blank 的独立诊断确认 GPU 子进程反复以 -1073741790（访问被拒绝）退出，随后浏览器报告 GPU process isn't usable。根因为当前 Windows 执行沙箱限制浏览器子进程启动，并非 notebook 内容或 CDP 协议错误。后续通过需审批的宿主执行通道验证；不添加 --no-sandbox，不修改全局隔离或用户浏览器配置。
 
+2026-11-11 PR #10 CI 排障（D-073 实现修正，无新增设计偏离）：[首轮 CI](https://github.com/3021244161/ipynb-mcp/actions/runs/42979101122) 的两个 Ubuntu 26.04 集成任务均在浏览器启动阶段失败，其余七个任务通过。自动发现将 Chromium 排在 Chrome/Edge 之前；[该 runner 的安装脚本](https://github.com/actions/runner-images/blob/ubuntu26/20261101.186/images/ubuntu/scripts/build/install-google-chrome.sh) 将独立 Chromium snapshot 链接到 /usr/bin/chromium，同时另装系统 Chrome。结合 [Chromium 的 AppArmor 说明](https://chromium.googlesource.com/chromium/src/+/main/docs/security/apparmor-userns-restrictions.md)，判断是选中了缺少对应沙箱支持的独立构建。修复为跨 PATH 目录优先发现 Chrome/Edge，再回退 Chromium；新增四项选择顺序/回退回归，其中 Chrome、Edge 优先用例在原实现先红。集成测试记录选中的可执行文件供后续核验；不跳过失败用例，不更改 runner 安全策略，不添加 --no-sandbox。
+
 | # | 日期 | SPEC 位置 | 偏离内容 | 理由 | 影响面 | 状态 |
 |---|---|---|---|---|---|---|
 | D-001 | 2026-10-02 | §5.1 `--backup-keep` / §5.9 | SPEC 未定义 `backup_keep=0` 的语义（"超过 backup_keep 时删除最旧的"在 0 时与"生成备份"自相矛盾）。实现取：`keep=0` 时**不创建备份**，返回 `backup_path: null`。 | 创建后立即删除是无意义的额外 I/O；"保留 0 份"的直译结果等价于"不备份"。 | 仅影响 `--backup-keep 0` 配置；默认 10 不受影响。 | 已实现（src/fs/backup.ts） |
