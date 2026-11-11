@@ -4,6 +4,9 @@
 
 ## Unreleased
 
+- 新增 `notebook_export`：将已保存的 notebook 内容导出为独立 HTML、A4 PDF 或整页 PNG，可隐藏代码并指定目标路径；默认禁止覆盖，不执行 cell、不修改源文件。
+- HTML 导出不依赖 Python 或浏览器；PDF/PNG 使用本机 Chrome/Edge/Chromium，不新增包依赖；导出路径限制在 root 内，支持取消、超时及临时进程与文件清理。
+
 ## [0.1.3] — 运行状态与解释器修复（2026-10-16）
 
 - #3：restart 重新读取 notebook 并解析当前 kernelspec，不再复用旧解释器；没有 kernel 时正常新建。不可用的 spec 解释器回退时，通过现有 `kernelspec_mismatch` 说明路径与拒绝原因；显式解释器优先级不变。

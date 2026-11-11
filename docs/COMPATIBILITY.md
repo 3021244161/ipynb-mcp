@@ -1,5 +1,11 @@
 # COMPATIBILITY — 实测过的客户端与版本矩阵
 
+## 2026-11-11 — 静态导出功能（dev，未发布）
+
+Windows x64 / Node 26.7.0 / pnpm 11.7.0 / 本机 Chrome 156.0.8078.80：typecheck、lint、build、离线 check:package（161 文件、23 个变异）通过；完整单测 **705/705（40 文件）**，新增导出和工具形状回归 **28/28**，真实浏览器导出 **5/5**，fixture 合规性 **3/3**，真实 SDK stdio smoke **27/27** 通过。浏览器用例覆盖 PDF、1200 像素宽长 PNG、保存的 SVG 输出、取消/超时回收进程及超大 PNG 拒绝；外部 nbformat validator 校验了新增的混合输出 fixture。Poppler 识别样例为无 JavaScript 的三页 A4 PDF，逐页与长图视觉检查确认中文、表格、SVG 图表、长文本和异常输出完整。
+
+执行环境：普通 Windows 沙箱阻止 Chrome 子进程启动，实际浏览器及进程清理测试通过需审批的宿主执行通道完成，未关闭浏览器沙箱。完整单测首次受默认 Python 相对路径与启动超时影响，显式指定 Python 绝对路径及独立测试 venv 后全绿；未安装 Python/npm 依赖。Linux/macOS、Edge/Chromium 及第三方 GUI 客户端本轮未实测；macOS 既有 CI 仍只运行 unit。
+
 ## 2026-10-16 — 0.1.3 发布验证
 
 Windows x64 / Node 26.7.0 / pnpm 11.7.0，使用既有专用测试 venv（Python 3.10.14、ipykernel 6.25.2、jupyter_client 8.3.1、nbformat 5.9.2）：最终生命周期修复后 **686/686 单测（38 文件）**、typecheck、lint、build、check:package（145 文件、23 个变异）通过；0.1.3 tarball 安装后的 **check:release 12/12** 通过，包含真实 stdio 和真实 kernel。

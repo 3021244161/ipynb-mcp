@@ -1,4 +1,4 @@
-// MCP server assembly (SPEC §4.2, §4.6): six tools, single-text-block
+// MCP server assembly (SPEC §4.2, §4.6, D-073): seven tools, single-text-block
 // results (D24), progress notifications when the client sends a
 // progressToken, IpynbError -> isError mapping, read-only guards (D18).
 
@@ -22,6 +22,7 @@ import {
   notebookRunStatusDescription,
 } from './mcp/tools/run-status.js';
 import { handleNotebookKernel, notebookKernelDescription } from './mcp/tools/kernel.js';
+import { handleNotebookExport, notebookExportDescription } from './mcp/tools/export.js';
 
 type Extra = RequestHandlerExtra<ServerRequest, ServerNotification>;
 
@@ -252,6 +253,24 @@ export function createServer(ctx: ToolContext): McpServer {
     wrap((args) => {
       // read-only mode only allows action 'status'; enforced in the handler.
       return handleNotebookKernel(ctx, args);
+    }),
+  );
+
+  server.registerTool(
+    'notebook_export',
+    {
+      description: notebookExportDescription,
+      inputSchema: strict({
+        path: z.string().describe('Notebook path (absolute, or relative to the server root)'),
+        format: z.string().describe("Export format: 'html' | 'pdf' | 'png'"),
+        output_path: z.string().optional().describe('Destination inside root; parent directory must exist. Default: notebook basename with the export extension'),
+        include_source: z.boolean().optional().describe('Include code cell source. Default true; Markdown and saved outputs are always included'),
+        overwrite: z.boolean().optional().describe('Replace an existing export file. Default false; never replaces the source notebook'),
+      }),
+    },
+    wrap((args, extra) => {
+      assertWritableAllowed(ctx, 'notebook_export', true);
+      return handleNotebookExport(ctx, args, extra.signal);
     }),
   );
 

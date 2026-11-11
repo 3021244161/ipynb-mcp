@@ -147,6 +147,28 @@ An `include_outputs: 'full'` read projects every stored output into one of the `
 
 **Large integers in `application/json`.** nbformat puts no type constraint on a json value, and an integer JavaScript cannot represent exactly (anything past ±2^53, e.g. `2**64`) cannot survive a JSON number channel unchanged. Such a value is preserved byte-for-byte in the file — a read/write round trip no longer rounds it — and the response reports it rather than pretending: whenever that output is returned in full (a full-output read, or a run), the item carries a `warnings` array and the call-level `warnings[]` gains one entry — code `output_truncated`, which is already in SPEC §7's closed table — whose message contains the **exact digits**. `value` holds the nearest double, because that is what the JSON channel itself can carry and what any JSON client would parse; the digits you need are in the warning and in the file.
 
+## Export to HTML, PDF or PNG
+
+Use `notebook_export` to save the notebook's existing Markdown, code and outputs without executing any cells:
+
+```json
+{"path":"analysis.ipynb","format":"pdf"}
+```
+
+`format` is required: `html`, `pdf` (A4 pages), or `png` (one full-page image, 1200 CSS pixels wide). Optional parameters:
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `output_path` | Notebook basename with the export extension | Absolute path or path relative to root; the parent directory must exist and the extension must match `format` |
+| `include_source` | `true` | Include code cell source; `false` keeps Markdown and saved outputs |
+| `overwrite` | `false` | Explicitly permit replacing an existing export file |
+
+The result contains `output_path`, `format`, `bytes`, `cell_count`, `include_source`, the source `content_hash`, and `warnings`; it never sends the document or image base64 to the model. Export always confines input, output and temporary files to root, including when `--allow-outside-root` is set. It refuses read-only mode and never overwrites the source notebook.
+
+HTML is self-contained and needs no browser or Python. PDF/PNG use a locally installed Chrome, Edge or Chromium, discovered in standard installation directories or PATH. Discovery prefers installed Chrome/Edge over standalone Chromium builds, which can lack a usable sandbox on Ubuntu. Nothing is installed or downloaded. Each render uses a temporary browser profile that is removed after the browser process tree stops. Rendering observes cancellation and a 60-second timeout.
+
+Exports support common Markdown headings, lists, fenced code, links and tables, stored PNG/JPEG/SVG images, Markdown attachments, static HTML tables, streams, errors and JSON. HTML outputs are rebuilt with a limited set of static tags; original styling and active content are removed. Scripts, widgets, external/local image references and external resources are omitted; missing images or unsupported outputs produce a warning. Math/LaTeX and advanced Markdown extensions are not typeset. PNG is limited to 16384 × 32767 and 64 million pixels; use PDF or HTML for longer notebooks. Export reflects saved outputs, which may be stale or incomplete if a run has not written them back yet.
+
 ## Known limitations
 
 - **IPython syntax can degrade stale analysis.** A cell containing `!command`, `%magic` or `%%cell-magic` cannot be parsed by raw Python symtable, so the whole analysis uses regex with low confidence. Analysis never executes shell commands or installs packages. Static preprocessing requires conservative treatment of hidden magic effects; see [the follow-up design](docs/ISSUE_FOLLOWUPS.md#ipython-analysis-8).
@@ -168,7 +190,7 @@ An `include_outputs: 'full'` read projects every stored output into one of the `
 - **Byte-level fidelity is logical, not literal.** Serialization normalizes `\uXXXX` escapes and number *spellings*, so untouched regions of a heavily-escaped notebook may show file-level diffs. **What is preserved is every value**: `100.0` may come back as `100`, `2.0` as `2`, `1e-05` as `0.00001` — the same number, and the same is true of Python's own `json.dumps` output, which is where most of these spellings come from. What is *not* tolerated is a changed value: a number JavaScript cannot hold is written back as the literal that was there, with a warning naming the exact digits (see "Outputs, images and large numbers" above), and the same is true of literals that overflow (`1e400`) or underflow (`1e-400`) a double. Rolling backups (`<name>.<timestamp>.ipynb.bak`) cover the rest.
 - **An unknown tool argument is an error, not a silent default.** Sending `cell_selector` to `notebook_read` (whose argument is `cell_indexes`) fails with `invalid_arguments` instead of quietly reading the whole notebook.
 - **A write racing another program's write is retried, then reported.** On Windows the OS reports "another process holds this file" and "two renames collided" identically; the transient case is retried for about 0.75 s before `notebook_locked` is returned, so a momentary collision no longer looks like a locked file (D-035).
-- **No auto-creation** of notebooks, no format conversion, no collaboration features.
+- **No auto-creation** of notebooks, no notebook-to-script conversion, no collaboration features.
 
 ## Differences from the obvious alternatives
 
@@ -187,7 +209,7 @@ pnpm check:package                                 # what `npm pack` would ship
 pnpm build
 ```
 
-`pnpm lint` is more than a linter: it also runs the zero-dependency checkers `scripts/check-format.mjs` (tabs, trailing whitespace), `scripts/check-indent.mjs` (block structure, via the TypeScript parser) and `scripts/check-docs.mjs`, which keeps the documentation invariants honest (one `docs/DEVIATIONS.md` with unique, gap-free entry ids, and `docs/OPEN_QUESTIONS.md` still a verbatim copy of SPEC §12). `pnpm smoke` starts the built server as a real stdio process, drives it with the SDK's own client, and checks the end-to-end behaviours the unit suite cannot reach — 26 checks today, including a run and a read of a notebook holding a `data:` URL image (the shape that used to fail the whole `tools/call`), a timeout, a background run, and Python's own `nbformat.validate` on the file it wrote. `pnpm check:package` asserts the shape of the shipped package (no compiled Python, no sources, no test files, no scratch scripts) and proves its own judgment with a resident mutation matrix. Before publishing, `pnpm check:release` packs the tarball, installs it into an empty directory and drives the INSTALLED binary over real stdio (six tools, a real kernel, a real execution, clean exit) — the one step a release can get wrong while every repository gate stays green.
+`pnpm lint` is more than a linter: it also runs the zero-dependency checkers `scripts/check-format.mjs` (tabs, trailing whitespace), `scripts/check-indent.mjs` (block structure, via the TypeScript parser) and `scripts/check-docs.mjs`, which keeps the documentation invariants honest (one `docs/DEVIATIONS.md` with unique, gap-free entry ids, and `docs/OPEN_QUESTIONS.md` still a verbatim copy of SPEC §12). `pnpm smoke` starts the built server as a real stdio process, drives it with the SDK's own client, and checks the end-to-end behaviours the unit suite cannot reach — 27 checks today, including a run and a read of a notebook holding a `data:` URL image (the shape that used to fail the whole `tools/call`), a timeout, a background run, and Python's own `nbformat.validate` on the file it wrote. `pnpm check:package` asserts the shape of the shipped package (no compiled Python, no sources, no test files, no scratch scripts) and proves its own judgment with a resident mutation matrix. Before publishing, `pnpm check:release` packs the tarball, installs it into an empty directory and drives the INSTALLED binary over real stdio (seven tools, a real kernel, a real execution, clean exit) — the one step a release can get wrong while every repository gate stays green.
 
 The unit and integration suites share one dedicated venv **in the system temp directory** (never in the repository; override the location with `IPYNB_TEST_VENV`) and never touch your interpreters. The unit suite uses it too, because its analyzer cases start a real sidecar — which is also why both suites run their files serially. Set `IPYNB_TEST_PYTHON` to a base interpreter that already has `ipykernel`. A venv this suite did not create is never deleted, and one it cannot use is removed only when it created it.
 

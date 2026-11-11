@@ -3,7 +3,7 @@
 //
 // `pnpm smoke` runs `lib/` from the repository. This script does what a user does instead:
 // `npm pack`, install the tarball into an empty directory, and talk to the installed binary
-// with real JSON-RPC — six tools, a real kernel, a real execution. That is the one step a
+// with real JSON-RPC — seven tools, a real kernel, a real execution. That is the one step a
 // release can get wrong while every repository gate stays green (a file missing from `files`,
 // a `bin` path that does not survive packing, a dependency that is only a devDependency).
 //
@@ -158,13 +158,14 @@ try {
   const names = (tools.result?.tools ?? []).map((tool) => tool.name).sort();
   const expected = [
     'notebook_edit',
+    'notebook_export',
     'notebook_kernel',
     'notebook_read',
     'notebook_run',
     'notebook_run_cancel',
     'notebook_run_status',
   ];
-  check('six tools, exact names', JSON.stringify(names) === JSON.stringify(expected), JSON.stringify(names));
+  check('seven tools, exact names', JSON.stringify(names) === JSON.stringify(expected), JSON.stringify(names));
   check(
     'no tool declares structuredContent/outputSchema',
     (tools.result?.tools ?? []).every((tool) => tool.outputSchema === undefined),
@@ -180,6 +181,16 @@ try {
   check('read returns the notebook', readBody.cell_count === 2, JSON.stringify(readBody).slice(0, 160));
   check('read payload has exactly one text block', (read.result?.content ?? []).length === 1);
   check('no image block without images', (read.result?.content ?? []).every((block) => block.type === 'text'));
+
+  const beforeExport = readFileSync(notebook, 'utf8');
+  const exported = await request('tools/call', {
+    name: 'notebook_export', arguments: { path: notebook, format: 'html' },
+  });
+  const exportBody = JSON.parse(textOf(exported));
+  check('installed package exports HTML without changing the notebook',
+    exportBody.format === 'html' && typeof exportBody.output_path === 'string' &&
+      readFileSync(exportBody.output_path, 'utf8').includes('<!doctype html>') &&
+      readFileSync(notebook, 'utf8') === beforeExport);
 
   const run = await request('tools/call', {
     name: 'notebook_run',
