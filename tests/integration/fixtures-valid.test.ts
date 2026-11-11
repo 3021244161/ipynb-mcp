@@ -35,6 +35,7 @@ import { parseNotebook, findStructuralProblem } from '../../src/core/parse.js';
 import { hasher } from '../../src/hash.js';
 import { nbformatAvailable, nbformatSkipReason, validateNotebook } from './nbformat-validator.js';
 import { TEST_VENV_PY } from './test-venv.js';
+import { exportFixture } from '../fixtures/export.js';
 
 /**
  * Representative notebook literals: the shapes the write paths must be able to
@@ -42,6 +43,7 @@ import { TEST_VENV_PY } from './test-venv.js';
  * the header for what the second layer covers.
  */
 const FIXTURES: ReadonlyArray<{ name: string; notebook: unknown }> = [
+  { name: 'static-export-mixed-output', notebook: exportFixture() },
   {
     name: 'code-cell-with-stream-output',
     notebook: {

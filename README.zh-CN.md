@@ -147,6 +147,28 @@ cell 选择器的端点必须是 notebook 范围内的安全整数，校验通�
 
 **`application/json` 里的大整数。** nbformat 对 json 取值不做类型约束，而 JavaScript 无法精确表示的整数（超出 ±2^53，例如 `2**64`）无法原样穿过 JSON number 通道。这类值在文件里**逐字节保留**（一次读-写往返不再把它四舍五入），响应也会如实报告而不是假装无事：每当该输出被完整返回（完整输出读取或执行），该项会带 `warnings` 数组，调用级 `warnings[]` 也会增加一条——code 为 `output_truncated`（它本来就在 SPEC §7 的封闭码表里）——其 message 含**精确数字**。`value` 字段存的是最接近的 double，因为那正是 JSON 通道本身能承载、任何 JSON 客户端都会解析出来的东西；你需要的数字在 warning 里，也在文件里。
 
+## 导出 HTML、PDF 或 PNG
+
+使用 `notebook_export` 导出 notebook 已保存的 Markdown、代码和输出，不执行任何 cell：
+
+```json
+{"path":"analysis.ipynb","format":"pdf"}
+```
+
+必填 `format`：`html`、`pdf`（A4 分页）或 `png`（整页长图，宽 1200 CSS 像素）。可选参数：
+
+| 参数 | 默认 | 含义 |
+|---|---|---|
+| `output_path` | notebook 同名并替换为导出扩展名 | 绝对路径或相对 root 的路径；父目录须已存在，扩展名须匹配 format |
+| `include_source` | `true` | 是否包含代码 cell 的源码；false 仍保留 Markdown 和已保存输出 |
+| `overwrite` | `false` | 显式允许覆盖已有导出文件 |
+
+结果含 `output_path`、`format`、`bytes`、`cell_count`、`include_source`、源文件 `content_hash` 与 `warnings`；不向模型发送文档正文或图片 base64。即使设置 `--allow-outside-root`，导出的输入、输出及临时文件仍限制在 root 内。只读模式拒绝导出，源 notebook 永不作为覆盖目标。
+
+HTML 为独立文件，无需浏览器或 Python。PDF/PNG 使用本机已安装的 Chrome、Edge 或 Chromium，在标准安装目录或 PATH 中查找，不安装或下载依赖。每次使用独立临时浏览器配置，进程树停止后清理；支持取消，渲染超时为 60 秒。
+
+支持常用 Markdown 标题、列表、代码围栏、链接、表格，已保存的 PNG/JPEG/SVG 图片、Markdown 附件、静态 HTML 表格、文本流、异常和 JSON。HTML 输出只保留受限的静态标签，原样式与活动内容会移除。脚本、widget、外部或本地图片引用及外部资源不加载；图片缺失或输出不支持时返回警告。不排版数学/LaTeX 及复杂 Markdown 扩展。PNG 上限为 16384 × 32767 且不超过 6400 万像素；更长的 notebook 请用 PDF 或 HTML。导出反映磁盘上已保存的输出，运行尚未写回时可能不是最新结果。
+
 ## 已知限制
 
 - **IPython 语法会导致 stale 分析降级。** 含 `!command`、`%magic` 或 `%%cell-magic` 的 cell 无法被原始 Python symtable 解析，因此整轮分析退回低置信度 regex。分析不会执行 shell 命令或安装包。静态预处理还需保守处理 magic 的隐藏影响，后续方案见 [设计记录](docs/ISSUE_FOLLOWUPS.md#ipython-analysis-8)。
@@ -168,7 +190,7 @@ cell 选择器的端点必须是 notebook 范围内的安全整数，校验通�
 - **字节级保真度是"逻辑上的"，不是"字面上的"。** 序列化会规范化 `\uXXXX` 转义与数字的**拼写**，所以一份大量使用转义的 notebook，在未被触碰的区域也可能出现文件级 diff。**被保留下来的是每一个值**：`100.0` 可能回来变成 `100`，`2.0` 变成 `2`，`1e-05` 变成 `0.00001`——同一个数；Python 自己的 `json.dumps` 输出也是这样，而这些拼写大多来自它。**不被容忍**的是值被改动：JavaScript 拿不住的数字会以文件里原本的字面量写回，并附一条点出精确数字的警告（见上文"输出、图片与大数"）；溢出（`1e400`）或下溢（`1e-400`）double 的字面量同理。其余情况由滚动备份（`<名字>.<时间戳>.ipynb.bak`）兜底。
 - **未知的工具参数会报错，而不是静默取默认。** 往 `notebook_read`（它的参数是 `cell_indexes`）传 `cell_selector` 会以 `invalid_arguments` 失败，而不是悄悄把整个 notebook 读一遍。
 - **与其他程序写入相撞时：先重试，再报告。** 在 Windows 上，操作系统把"另一个进程持有此文件"与"两次 rename 撞车"报成同一回事；瞬时情形会重试约 0.75 秒后才返回 `notebook_locked`，所以一次瞬时碰撞不再看起来像"文件被锁"（D-035）。
-- **不自动创建** notebook、不做格式转换、没有协作功能。
+- **不自动创建** notebook、不做 notebook 与脚本间转换、没有协作功能。
 
 ## 与显而易见的替代方案的区别
 
@@ -187,7 +209,7 @@ pnpm check:package                                 # 看 `npm pack` 会发出去
 pnpm build
 ```
 
-`pnpm lint` 不只是 linter：它还会跑三个零依赖检查器——`scripts/check-format.mjs`（制表符、行尾空白）、`scripts/check-indent.mjs`（块结构，走 TypeScript 解析器）与 `scripts/check-docs.mjs`，后者守住文档不变量（`docs/DEVIATIONS.md` 的条目 id 唯一且无空号，`docs/OPEN_QUESTIONS.md` 仍是 SPEC §12 的逐字副本）。`pnpm smoke` 会把构建产物作为真实 stdio 进程启动，用 SDK 自带的客户端驱动它，检查单元测试够不到的端到端行为——目前 26 项，包括运行与读取一个存放 `data:` URL 图片的 notebook（这个形态过去会让整个 `tools/call` 失败）、一次超时、一次后台运行，以及用 Python 自己的 `nbformat.validate` 校验它写出的文件。`pnpm check:package` 断言发布包的形状（不含编译后的 Python、不含源码、不含测试文件、不含临时脚本），并用一套常驻的变异矩阵证明它自己的判断力。发布之前，`pnpm check:release` 会打包 tarball、装进空目录，并用真实 stdio 驱动**装好的**二进制（六个工具、一个真 kernel、一次真执行、干净退出）——这是"所有仓库门禁都绿、发布却仍可能搞砸"的那一步。
+`pnpm lint` 不只是 linter：它还会跑三个零依赖检查器——`scripts/check-format.mjs`（制表符、行尾空白）、`scripts/check-indent.mjs`（块结构，走 TypeScript 解析器）与 `scripts/check-docs.mjs`，后者守住文档不变量（`docs/DEVIATIONS.md` 的条目 id 唯一且无空号，`docs/OPEN_QUESTIONS.md` 仍是 SPEC §12 的逐字副本）。`pnpm smoke` 会把构建产物作为真实 stdio 进程启动，用 SDK 自带的客户端驱动它，检查单元测试够不到的端到端行为——目前 27 项，包括运行与读取一个存放 `data:` URL 图片的 notebook（这个形态过去会让整个 `tools/call` 失败）、一次超时、一次后台运行，以及用 Python 自己的 `nbformat.validate` 校验它写出的文件。`pnpm check:package` 断言发布包的形状（不含编译后的 Python、不含源码、不含测试文件、不含临时脚本），并用一套常驻的变异矩阵证明它自己的判断力。发布之前，`pnpm check:release` 会打包 tarball、装进空目录，并用真实 stdio 驱动**装好的**二进制（七个工具、一个真 kernel、一次真执行、干净退出）——这是"所有仓库门禁都绿、发布却仍可能搞砸"的那一步。
 
 单元与集成测试共用**系统临时目录**里一个专用 venv（绝不在仓库内；用 `IPYNB_TEST_VENV` 可改位置），并且永不触碰你自己的解释器。单元测试也用它，因为它的分析器用例会启动真实 sidecar——这也是两个套件都串行跑文件的原因。把 `IPYNB_TEST_PYTHON` 指向一个已装 `ipykernel` 的基础解释器即可。不是本套件创建的 venv 永不被删除；它用不了的 venv，也只有在本套件创建时才被移除。
 

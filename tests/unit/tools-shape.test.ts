@@ -86,7 +86,7 @@ function assertSingleTextBlock(result: ShapeResult): string {
   return text;
 }
 
-describe('[step9][U24] response shape across all six tools', () => {
+describe('[step9][U24] response shape across all seven tools', () => {
   it('every tool answers with exactly one JSON text block', async () => {
     const nb = path.join(workspace, 'shape.ipynb');
     await writeFile(nb, JSON.stringify({
@@ -132,13 +132,19 @@ describe('[step9][U24] response shape across all six tools', () => {
     const kernel = await callTool('notebook_kernel', { action: 'status' });
     const kernelText = assertSingleTextBlock(kernel);
     expect(JSON.parse(kernelText)['kernels']).toEqual([]);
+
+    const exported = await callTool('notebook_export', { path: nb, format: 'html' });
+    const exportText = assertSingleTextBlock(exported);
+    expect(exported.isError).toBeUndefined();
+    expect(JSON.parse(exportText)['format']).toBe('html');
   }, 120_000);
 
   it('declares no outputSchema for any tool', async () => {
     const tools = await client.listTools();
-    expect(tools.tools).toHaveLength(6);
+    expect(tools.tools).toHaveLength(7);
     expect(tools.tools.map((tool) => tool.name).sort()).toEqual([
       'notebook_edit',
+      'notebook_export',
       'notebook_kernel',
       'notebook_read',
       'notebook_run',

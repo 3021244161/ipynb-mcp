@@ -196,7 +196,7 @@ try {
   await client.connect(transport);
 
   const tools = await client.listTools();
-  check('tools/list returns the 6 documented tools', tools.tools.length === 6, tools.tools.map((t) => t.name).join(','));
+  check('tools/list returns the 7 documented tools', tools.tools.length === 7, tools.tools.map((t) => t.name).join(','));
   check(
     'no tool advertises an outputSchema (D24)',
     tools.tools.every((tool) => tool.outputSchema === undefined),
@@ -214,6 +214,16 @@ try {
   const read = await call('notebook_read', { path: notebookPath });
   const readBody = parse(read);
   check('notebook_read returns parseable JSON with 6 cells', readBody?.cells?.length === 6, `cells=${readBody?.cells?.length}`);
+
+  const sourceBeforeExport = await readFile(notebookPath, 'utf8');
+  const exported = parse(await call('notebook_export', { path: notebookPath, format: 'html' }));
+  check(
+    'HTML export works over stdio without changing the notebook',
+    exported?.format === 'html' && typeof exported.output_path === 'string' &&
+      (await readFile(exported.output_path, 'utf8')).includes('<!doctype html>') &&
+      await readFile(notebookPath, 'utf8') === sourceBeforeExport,
+    exported?.output_path,
+  );
 
   // The unknown-argument check must come from the TOOL layer (SPEC §4.1.12),
   // not from the SDK's schema validation (review v4 NEW-1).

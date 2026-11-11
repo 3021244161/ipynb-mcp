@@ -2,8 +2,8 @@
 
 > 规则（SPEC §6 R20 / AGENTS.md §0）：发现 SPEC 有错或需要偏离时，**先在此登记**（现象、已尝试的方案、判断的根因），再决定如何继续。接口契约与红线优先于任何示例代码；本文档**不改变** SPEC 的效力，仅记录偏离及理由。
 >
-> entries: 72
-> digest: 7ebc52000f3cde9a
+> entries: 73
+> digest: 05685f4e369ca626
 >
 > 上面这两行是**表内条目的权威计数与指纹**，由 `scripts/check-docs.mjs` 校对：表格的最后一行必须是这个编号，而 `digest` 是全部编号的 sha256 前 16 位。v9 的拼接事故里"末尾被截掉"是连编号连续性都看不出来的那一半（v10 V10-5），而"删掉末行再把计数减一"又能让计数**自证**（v11 V11-11）——所以除了计数，还要有一个**只能靠工具重新生成**的指纹：增删行之后运行 `node scripts/check-docs.mjs --print-digest` 并把结果粘贴回来，这是一次**有意的**编辑（diff 里看得见），而不是顺手改一个数字。
 
@@ -14,6 +14,8 @@ GitHub 远端检查连续两次失败：常规 fetch 与临时 `http.proxy=` 覆
 发布二次认证记录：npm 登录及 whoami 有效，但非交互 publish 返回 EOTP；两次交互 publish 生成的官方 web 认证链接均被用户报告跳转至主页，未完成认证。检查本机 npm CLI 确认链接由 registry 响应提供、命令同时轮询认证结果；浏览器侧跳转根因尚未确认。按用户要求停止所有等待认证的 publish 命令，交由用户在自己的交互终端手动发布同一个已验证的 tarball。
 
 ## SPEC 偏离条目
+
+2026-11-11 导出验证环境记录：首次 PDF/PNG 实测及进一步错误详情核实均遇到 Chrome 提前退出。仅加载 about:blank 的独立诊断确认 GPU 子进程反复以 -1073741790（访问被拒绝）退出，随后浏览器报告 GPU process isn't usable。根因为当前 Windows 执行沙箱限制浏览器子进程启动，并非 notebook 内容或 CDP 协议错误。后续通过需审批的宿主执行通道验证；不添加 --no-sandbox，不修改全局隔离或用户浏览器配置。
 
 | # | 日期 | SPEC 位置 | 偏离内容 | 理由 | 影响面 | 状态 |
 |---|---|---|---|---|---|---|
@@ -89,3 +91,4 @@ GitHub 远端检查连续两次失败：常规 fetch 与临时 `http.proxy=` 覆
 | D-070 | 2026-10-05 | §4.1（**`source_truncated` 的语义扩展**；结构化字段必须与交付的值一致，v16 V16-1） | SPEC §4.1 定义 `source_truncated` 为"preview 是否被截断"。**整帧响应预算现在也会截断 `source` / `source_preview`**，因此该字段在该情形下也为 `true` —— 即它的含义扩展为"**本次交付的源码是否不完整**"，而不只是"preview 模式是否少给了行"。实现上由 `src/mcp/render/read.ts` 的 `reconcileTruncationFlags` 完成：预算报告它**在哪些字段上做了切割**（`truncatedFields`），render 层（知道字段含义的那一层）据此把 `true` 写回它自己的标志位。**另外两个同类实例一并修正**：① `outputs_summary` 的 `line_count` 原先由**已被 `inline_text_chars` 截断的文本**算出，于是一段 11 MiB 的单行流被摘要成 `line_count: 1`（`line_count` 在 §4.1 是可选的，现在截断项**不报**行数，改为报 `truncated: true` + `truncated_at_chars`）；② `stream` 项本身有 `truncated` 字段（§5.4），预算截断它之后该字段仍为 `false`，现在按值上的标记置 `true`。 | 判据是"**模型会读哪个字段**"：模型读 `source_truncated` 而不是去读 8 MiB 字符串的尾部（这正是该字段存在的理由，SPEC §4.1），所以字段说谎比没有字段更糟；v16 实测 12 MiB 源码交付为 8 387 552 字符 + 标记 + 警告，而 `source_truncated: false`。三个实例都属同一族（**结构化字段与其描述的值矛盾**），评审只点名了第一个，另两个是把整个载荷按这一族扫一遍找出来的。 | ① "这段源码是全部吗"的答案在 `full` 模式下也正确；② 摘要不再把被截断的输出描述成"就这么多行"；③ 三个字段与它们描述的值在**所有** `include_source` / `include_outputs` 组合下一致；④ 不新增任何字段（`source_truncated`、`truncated`、`truncated_at_chars`、`line_count` 都是 SPEC 已有的）。 | 已实现；用例 `tests/integration/v13-response-budget.test.ts` 的 `[V16-1]` 三组（14 MiB 源码的 flag+标记+行数、大 cell 与小 cell 并列的 per-cell 判定、39 个被截断 stream 项的标记数与警告数一致）与 `tests/unit/response-budget.test.ts` 的 5 条；**变异验证**：①还原（不调和标志）→ 3 条红；②每格都置 true → 1 条红；③摘要按前缀算行数 → 1 条红；④被截断的 stream 不置 truncated → 1 条红 |
 | D-071 | 2026-10-15 | §5.2（kernelspec_mismatch 穷举触发条件） | 已解析 kernelspec 的解释器不存在、能力探测失败或无可用可执行文件时，也使用现有 kernelspec_mismatch，说明拒绝路径与原因后继续既有候选链。 | GitHub #3：候选失败后若 PATH 成功，原实现会丢失拒绝原因且可能没有警告。2026-10-15 用户在本会话明确批准扩展该触发条件；SPEC 不改。 | 无新错误码或返回字段；显式 --python / IPYNB_PYTHON 仍优先且失败终局；同次调用仍仅一条 mismatch。 | 已实现（src/kernel/interpreter.ts 的 resolveInterpreter）；tests/unit/interpreter.test.ts 的 [I17][U23] 用例覆盖有效 Windows 用户 spec、缺解释器、缺模块、显式失败。 |
 | D-072 | 2026-10-15 | §4.8（run-status 参数扩展） | notebook_run_status 新增可选 include_outputs: 'none' 或 'full'，默认 full。none 保留原有状态及逐 cell 元数据，但 outputs 为 []，不返回图片也不提交 artifact 计划。 | GitHub #6：轮询终态重复传输完整输出。2026-10-15 用户在本会话明确批准此兼容参数扩展；SPEC 不改。 | 默认调用与显式 full 保持原行为；none 是无副作用投影，不删除完整结果；notebook_run_cancel 的参数保持只有 run_id。 | 已实现（src/mcp/tools/run-status.ts 的 handleRunStatus 与 src/server.ts）；tests/unit/run-status-projection.test.ts 的 [U24][U26][U27] 通过真实 SDK 覆盖四种状态、250 cell、错误索引、无图片落盘、完整结果再取与非法参数。 |
+| D-073 | 2026-11-11 | §1.2 / §4.2 / §4.3 / §5.9 / R4 / R6（显式静态导出） | 新增 notebook_export：path、format（html/pdf/png），可选 output_path、include_source=true、overwrite=false。仅导出保存内容，不起 kernel、不改 notebook；PNG 为整页长图。允许本工具在 root 内生成导出文件、临时 HTML 与浏览器 profile，导出文件内部可嵌入图片 data URL，工具响应只含路径与摘要。PDF/PNG 允许启动本机 Chrome/Edge/Chromium（无头、独立 profile、禁用脚本和外部资源），不安装或下载依赖。 | 用户明确要求新增 PDF、HTML、PNG 导出，并于 2026-11-11 在本会话批准上述工具、参数、默认行为与本机浏览器方案。该批准替代本功能范围内原先“不做格式转换”及只返回图片块时物化的限制；SPEC 保持不变。 | 现有六个工具及其图片策略不变。导出路径即使开启 allow-outside-root 仍限制在 root 内；默认拒绝覆盖，源 notebook 永不作为导出目标；只读模式拒绝导出。复用既有错误码：invalid_arguments（目标冲突/浏览器缺失/尺寸限制）、internal（渲染失败）、exec_timeout、cancelled、notebook_locked、path_outside_root。不增加包依赖、版本号或 LICENSE 变更。 | 已实现；src/core/export.ts、src/fs/export-file.ts、src/render/browser.ts、src/mcp/tools/export.ts；[EXPORT] 关联 U1/U11/U24/U26/U27，705 单测、5 浏览器导出集成、3 fixture 合规性、27 stdio smoke 及离线打包检查通过。 |
